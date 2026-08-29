@@ -7,6 +7,12 @@ excludes databases, so we persist this as a JSON file per project under
 outputs/{project_id}/versions.json. The service layer is written so that
 swapping this for a real DB later (Phase 2+) only means rewriting this one
 class — nothing above it needs to change.
+
+Phase 2 note: this class is document-agnostic. The Business Analyst Agent uses
+it for BRD versions at outputs/{project_id}/versions.json; the Solution
+Architect Agent reuses the exact same class for HLD versions at
+outputs/{project_id}/hld/versions.json by passing `subdir="hld"`. The two
+streams are fully isolated — each instance only ever reads/writes its own file.
 """
 
 import json
@@ -25,6 +31,13 @@ VersionSource = Literal["initial", "manual_edit", "ai_refine"]
 
 
 class BRDVersion(BaseModel):
+    """One immutable version record. Shared by the BRD and HLD version streams.
+
+    `source_ref` is optional free-form provenance (e.g. the HLD stores
+    "brd_v3" to record which accepted BRD it was generated from). BRD versions
+    leave it as None.
+    """
+
     version: int
     content: str
     source: VersionSource
@@ -32,15 +45,25 @@ class BRDVersion(BaseModel):
     note: str = ""
     is_final: bool = False
     is_locked: bool = False
+    source_ref: str | None = None
 
 
 class VersionService:
     """Manages the version history of a single project's BRD."""
 
-    def __init__(self, project_id: str, output_dir: Path | None = None):
+    def __init__(
+        self,
+        project_id: str,
+        output_dir: Path | None = None,
+        *,
+        subdir: str | None = None,
+    ):
         self.project_id = project_id
         base_dir = output_dir or settings.resolved_output_dir()
-        self._project_dir = base_dir / project_id
+        project_dir = base_dir / project_id
+        # A subdir isolates a second version stream (e.g. "hld") from the BRD
+        # stream while keeping the exact same file layout and behaviour.
+        self._project_dir = project_dir / subdir if subdir else project_dir
         self._project_dir.mkdir(parents=True, exist_ok=True)
         self._versions_file = self._project_dir / "versions.json"
 
@@ -60,7 +83,13 @@ class VersionService:
 
     # --- public API ------------------------------------------------------------
 
-    def add_version(self, content: str, source: VersionSource, note: str = "") -> BRDVersion:
+    def add_version(
+        self,
+        content: str,
+        source: VersionSource,
+        note: str = "",
+        source_ref: str | None = None,
+    ) -> BRDVersion:
         """Append a new version. Never mutates or overwrites existing versions."""
         versions = self._load_all()
         next_number = (versions[-1].version + 1) if versions else 1
@@ -71,6 +100,7 @@ class VersionService:
             source=source,
             created_at=datetime.utcnow().isoformat(),
             note=note,
+            source_ref=source_ref,
         )
         versions.append(new_version)
         self._save_all(versions)

@@ -13,7 +13,6 @@ later swapped for a real web frontend.
 """
 
 from pathlib import Path
-import re
 
 from app.agents.business_analyst.agent import BusinessAnalystAgent, ProjectMetadata
 from app.parsers.detector import DocumentType, detect_document_type
@@ -22,24 +21,10 @@ from app.parsers.pdf_parser import extract_text_from_pdf
 from app.parsers.text_cleaner import clean_text
 from app.parsers.text_parser import extract_text_from_txt
 from app.services.version_service import BRDVersion, VersionService
+from app.services.version_text import stamp_version_number
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
-
-# Matches the "**Version:** N" metadata line that our prompt templates instruct
-# Gemini to write at the top of every BRD. AI refinement is deliberately told to
-# preserve unrelated content unchanged, so this line would never get bumped on
-# its own — the app stamps the correct number in after every generation, edit,
-# and refinement rather than trusting the model to keep it in sync.
-_VERSION_LINE_PATTERN = re.compile(r"(\*\*Version:\*\*\s*)\d+")
-
-
-def _stamp_version_number(content: str, version_number: int) -> str:
-    """Force the in-document '**Version:** N' line to match the real tracked version."""
-    if _VERSION_LINE_PATTERN.search(content):
-        return _VERSION_LINE_PATTERN.sub(rf"\g<1>{version_number}", content, count=1)
-    logger.warning("Could not find a '**Version:**' line in BRD content to stamp")
-    return content
 
 
 class UnsupportedFileTypeError(Exception):
@@ -97,7 +82,7 @@ class BusinessAnalystService:
         raw_text = self.extract_text(file_path)
         clean_sow = self.preprocess(raw_text)
         brd_text = self._agent.generate_brd(clean_sow, metadata)
-        brd_text = _stamp_version_number(brd_text, version_number=1)
+        brd_text = stamp_version_number(brd_text, version_number=1)
         return self._version_service.add_version(
             content=brd_text, source="initial", note="Generated from SOW"
         )
@@ -111,7 +96,7 @@ class BusinessAnalystService:
             )
         if not edited_content or not edited_content.strip():
             raise ValueError("Cannot save an empty BRD")
-        edited_content = _stamp_version_number(
+        edited_content = stamp_version_number(
             edited_content, version_number=self._next_version_number()
         )
         return self._version_service.add_version(
@@ -135,7 +120,7 @@ class BusinessAnalystService:
             current_version=latest.version,
         )
         return self._version_service.add_version(
-            content=_stamp_version_number(refined_text, self._next_version_number()),
+            content=stamp_version_number(refined_text, self._next_version_number()),
             source="ai_refine",
             note=user_feedback,
         )
