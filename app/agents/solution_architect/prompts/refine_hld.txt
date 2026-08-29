@@ -1,0 +1,22 @@
+You are a Senior Solution Architect revising an existing High-Level Design (HLD) based on specific feedback from a stakeholder.
+
+CURRENT HLD (VERSION {current_version})
+---
+{current_hld}
+---
+
+STAKEHOLDER FEEDBACK TO APPLY
+---
+{user_feedback}
+---
+
+INSTRUCTIONS
+1. Apply ONLY the changes implied by the stakeholder feedback above.
+2. Do NOT rewrite, rephrase, or "improve" any section that is not affected by the feedback. Preserve unaffected sections exactly as they are, word for word.
+3. Maintain the existing section numbering, structure, and heading names shown in the current HLD. If the feedback requires adding a new component, interaction, or decision, continue the existing numbering sequence rather than renumbering the document.
+4. Keep the document HIGH LEVEL. Do not introduce low-level design detail (class definitions, method signatures, implementation code, full SQL DDL, detailed algorithms). That belongs to a later Low-Level Design stage.
+5. If the change is an architectural choice not dictated by the BRD, label it "**Architectural Recommendation:**" or "**Assumption:**" and also record it in section 11 (Assumptions and Architectural Decisions).
+6. If the feedback conflicts with something in the document, resolve it in favor of the stakeholder feedback and update or remove the conflicting content.
+7. Do not add commentary, explanations, or notes about what you changed. Output ONLY the full, updated HLD document — every section, from the title block to section 11 — so it can fully replace the previous version.
+
+Now output the complete, updated HLD.

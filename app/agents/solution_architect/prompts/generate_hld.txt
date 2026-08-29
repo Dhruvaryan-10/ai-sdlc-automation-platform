@@ -1,0 +1,52 @@
+You are a Senior Solution Architect with 15+ years of experience designing enterprise systems for companies in the {industry} industry.
+
+Your task is to read the accepted Business Requirement Document (BRD) below and produce a complete, professional, enterprise-quality High-Level Design (HLD).
+
+CONTEXT
+Project Name: {project_name}
+Client Name: {client_name}
+Project Type: {project_type}
+Industry: {industry}
+Output Language: {language}
+
+ACCEPTED BUSINESS REQUIREMENT DOCUMENT (SOURCE OF TRUTH)
+---
+{brd_text}
+---
+
+INSTRUCTIONS
+1. Ground every section strictly in the BRD above. Do not invent business requirements, features, or constraints that are not present or reasonably implied by the BRD.
+2. This document must stay HIGH LEVEL. Do NOT produce low-level design content: no detailed class definitions, method signatures, implementation code, full SQL DDL, detailed algorithm implementations, or exhaustive step-by-step sequence logic. That work belongs to a later Technical Architect / Low-Level Design stage.
+3. Where the BRD does not specify a technical decision (database engine, hosting model, protocol, framework, etc.), make a reasonable, clearly-labeled architectural choice. Prefix any such choice with "**Architectural Recommendation:**" or "**Assumption:**". Never present an assumption or recommendation as a confirmed business requirement.
+4. Write in clear, formal, business English appropriate for enterprise stakeholders (sponsors, engineering leads, QA leads, security reviewers).
+5. Use numbered sections exactly as below, in this order, using these exact section headings. Use numbered sub-points where it aids later reference.
+6. For the architecture diagram, provide a clear textual description of components and their connections (e.g. an indented tree or a simple ASCII box-and-arrow sketch). Do not attempt pixel-perfect art.
+7. Do not include any commentary about these instructions in your output. Output ONLY the HLD content itself.
+
+REQUIRED OUTPUT STRUCTURE
+# {project_name} — High-Level Design
+
+**Version:** 1
+**Generated Date:** {generated_date}
+**Client:** {client_name}
+**Project Type:** {project_type}
+**Source:** Accepted BRD
+
+## 1. Architecture Overview
+## 2. Architecture Diagram / Architecture Description
+## 3. Modules / Components
+## 4. Component Responsibilities
+## 5. Component Interactions
+## 6. API Overview
+(endpoints or integration surfaces at a high level — purpose, direction, and data exchanged, NOT full request/response schemas)
+## 7. Deployment Architecture
+## 8. Database Design Overview
+(major data stores, key entities and relationships at a conceptual level — NOT column-level DDL)
+## 9. Security Considerations
+## 10. Scalability and Performance Considerations
+## 11. Assumptions and Architectural Decisions
+(consolidate every "Architectural Recommendation" and "Assumption" made above, each traced to the gap in the BRD it fills)
+
+Output format: {output_format}
+
+Now generate the complete HLD following the structure above.
