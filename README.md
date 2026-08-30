@@ -1,4 +1,4 @@
-# SDLC Agent — Phase 1 (SOW → BRD) · Phase 2 (BRD → HLD) · Phase 3 (BRD → User Stories) · Phase 4 (HLD → LLD)
+# SDLC Agent — BRD · HLD · User Stories · LLD · User Story Refinement
 
 The AI-powered SDLC platform, built one agent at a time:
 
@@ -13,10 +13,18 @@ The AI-powered SDLC platform, built one agent at a time:
   Low-Level Design. The accepted HLD is the only hard prerequisite; the BRD is
   supporting context and draft user stories, *if they exist*, are optional
   functional context. It does **not** depend on the User Story Agent.
+- **Phase 5 — User Story Refinement Agent:** reconciles the existing user
+  stories against the accepted BRD (primary) plus the accepted HLD and LLD
+  (optional context), producing **refined user stories appended to the same
+  user-story stream** — no second history. It reads BRD/HLD/LLD only through
+  the shared version-store interface and imports no other agent package. If the
+  BRD, HLD, or LLD later changes, the refined stories are *flagged stale*
+  (never mutated); only an explicit "Refine Again" produces a new version.
 
 Every stage shares the same lifecycle: manual editing, AI-assisted refinement,
-full version history, final-version locking/unlocking, and Word export. BRD,
-HLD, user-story, and LLD versions are each stored in their own independent stream.
+full version history, final-version locking/unlocking, and Word export. The BRD,
+HLD, user-story, and LLD version streams are each independent; Phase 3 and
+Phase 5 both write to the one user-story stream.
 
 No databases, no LangGraph, no RAG — plain JSON persistence, done properly.
 
@@ -159,12 +167,25 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
      Priority, and — where the BRD supports it — a BRD Reference, Dependencies,
      and Notes. The stories are business-focused; technical detail is added
      later by the future User Story Refinement stage.
-   - **Edit**, **AI Refine** (e.g. *"Add a story for password reset via
+   - **Edit**, **AI Refine** (freeform: *"Add a story for password reset via
      email."*), **History**, **Choose Final**, **Unlock**, and **Download
      UserStories.docx** work exactly like the BRD and HLD workspaces.
-   - If the accepted BRD changes after the stories were generated, a
-     non-blocking warning says they may be stale. Nothing is regenerated,
-     invalidated, or deleted — the stories stay independently versioned under
+   - **Refine (Artifacts)** sub-tab (Phase 5): click **Refine Stories from
+     Artifacts** to reconcile the current latest version against the accepted
+     BRD (primary) plus the accepted HLD and LLD (optional context). Existing
+     `US-NNN` IDs and unaffected stories are preserved; only evidence-based
+     changes are made. This appends a new version (labelled *Artifact
+     Refinement*) to the **same** user-story stream — it does not replace
+     Phase 3's generation and does not start a second history.
+   - **Three-way staleness:** each artifact-refinement version records the BRD,
+     HLD and LLD versions it used. If any of those later changes, a non-blocking
+     banner names the changed sources (*"…the following changed: BRD, LLD…"*)
+     and offers **Refine Again**. The existing refined version is never mutated
+     and stays viewable in History; only an explicit Refine Again creates a new
+     version that re-records the current source versions.
+   - If the accepted BRD changes after generation (before any artifact
+     refinement), the Phase 3 BRD-only stale hint still applies. Everything
+     stays independently versioned under
      `outputs/<project_id>/user_stories/versions.json`.
 
 6. **Tab 5 — LLD Workspace** (Phase 4, Low-Level Design Agent)
@@ -226,6 +247,11 @@ sdlc-ba-agent/
         prompts/
           generate_lld.txt
           refine_lld.txt
+      user_story_refinement/ <- Phase 5: BRD (+ optional HLD/LLD) reconciles user stories
+        agent.py             <- Gemini/LangChain wrapper (refine_user_stories)
+        service.py           <- BRD gate + reads BRD/HLD/LLD via VersionService; appends to the "user_stories" stream; three-way staleness
+        prompts/
+          refine_from_artifacts.txt
     parsers/
       detector.py            <- detects .docx / .pdf / .txt
       docx_parser.py
@@ -274,15 +300,14 @@ pytest
 
 ---
 
-## 7. What's Deliberately NOT in Phases 1–4
+## 7. What's Deliberately NOT in Phases 1–5
 
-Phase 1 delivered the Business Analyst Agent (SOW → BRD). Phase 2 added the
-Solution Architect Agent (accepted BRD → HLD). Phase 3 added the Initial User
-Story Agent (accepted BRD → draft user stories). Phase 4 adds the Low-Level
-Design Agent (accepted HLD → LLD). Still **not** included, by scope: the
-**User Story Refinement Agent** (the later stage that combines BRD + HLD + LLD
-+ draft user stories into technically refined final stories), QA / Test Case
-Agent, Documentation and Project Closure Agents, Project Memory, LangGraph
-multi-agent orchestration, RAG, a real database, and authentication /
-multi-user support. Persistence is still plain JSON files; the database
-decision is deferred to the Project Memory phase.
+Phases 1–5 deliver: Business Analyst (SOW → BRD), Solution Architect
+(BRD → HLD), Initial User Story (BRD → draft stories), Low-Level Design
+(HLD → LLD), and User Story Refinement (BRD + HLD + LLD reconcile the stories).
+Still **not** included, by scope: a QA / Test Case Agent, Documentation and
+Project Closure Agents, Project Memory, LangGraph / multi-agent orchestration,
+RAG, a real database, and authentication / multi-user support. Persistence is
+still plain JSON files; the database decision is deferred to the Project Memory
+phase. The known `_extract_text` / `_invoke` / metadata-helper duplication
+across the five agent packages is a deliberately deferred cleanup.
