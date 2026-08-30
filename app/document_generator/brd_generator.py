@@ -174,3 +174,14 @@ def generate_user_stories_docx(user_stories_markdown: str, output_path: str | Pa
     call-site clarity.
     """
     return generate_brd_docx(user_stories_markdown, output_path)
+
+
+def generate_lld_docx(lld_markdown: str, output_path: str | Path) -> Path:
+    """Convert a markdown-flavored LLD string into a formatted .docx file.
+
+    The Low-Level Design produced by the LLD Agent uses the same markdown
+    conventions as the BRD/HLD (# / ## / ### headings, - bullets, 1. numbered
+    items, | pipe tables, **Key:** metadata lines), so this reuses the BRD
+    converter. Separate named entry point for call-site clarity.
+    """
+    return generate_brd_docx(lld_markdown, output_path)

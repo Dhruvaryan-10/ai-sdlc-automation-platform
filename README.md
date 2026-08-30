@@ -1,4 +1,4 @@
-# SDLC Agent — Phase 1 (SOW → BRD) + Phase 2 (BRD → HLD) + Phase 3 (BRD → User Stories)
+# SDLC Agent — Phase 1 (SOW → BRD) · Phase 2 (BRD → HLD) · Phase 3 (BRD → User Stories) · Phase 4 (HLD → LLD)
 
 The AI-powered SDLC platform, built one agent at a time:
 
@@ -7,13 +7,16 @@ The AI-powered SDLC platform, built one agent at a time:
 - **Phase 2 — Solution Architect Agent:** turns the **accepted/final BRD**
   into a High-Level Design (HLD).
 - **Phase 3 — Initial User Story Agent:** turns the **accepted/final BRD**
-  into draft user stories. This is an *independent* branch from the BRD — it
-  runs in parallel with the Solution Architect Agent and does **not** need the
-  HLD (or any later LLD).
+  into draft user stories. An *independent* branch from the BRD — parallel to
+  the Solution Architect Agent, needs no HLD or LLD.
+- **Phase 4 — Low-Level Design Agent:** turns the **accepted/final HLD** into a
+  Low-Level Design. The accepted HLD is the only hard prerequisite; the BRD is
+  supporting context and draft user stories, *if they exist*, are optional
+  functional context. It does **not** depend on the User Story Agent.
 
 Every stage shares the same lifecycle: manual editing, AI-assisted refinement,
 full version history, final-version locking/unlocking, and Word export. BRD,
-HLD, and user-story versions are each stored in their own independent stream.
+HLD, user-story, and LLD versions are each stored in their own independent stream.
 
 No databases, no LangGraph, no RAG — plain JSON persistence, done properly.
 
@@ -164,6 +167,32 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
      invalidated, or deleted — the stories stay independently versioned under
      `outputs/<project_id>/user_stories/versions.json`.
 
+6. **Tab 5 — LLD Workspace** (Phase 4, Low-Level Design Agent)
+   - Available once an HLD has been marked **Final** (Tab 3). The accepted HLD
+     is the **only** hard prerequisite — user stories are *not* required. Until
+     a Final HLD exists the tab shows *"Accept an HLD before generating the
+     LLD."* and the button is disabled.
+   - Click **Generate LLD** to produce **LLD Version 1** from the accepted HLD
+     (primary technical source), with the accepted BRD as supporting context
+     and — *if a user-story version exists* — the most relevant draft user
+     stories as optional functional context. If no user stories exist, the LLD
+     is generated from the HLD and BRD alone.
+   - The LLD contains implementation-level detail: detailed component design,
+     classes/responsibilities/interfaces, service & API specifications,
+     request/response structures and data models, database schema where
+     applicable, sequence flows, validation rules, error handling, processing
+     logic, dependencies, security considerations, and a requirement/user-story
+     → implementation mapping.
+   - **Edit**, **AI Refine** (e.g. *"Add a caching table for product
+     lookups."*), **History**, **Choose Final LLD**, **Unlock**, and **Download
+     LLD.docx** work exactly like the other workspaces.
+   - If the accepted **HLD** changes after the LLD was generated, a
+     non-blocking warning says the LLD may be stale. Nothing is regenerated,
+     invalidated, or deleted — the LLD stays independently versioned under
+     `outputs/<project_id>/lld/versions.json`. (BRD changes are already
+     surfaced in the HLD workspace; re-finalising the HLD then triggers this
+     LLD warning.)
+
 ---
 
 ## 5. Project Structure
@@ -191,6 +220,12 @@ sdlc-ba-agent/
         prompts/
           generate_user_stories.txt
           refine_user_stories.txt
+      low_level_design/      <- Phase 4: accepted HLD (+ BRD / optional stories) -> LLD
+        agent.py             <- Gemini/LangChain wrapper (generate_lld + refine_lld)
+        service.py           <- HLD gate + reads user_stories stream via VersionService -> LLD versions (subdir "lld")
+        prompts/
+          generate_lld.txt
+          refine_lld.txt
     parsers/
       detector.py            <- detects .docx / .pdf / .txt
       docx_parser.py
@@ -198,10 +233,10 @@ sdlc-ba-agent/
       text_parser.py
       text_cleaner.py        <- preprocessing (removes headers/footers/page numbers)
     document_generator/
-      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx)
+      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx / _lld_docx)
     services/
       version_service.py     <- version history (JSON file per project/stream, no DB yet)
-      version_text.py        <- shared "**Version:** N" stamping helper (BRD + HLD + stories)
+      version_text.py        <- shared "**Version:** N" stamping helper (all document streams)
     utils/
       config.py              <- reads .env via pydantic-settings
       logger.py               <- centralized logging to logs/app.log
@@ -209,7 +244,7 @@ sdlc-ba-agent/
       streamlit_app.py       <- the UI, calls the service layer only
   tests/                     <- deterministic pytest suite (stub agents, no Gemini calls)
   uploads/                   <- uploaded SOW files land here
-  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + .docx exports
+  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + <id>/lld/ + .docx exports
   logs/                      <- app.log (rotating)
   requirements.txt
   pytest.ini
@@ -239,14 +274,15 @@ pytest
 
 ---
 
-## 7. What's Deliberately NOT in Phases 1–3
+## 7. What's Deliberately NOT in Phases 1–4
 
 Phase 1 delivered the Business Analyst Agent (SOW → BRD). Phase 2 added the
-Solution Architect Agent (accepted BRD → HLD). Phase 3 adds the Initial User
-Story Agent (accepted BRD → draft user stories). Still **not** included, by
-scope: LLD / Technical Architect Agent, the **User Story Refinement Agent**
-(the later stage that combines BRD + HLD + LLD into technically refined final
-stories), QA / Test Case Agent, Documentation and Project Closure Agents,
-Project Memory, LangGraph multi-agent orchestration, RAG, a real database, and
-authentication / multi-user support. Persistence is still plain JSON files; the
-database decision is deferred to the Project Memory phase.
+Solution Architect Agent (accepted BRD → HLD). Phase 3 added the Initial User
+Story Agent (accepted BRD → draft user stories). Phase 4 adds the Low-Level
+Design Agent (accepted HLD → LLD). Still **not** included, by scope: the
+**User Story Refinement Agent** (the later stage that combines BRD + HLD + LLD
++ draft user stories into technically refined final stories), QA / Test Case
+Agent, Documentation and Project Closure Agents, Project Memory, LangGraph
+multi-agent orchestration, RAG, a real database, and authentication /
+multi-user support. Persistence is still plain JSON files; the database
+decision is deferred to the Project Memory phase.
