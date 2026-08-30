@@ -252,6 +252,15 @@ lld_latest = lld_versions[-1] if lld_versions else None
 lld_final = next((v for v in lld_versions if v.is_final), None)
 lld_is_locked = bool(lld_final and lld_final.is_locked)
 
+# --- Phase 5 refinement state (reads the SAME user_stories stream, no second store) ---
+try:
+    usr_recorded = usr_service.recorded_source_versions()
+    usr_stale_sources = usr_service.stale_sources()
+except Exception:
+    usr_recorded, usr_stale_sources = None, []
+usr_is_refined = usr_recorded is not None      # latest user-story version came from artifact refinement
+usr_stale = bool(usr_stale_sources)            # a recorded source artifact changed since that refinement
+
 
 # --- sidebar: project status + version history --------------------------------------
 
@@ -334,6 +343,27 @@ with st.sidebar:
         st.caption("Accept an HLD first to unlock the LLD stage.")
 
     st.divider()
+    st.subheader("User Story Refinement")
+    if usr_is_refined and usr_recorded is not None:
+        st.metric("Refined Stories Version", f"v{us_latest.version}")
+        st.caption(
+            "Source artifacts: "
+            f"BRD v{usr_recorded['brd']} · "
+            f"HLD v{usr_recorded['hld'] if usr_recorded['hld'] is not None else '—'} · "
+            f"LLD v{usr_recorded['lld'] if usr_recorded['lld'] is not None else '—'}"
+        )
+        if usr_stale:
+            st.warning(f"STALE — changed since refinement: {', '.join(usr_stale_sources)}")
+        else:
+            st.success("Up to date with the accepted BRD / HLD / LLD.")
+    elif us_latest is not None and final_version is not None:
+        st.caption("Ready to refine. Open the User Story Refinement tab.")
+    elif final_version is not None:
+        st.caption("Generate initial user stories (Step 4) first.")
+    else:
+        st.caption("Accept a BRD first to unlock refinement.")
+
+    st.divider()
     if st.button("Start New Project"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -345,9 +375,11 @@ with st.sidebar:
 st.title("Business Analyst Agent - SOW to BRD")
 st.caption("Phase 1: Statement of Work to Business Requirement Document")
 
-tab_generate, tab_workspace, tab_hld, tab_stories, tab_lld = st.tabs(
+(tab_generate, tab_workspace, tab_hld, tab_stories,
+ tab_lld, tab_usr) = st.tabs(
     ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace",
-     "Step 4: User Story Workspace", "Step 5: LLD Workspace"]
+     "Step 4: User Story Workspace", "Step 5: LLD Workspace",
+     "Step 6: User Story Refinement"]
 )
 
 
@@ -896,52 +928,19 @@ with tab_stories:
         us_is_current = us_viewing.version == us_latest.version
         us_editable = us_is_current and not us_is_locked
 
-        # --- Phase 5 refinement staleness (three-way: BRD / HLD / LLD) ---
+        # --- stale-vs-BRD hint (Phase 3; non-blocking, no auto-regeneration) ---
         try:
-            usr_recorded = usr_service.recorded_source_versions()
-            usr_stale_sources = usr_service.stale_sources()
+            if us_service.brd_changed_since_stories():
+                src = us_service.source_brd_version()
+                src_text = f"BRD v{src}" if src is not None else "an earlier BRD version"
+                st.warning(
+                    f"These user stories were generated from {src_text}, but the Accepted "
+                    f"BRD is now v{final_version.version}. They may be stale. Refine them "
+                    "here (freeform), or reconcile them against BRD / HLD / LLD in "
+                    "**Step 6: User Story Refinement** - nothing is changed automatically."
+                )
         except Exception as exc:
             st.error(friendly_error(exc))
-            usr_recorded, usr_stale_sources = None, []
-        usr_stale = bool(usr_stale_sources)
-
-        if usr_recorded is not None and usr_stale:
-            rec_txt = (f"BRD v{usr_recorded['brd']}, "
-                       f"HLD v{usr_recorded['hld'] if usr_recorded['hld'] is not None else '—'}, "
-                       f"LLD v{usr_recorded['lld'] if usr_recorded['lld'] is not None else '—'}")
-            st.warning(
-                f"These refined user stories were built from {rec_txt}. Since then the "
-                f"following changed: **{', '.join(usr_stale_sources)}**. They may be stale. "
-                "Use **Refine Again** to reconcile them against the current artifacts - "
-                "nothing is changed automatically, and this version stays in History."
-            )
-            if st.button("Refine Again", type="primary", key="us_refine_again_btn"):
-                with st.spinner("Reconciling the user stories against BRD / HLD / LLD..."):
-                    try:
-                        start = time.time()
-                        new_us = usr_service.refine()
-                        elapsed = time.time() - start
-                        logger.info(f"User stories re-refined to v{new_us.version} in {elapsed:.1f}s")
-                        refresh_us_versions()
-                        st.session_state.us_viewing_version = new_us.version
-                        st.success(f"Created User Stories Version {new_us.version} "
-                                   f"(artifact refinement) in {elapsed:.1f}s.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(friendly_error(exc))
-        elif usr_recorded is None:
-            # not yet refined from artifacts -> keep the Phase 3 BRD-only stale hint
-            try:
-                if us_service.brd_changed_since_stories():
-                    src = us_service.source_brd_version()
-                    src_text = f"BRD v{src}" if src is not None else "an earlier BRD version"
-                    st.warning(
-                        f"These user stories were generated from {src_text}, but the Accepted "
-                        f"BRD is now v{final_version.version}. They may be stale. Refine them "
-                        "(freeform or from artifacts) - nothing is changed automatically."
-                    )
-            except Exception as exc:
-                st.error(friendly_error(exc))
 
         # --- status banner ---
         us_status_cols = st.columns([2, 2, 2])
@@ -965,9 +964,8 @@ with tab_stories:
 
         st.divider()
 
-        (us_tab_preview, us_tab_edit, us_tab_refine,
-         us_tab_artifacts, us_tab_history) = st.tabs(
-            ["Preview", "Edit", "AI Refine", "Refine (Artifacts)", "History"]
+        us_tab_preview, us_tab_edit, us_tab_refine, us_tab_history = st.tabs(
+            ["Preview", "Edit", "AI Refine", "History"]
         )
 
         with us_tab_preview:
@@ -1037,47 +1035,6 @@ with tab_stories:
                         except Exception as exc:
                             st.error(friendly_error(exc))
 
-        with us_tab_artifacts:
-            st.caption("Reconcile the current user stories against the project's other "
-                       "artifacts. The Accepted BRD is the primary business source; the "
-                       "Accepted HLD and LLD are optional technical context. Existing "
-                       "US-NNN IDs and unaffected stories are preserved - only "
-                       "evidence-based changes are made. This creates a NEW version.")
-
-            art_cols = st.columns(3)
-            art_cols[0].markdown(f"**BRD** — Accepted v{final_version.version} ✅ (required)")
-            if hld_final is not None:
-                art_cols[1].markdown(f"**HLD** — Accepted v{hld_final.version} ✅ (context)")
-            else:
-                art_cols[1].markdown("**HLD** — none accepted (optional; skipped)")
-            if lld_final is not None:
-                art_cols[2].markdown(f"**LLD** — Accepted v{lld_final.version} ✅ (context)")
-            else:
-                art_cols[2].markdown("**LLD** — none accepted (optional; skipped)")
-
-            st.caption(f"Refinement always starts from the current latest version "
-                       f"(v{us_latest.version}), whatever its origin.")
-
-            if us_is_locked:
-                st.info("Refinement is disabled while the Final User Stories are locked. "
-                        "Unlock them below to continue.")
-            if st.button("Refine Stories from Artifacts", type="primary",
-                         disabled=us_is_locked, key="us_refine_artifacts_btn"):
-                with st.spinner("Reconciling the user stories against BRD / HLD / LLD..."):
-                    try:
-                        start = time.time()
-                        new_us = usr_service.refine()
-                        elapsed = time.time() - start
-                        logger.info(f"User stories refined from artifacts to v{new_us.version} "
-                                    f"in {elapsed:.1f}s")
-                        refresh_us_versions()
-                        st.session_state.us_viewing_version = new_us.version
-                        st.success(f"Created User Stories Version {new_us.version} "
-                                   f"(artifact refinement) in {elapsed:.1f}s.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(friendly_error(exc))
-
         with us_tab_history:
             st.caption("All user stories versions are permanent. "
                        "Nothing is ever overwritten or deleted.")
@@ -1089,8 +1046,6 @@ with tab_stories:
                 badges = []
                 if us_latest and v.version == us_latest.version:
                     badges.append("Current")
-                    if usr_stale:
-                        badges.append("STALE")
                 if v.is_final:
                     badges.append("Accepted")
                     if v.is_locked:
@@ -1422,3 +1377,136 @@ with tab_lld:
                         )
                 except Exception as exc:
                     st.error(friendly_error(exc))
+
+
+# --- STEP 6: User Story Refinement workspace (User Story Refinement Agent) ----------------
+#
+# Standalone stage. Reconciles the LATEST user-story version against the accepted BRD
+# (primary) plus the accepted HLD / LLD (optional context). It writes a NEW version into
+# the SAME `user_stories` stream via UserStoryRefinementService.refine() - no second store.
+
+with tab_usr:
+    st.caption("Phase 5: reconcile the current user stories against BRD (primary) + "
+               "HLD / LLD (optional context). Produces a new version in the same "
+               "user-story stream.")
+
+    if final_version is None:
+        st.warning("User Story Refinement is unavailable: no accepted BRD.")
+        st.caption("Accept a BRD in the BRD Workspace first. The accepted BRD is the "
+                   "primary business source for refinement.")
+
+    elif us_latest is None:
+        st.warning("User Story Refinement is unavailable: no user stories exist yet.")
+        st.caption("Generate the initial user stories in Step 4 first. Refinement always "
+                   "starts from the latest existing user-story version.")
+
+    else:
+        usr_viewing_number = st.session_state.get("usr_viewing_version", us_latest.version)
+        try:
+            usr_viewing = us_service.get_version(usr_viewing_number) or us_latest
+        except Exception as exc:
+            st.error(friendly_error(exc))
+            usr_viewing = us_latest
+
+        # --- 1. Source Artifacts -------------------------------------------------
+        st.subheader("Source Artifacts")
+        src_cols = st.columns(4)
+        src_cols[0].metric("BRD", f"v{final_version.version}", "Accepted (required)")
+        src_cols[1].metric(
+            "HLD",
+            f"v{hld_final.version}" if hld_final is not None else "—",
+            "Accepted (context)" if hld_final is not None else "none — optional",
+        )
+        src_cols[2].metric(
+            "LLD",
+            f"v{lld_final.version}" if lld_final is not None else "—",
+            "Accepted (context)" if lld_final is not None else "none — optional",
+        )
+        us_state = ("Locked" if us_is_locked else
+                    ("Accepted" if (us_final and us_final.version == us_latest.version) else "Draft"))
+        src_cols[3].metric("User Stories", f"v{us_latest.version}", us_state)
+        st.caption("HLD and LLD are optional context — refinement proceeds without them "
+                   "(the agent receives a sentinel). Only accepted/final versions are used.")
+
+        # --- 4/5. Refinement result + provenance + staleness -------------------
+        if usr_is_refined and usr_recorded is not None:
+            prov = (f"BRD v{usr_recorded['brd']}, "
+                    f"HLD v{usr_recorded['hld'] if usr_recorded['hld'] is not None else '—'}, "
+                    f"LLD v{usr_recorded['lld'] if usr_recorded['lld'] is not None else '—'}, "
+                    f"source stories v{usr_recorded['us']}")
+            st.success(f"Latest version **v{us_latest.version} — Artifact Refinement**. "
+                       f"Built from: {prov}.")
+            if us_latest.note:
+                st.caption(f"Note: {us_latest.note}")
+
+            if usr_stale:
+                st.warning(
+                    f"These refined stories may be **stale**: the following changed since "
+                    f"the refinement — **{', '.join(usr_stale_sources)}**. Nothing is "
+                    "regenerated automatically; click **Refine Again** to reconcile against "
+                    "the current artifacts (creates a new version; this one stays in History)."
+                )
+        else:
+            st.info("The latest user-story version has not been refined from artifacts yet.")
+
+        # --- 3. Artifact Refinement action -----------------------------------
+        st.divider()
+        st.subheader("Artifact Refinement")
+        if us_is_locked:
+            st.info("The Final User Stories are locked. Unlock them in Step 4 "
+                    "(User Story Workspace) before refining.")
+        st.caption(f"Refinement starts from the current latest version "
+                   f"(v{us_latest.version}), whatever its origin (initial, manual edit, or a "
+                   "previous refinement). Existing US-NNN IDs and unaffected stories are "
+                   "preserved; only evidence-based changes are made.")
+        refine_label = "Refine Again" if usr_is_refined else "Refine Stories from Artifacts"
+        if st.button(refine_label, type="primary", disabled=us_is_locked,
+                     key="usr_refine_btn"):
+            with st.spinner("Reconciling the user stories against BRD / HLD / LLD..."):
+                try:
+                    start = time.time()
+                    new_us = usr_service.refine()
+                    elapsed = time.time() - start
+                    logger.info(f"User stories refined from artifacts to v{new_us.version} "
+                                f"in {elapsed:.1f}s")
+                    refresh_us_versions()
+                    st.session_state.usr_viewing_version = new_us.version
+                    st.session_state.us_viewing_version = new_us.version
+                    st.success(f"Created User Stories Version {new_us.version} "
+                               f"(Artifact Refinement) in {elapsed:.1f}s.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+        # --- 2. Current User Stories: Preview + History --------------------
+        st.divider()
+        st.subheader("User Stories")
+        usr_tab_preview, usr_tab_history = st.tabs(["Preview", "History"])
+
+        with usr_tab_preview:
+            if usr_viewing.version != us_latest.version:
+                st.info(f"Viewing v{usr_viewing.version}. The latest version is "
+                        f"v{us_latest.version}.")
+            st.markdown(usr_viewing.content)
+
+        with usr_tab_history:
+            st.caption("The whole user-story history — initial generation, manual edits, "
+                       "freeform AI refinement, and artifact refinement all share this stream.")
+            for v in reversed(us_versions):
+                cols = st.columns([1, 2, 3, 2, 1])
+                cols[0].markdown(f"**v{v.version}**")
+                cols[1].markdown(story_version_label(v))
+                cols[2].caption(v.note or "-")
+                badges = []
+                if v.version == us_latest.version:
+                    badges.append("Current")
+                    if usr_stale:
+                        badges.append("STALE")
+                if v.is_final:
+                    badges.append("Accepted")
+                    if v.is_locked:
+                        badges.append("Locked")
+                cols[3].caption(" / ".join(badges) if badges else "Draft")
+                if cols[4].button("View", key=f"usr_hist_view_{v.version}"):
+                    st.session_state.usr_viewing_version = v.version
+                    st.rerun()
