@@ -1,4 +1,4 @@
-# SDLC Agent — Phase 1 (SOW → BRD) + Phase 2 (BRD → HLD)
+# SDLC Agent — Phase 1 (SOW → BRD) + Phase 2 (BRD → HLD) + Phase 3 (BRD → User Stories)
 
 The AI-powered SDLC platform, built one agent at a time:
 
@@ -6,10 +6,14 @@ The AI-powered SDLC platform, built one agent at a time:
   (SOW) into a Business Requirement Document (BRD).
 - **Phase 2 — Solution Architect Agent:** turns the **accepted/final BRD**
   into a High-Level Design (HLD).
+- **Phase 3 — Initial User Story Agent:** turns the **accepted/final BRD**
+  into draft user stories. This is an *independent* branch from the BRD — it
+  runs in parallel with the Solution Architect Agent and does **not** need the
+  HLD (or any later LLD).
 
-Both stages share the same lifecycle: manual editing, AI-assisted refinement,
-full version history, final-version locking/unlocking, and Word export. BRD and
-HLD versions are stored independently.
+Every stage shares the same lifecycle: manual editing, AI-assisted refinement,
+full version history, final-version locking/unlocking, and Word export. BRD,
+HLD, and user-story versions are each stored in their own independent stream.
 
 No databases, no LangGraph, no RAG — plain JSON persistence, done properly.
 
@@ -140,6 +144,26 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
      regenerated or deleted automatically — the HLD stays independently
      versioned under `outputs/<project_id>/hld/versions.json`.
 
+5. **Tab 4 — User Story Workspace** (Phase 3, Initial User Story Agent)
+   - Available once a BRD has been marked **Final** (Tab 2). Independent of the
+     HLD — you do **not** need to generate an HLD first. Until a Final BRD
+     exists the tab shows *"Accept a BRD before generating user stories."* and
+     the button is disabled; stories are never built from the SOW, a draft
+     BRD, the HLD, or an LLD.
+   - Click **Generate Draft User Stories** to produce **User Stories Version 1**
+     from the accepted BRD. Each story has an ID (`US-001`, …), Title, the
+     *"As a … I want … so that …"* statement, testable Acceptance Criteria,
+     Priority, and — where the BRD supports it — a BRD Reference, Dependencies,
+     and Notes. The stories are business-focused; technical detail is added
+     later by the future User Story Refinement stage.
+   - **Edit**, **AI Refine** (e.g. *"Add a story for password reset via
+     email."*), **History**, **Choose Final**, **Unlock**, and **Download
+     UserStories.docx** work exactly like the BRD and HLD workspaces.
+   - If the accepted BRD changes after the stories were generated, a
+     non-blocking warning says they may be stale. Nothing is regenerated,
+     invalidated, or deleted — the stories stay independently versioned under
+     `outputs/<project_id>/user_stories/versions.json`.
+
 ---
 
 ## 5. Project Structure
@@ -161,6 +185,12 @@ sdlc-ba-agent/
         prompts/
           generate_hld.txt
           refine_hld.txt
+      initial_user_story/    <- Phase 3: accepted BRD -> draft user stories (independent of HLD)
+        agent.py             <- Gemini/LangChain wrapper (generate_stories + refine_stories)
+        service.py           <- BRD gate + orchestrates agent -> story versions (subdir "user_stories")
+        prompts/
+          generate_user_stories.txt
+          refine_user_stories.txt
     parsers/
       detector.py            <- detects .docx / .pdf / .txt
       docx_parser.py
@@ -168,10 +198,10 @@ sdlc-ba-agent/
       text_parser.py
       text_cleaner.py        <- preprocessing (removes headers/footers/page numbers)
     document_generator/
-      brd_generator.py       <- markdown -> formatted .docx (generate_brd_docx / generate_hld_docx)
+      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx)
     services/
       version_service.py     <- version history (JSON file per project/stream, no DB yet)
-      version_text.py        <- shared "**Version:** N" stamping helper (BRD + HLD)
+      version_text.py        <- shared "**Version:** N" stamping helper (BRD + HLD + stories)
     utils/
       config.py              <- reads .env via pydantic-settings
       logger.py               <- centralized logging to logs/app.log
@@ -179,7 +209,7 @@ sdlc-ba-agent/
       streamlit_app.py       <- the UI, calls the service layer only
   tests/                     <- deterministic pytest suite (stub agents, no Gemini calls)
   uploads/                   <- uploaded SOW files land here
-  outputs/                   <- BRD versions + outputs/<id>/hld/ HLD versions + .docx exports
+  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + .docx exports
   logs/                      <- app.log (rotating)
   requirements.txt
   pytest.ini
@@ -209,12 +239,14 @@ pytest
 
 ---
 
-## 7. What's Deliberately NOT in Phases 1–2
+## 7. What's Deliberately NOT in Phases 1–3
 
-Phase 1 delivered the Business Analyst Agent (SOW → BRD). Phase 2 adds the
-Solution Architect Agent (accepted BRD → HLD). Still **not** included, by
-scope: LLD / Technical Architect Agent, Initial User Story / User Story
-Refinement Agents, QA / Test Case Agent, Documentation and Project Closure
-Agents, Project Memory, LangGraph multi-agent orchestration, RAG, a real
-database, and authentication / multi-user support. Persistence is still plain
-JSON files; the database decision is deferred to the Project Memory phase.
+Phase 1 delivered the Business Analyst Agent (SOW → BRD). Phase 2 added the
+Solution Architect Agent (accepted BRD → HLD). Phase 3 adds the Initial User
+Story Agent (accepted BRD → draft user stories). Still **not** included, by
+scope: LLD / Technical Architect Agent, the **User Story Refinement Agent**
+(the later stage that combines BRD + HLD + LLD into technically refined final
+stories), QA / Test Case Agent, Documentation and Project Closure Agents,
+Project Memory, LangGraph multi-agent orchestration, RAG, a real database, and
+authentication / multi-user support. Persistence is still plain JSON files; the
+database decision is deferred to the Project Memory phase.
