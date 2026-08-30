@@ -48,9 +48,16 @@ from app.agents.initial_user_story.service import (
 from app.agents.initial_user_story.service import (
     NoFinalBRDError as NoFinalBRDErrorForStories,
 )
+from app.agents.low_level_design.agent import LLDAgentError
+from app.agents.low_level_design.service import (
+    LLDLockedError,
+    LowLevelDesignService,
+    NoFinalHLDError,
+)
 from app.document_generator.brd_generator import (
     generate_brd_docx,
     generate_hld_docx,
+    generate_lld_docx,
     generate_user_stories_docx,
 )
 from app.utils.config import settings
@@ -80,12 +87,12 @@ def friendly_error(exc: Exception) -> str:
         return ("No readable text was found in that document. If it's a scanned PDF, "
                 "please upload a text-based version instead.")
     if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError,
-                        InitialUserStoryAgentError)):
+                        InitialUserStoryAgentError, LLDAgentError)):
         return ("Unable to reach the Gemini API. Please check your API key and network "
                 "connection, then try again.")
-    if isinstance(exc, (NoFinalBRDError, NoFinalBRDErrorForStories)):
+    if isinstance(exc, (NoFinalBRDError, NoFinalBRDErrorForStories, NoFinalHLDError)):
         return str(exc)
-    if isinstance(exc, (BRDLockedError, HLDLockedError, UserStoryLockedError)):
+    if isinstance(exc, (BRDLockedError, HLDLockedError, UserStoryLockedError, LLDLockedError)):
         return str(exc)
     if isinstance(exc, ValueError):
         return str(exc)
@@ -132,6 +139,19 @@ if "us_service" not in st.session_state:
 
 us_service: InitialUserStoryService = st.session_state.us_service
 
+if "lld_service" not in st.session_state:
+    try:
+        st.session_state.lld_service = LowLevelDesignService(
+            project_id=st.session_state.project_id,
+            sa_service=sa_service,
+            ba_service=service,
+        )
+    except Exception as exc:
+        st.error(friendly_error(exc))
+        st.stop()
+
+lld_service: LowLevelDesignService = st.session_state.lld_service
+
 
 def refresh_versions() -> None:
     try:
@@ -157,6 +177,14 @@ def refresh_us_versions() -> None:
         st.error(friendly_error(exc))
 
 
+def refresh_lld_versions() -> None:
+    try:
+        st.session_state.lld_versions = lld_service.get_all_versions()
+    except Exception as exc:
+        st.session_state.lld_versions = []
+        st.error(friendly_error(exc))
+
+
 if "versions" not in st.session_state:
     refresh_versions()
 
@@ -165,6 +193,9 @@ if "hld_versions" not in st.session_state:
 
 if "us_versions" not in st.session_state:
     refresh_us_versions()
+
+if "lld_versions" not in st.session_state:
+    refresh_lld_versions()
 
 versions = st.session_state.versions
 latest_version = versions[-1] if versions else None
@@ -180,6 +211,11 @@ us_versions = st.session_state.us_versions
 us_latest = us_versions[-1] if us_versions else None
 us_final = next((v for v in us_versions if v.is_final), None)
 us_is_locked = bool(us_final and us_final.is_locked)
+
+lld_versions = st.session_state.lld_versions
+lld_latest = lld_versions[-1] if lld_versions else None
+lld_final = next((v for v in lld_versions if v.is_final), None)
+lld_is_locked = bool(lld_final and lld_final.is_locked)
 
 
 # --- sidebar: project status + version history --------------------------------------
@@ -249,6 +285,20 @@ with st.sidebar:
         st.caption("Accept a BRD first to unlock the User Story stage.")
 
     st.divider()
+    st.subheader("LLD")
+    if lld_latest:
+        st.metric("Current LLD Version", f"v{lld_latest.version}")
+        if lld_final:
+            lld_status = "Locked" if lld_final.is_locked else "Unlocked"
+            st.success(f"Final LLD: v{lld_final.version}\n\nStatus: {lld_status}")
+        else:
+            st.info("No final LLD selected yet.")
+    elif hld_final:
+        st.caption("Ready to generate. Open the LLD Workspace tab.")
+    else:
+        st.caption("Accept an HLD first to unlock the LLD stage.")
+
+    st.divider()
     if st.button("Start New Project"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -260,9 +310,9 @@ with st.sidebar:
 st.title("Business Analyst Agent - SOW to BRD")
 st.caption("Phase 1: Statement of Work to Business Requirement Document")
 
-tab_generate, tab_workspace, tab_hld, tab_stories = st.tabs(
+tab_generate, tab_workspace, tab_hld, tab_stories, tab_lld = st.tabs(
     ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace",
-     "Step 4: User Story Workspace"]
+     "Step 4: User Story Workspace", "Step 5: LLD Workspace"]
 )
 
 
@@ -1010,6 +1060,253 @@ with tab_stories:
                             mime=("application/vnd.openxmlformats-officedocument"
                                   ".wordprocessingml.document"),
                             key="us_download_btn",
+                        )
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+
+# --- STEP 5: LLD workspace (Low-Level Design Agent) ------------------------------------
+
+with tab_lld:
+    st.caption("Phase 4: accepted HLD (+ BRD / optional draft user stories) to Low-Level Design")
+
+    if hld_final is None:
+        st.warning("Accept an HLD before generating the LLD.")
+        st.caption("Go to the HLD Workspace, choose a version as the Final HLD, and it will "
+                   "become available here. The LLD is generated from the accepted HLD; the BRD "
+                   "is supporting context and draft user stories are optional context - user "
+                   "stories are never required.")
+        st.button("Generate LLD", disabled=True)
+
+    elif lld_latest is None:
+        st.subheader("Generate the Low-Level Design")
+        us_note = (f" Draft user stories (v{us_latest.version}) will be included as optional "
+                   "context." if us_latest is not None
+                   else " No draft user stories exist yet - the LLD will be generated from the "
+                        "HLD and BRD only.")
+        st.caption(f"The LLD will be generated from the Accepted HLD (v{hld_final.version})."
+                   + us_note + " This creates LLD Version 1.")
+        if st.button("Generate LLD", type="primary"):
+            with st.spinner("Sending the accepted HLD and context to Gemini and drafting the LLD..."):
+                try:
+                    start = time.time()
+                    lld_version = lld_service.generate_initial_lld()
+                    elapsed = time.time() - start
+                    logger.info(f"LLD v{lld_version.version} generated in {elapsed:.1f}s")
+
+                    refresh_lld_versions()
+                    st.session_state.lld_viewing_version = lld_version.version
+                    st.success(f"LLD Version {lld_version.version} generated in {elapsed:.1f}s.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+    else:
+        lld_viewing_number = st.session_state.get("lld_viewing_version", lld_latest.version)
+        try:
+            lld_viewing = lld_service.get_version(lld_viewing_number) or lld_latest
+        except Exception as exc:
+            st.error(friendly_error(exc))
+            lld_viewing = lld_latest
+
+        lld_is_current = lld_viewing.version == lld_latest.version
+        lld_editable = lld_is_current and not lld_is_locked
+
+        # --- stale-vs-HLD hint (non-blocking; no auto-regeneration) ---
+        try:
+            if lld_service.hld_changed_since_lld():
+                src = lld_service.source_hld_version()
+                src_text = f"HLD v{src}" if src is not None else "an earlier HLD version"
+                st.warning(
+                    f"This LLD was generated from {src_text}, but the Accepted HLD is now "
+                    f"v{hld_final.version}. The LLD may be stale. Review it, refine it, or "
+                    "start a new project to regenerate from scratch - nothing is changed "
+                    "automatically."
+                )
+        except Exception as exc:
+            st.error(friendly_error(exc))
+
+        # --- status banner ---
+        lld_status_cols = st.columns([2, 2, 2])
+        with lld_status_cols[0]:
+            st.metric("Viewing", f"v{lld_viewing.version}")
+        with lld_status_cols[1]:
+            st.metric("Type", SOURCE_LABELS.get(lld_viewing.source, lld_viewing.source))
+        with lld_status_cols[2]:
+            st.metric("Status", "Accepted" if lld_viewing.is_final else "Draft")
+
+        if lld_is_locked:
+            if lld_viewing.is_final:
+                st.success(f"This is the Final LLD (v{lld_viewing.version}) and it is locked "
+                           "against further changes.")
+            else:
+                st.warning(f"The Final LLD (v{lld_final.version}) is locked. "
+                           "Unlock it below to make further changes.")
+        elif not lld_is_current:
+            st.info(f"You are viewing an older LLD version (v{lld_viewing.version}). "
+                    f"Editing is only available on the current version (v{lld_latest.version}).")
+
+        st.divider()
+
+        lld_tab_preview, lld_tab_edit, lld_tab_refine, lld_tab_history = st.tabs(
+            ["Preview", "Edit", "AI Refine", "History"]
+        )
+
+        with lld_tab_preview:
+            st.markdown(lld_viewing.content)
+
+        with lld_tab_edit:
+            if not lld_editable:
+                st.info("Editing is disabled for this version. "
+                        + ("Unlock the Final LLD to continue." if lld_is_locked
+                           else "Switch to the current version to edit."))
+                st.text_area("LLD content (read-only)", value=lld_viewing.content,
+                             height=500, disabled=True, key=f"lld_ro_{lld_viewing.version}")
+            else:
+                st.caption("Edit the LLD below. Saving creates a NEW version - "
+                           "the current version is never overwritten.")
+                lld_edited_text = st.text_area(
+                    "LLD content (markdown)",
+                    value=lld_viewing.content,
+                    height=500,
+                    key=f"lld_editor_{lld_viewing.version}",
+                )
+                lld_change_note = st.text_input(
+                    "Change description (optional)",
+                    placeholder="e.g. Added idempotency key to the registration endpoint",
+                    key=f"lld_note_{lld_viewing.version}",
+                )
+                if st.button("Save as New Version", type="primary", key="lld_save_edit"):
+                    try:
+                        new_lld = lld_service.save_manual_edit(
+                            lld_edited_text, note=lld_change_note.strip() or "Manual edit"
+                        )
+                        refresh_lld_versions()
+                        st.session_state.lld_viewing_version = new_lld.version
+                        st.success(f"Saved as LLD Version {new_lld.version}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+        with lld_tab_refine:
+            if not lld_editable:
+                st.info("AI refinement is disabled for this version. "
+                        + ("Unlock the Final LLD to continue." if lld_is_locked
+                           else "Switch to the current version to refine."))
+            else:
+                st.caption("Describe your change in plain English. The AI receives the CURRENT "
+                           "LLD plus your feedback - unaffected sections are preserved.")
+                lld_feedback = st.text_area(
+                    "Refinement instruction",
+                    placeholder="e.g. Add a caching table for product lookups.",
+                    key="lld_feedback_input",
+                    height=120,
+                )
+                if st.button("Refine with AI", type="primary",
+                             disabled=not lld_feedback.strip(), key="lld_refine_btn"):
+                    with st.spinner("Sending the current LLD and your feedback to Gemini..."):
+                        try:
+                            start = time.time()
+                            new_lld = lld_service.refine_with_ai(lld_feedback)
+                            elapsed = time.time() - start
+                            logger.info(f"LLD refined to v{new_lld.version} in {elapsed:.1f}s")
+
+                            refresh_lld_versions()
+                            st.session_state.lld_viewing_version = new_lld.version
+                            st.success(f"Created LLD Version {new_lld.version} in {elapsed:.1f}s.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+
+        with lld_tab_history:
+            st.caption("All LLD versions are permanent. Nothing is ever overwritten or deleted.")
+            for v in reversed(lld_versions):
+                cols = st.columns([1, 2, 3, 2, 1])
+                cols[0].markdown(f"**v{v.version}**")
+                cols[1].markdown(SOURCE_LABELS.get(v.source, v.source))
+                cols[2].caption(v.note or "-")
+                badges = []
+                if lld_latest and v.version == lld_latest.version:
+                    badges.append("Current")
+                if v.is_final:
+                    badges.append("Accepted")
+                    if v.is_locked:
+                        badges.append("Locked")
+                cols[3].caption(" / ".join(badges) if badges else "Draft")
+                if cols[4].button("View", key=f"lld_hist_view_{v.version}"):
+                    st.session_state.lld_viewing_version = v.version
+                    st.rerun()
+
+        st.divider()
+
+        st.subheader("Final LLD")
+        lld_final_cols = st.columns([2, 2, 2])
+
+        with lld_final_cols[0]:
+            if not lld_viewing.is_final:
+                if st.button(f"Choose v{lld_viewing.version} as Final LLD", key="lld_choose_final"):
+                    try:
+                        lld_service.choose_final_lld(lld_viewing.version)
+                        refresh_lld_versions()
+                        st.success(f"LLD Version {lld_viewing.version} is now the Final LLD.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+            else:
+                st.caption("This version is the Final LLD.")
+
+        with lld_final_cols[1]:
+            if lld_is_locked:
+                if st.session_state.get("lld_confirm_unlock"):
+                    st.warning("Unlock the Final LLD? It stays in history unchanged; "
+                               "any new edit creates a new version.")
+                    yes_col, no_col = st.columns(2)
+                    if yes_col.button("Yes, unlock", key="lld_unlock_yes"):
+                        try:
+                            lld_service.unlock_final_lld()
+                            st.session_state.lld_confirm_unlock = False
+                            refresh_lld_versions()
+                            st.success("Final LLD unlocked. Further edits will create a new version.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+                    if no_col.button("Cancel", key="lld_unlock_cancel"):
+                        st.session_state.lld_confirm_unlock = False
+                        st.rerun()
+                else:
+                    if st.button("Unlock Final LLD", key="lld_unlock_btn"):
+                        st.session_state.lld_confirm_unlock = True
+                        st.rerun()
+
+        with lld_final_cols[2]:
+            # Export always uses the version being viewed, so what you see is what you download.
+            if st.button("Prepare .docx for download", key="lld_prepare_docx"):
+                with st.spinner("Formatting Word document..."):
+                    try:
+                        lld_docx_path = (Path(settings.resolved_output_dir())
+                                         / st.session_state.project_id
+                                         / "lld"
+                                         / f"LLD_v{lld_viewing.version}.docx")
+                        generate_lld_docx(lld_viewing.content, lld_docx_path)
+                        st.session_state.lld_docx_ready_path = str(lld_docx_path)
+                        st.session_state.lld_docx_ready_version = lld_viewing.version
+                        logger.info(f"LLD DOCX exported for v{lld_viewing.version}")
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+            lld_ready_path = st.session_state.get("lld_docx_ready_path")
+            lld_ready_version = st.session_state.get("lld_docx_ready_version")
+            if (lld_ready_path and Path(lld_ready_path).exists()
+                    and lld_ready_version == lld_viewing.version):
+                try:
+                    with open(lld_ready_path, "rb") as f:
+                        st.download_button(
+                            f"Download LLD v{lld_viewing.version}.docx",
+                            data=f.read(),
+                            file_name=f"LLD_v{lld_viewing.version}.docx",
+                            mime=("application/vnd.openxmlformats-officedocument"
+                                  ".wordprocessingml.document"),
+                            key="lld_download_btn",
                         )
                 except Exception as exc:
                     st.error(friendly_error(exc))

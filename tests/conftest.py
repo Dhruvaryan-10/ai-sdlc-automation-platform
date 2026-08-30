@@ -91,6 +91,24 @@ so that I can access the application.
 **BRD Reference:** FR-1
 """
 
+STUB_LLD = """# Test Project — Low-Level Design
+
+**Version:** 0
+**Generated Date:** 2026-01-01
+**Client:** Acme Corp
+**Project Type:** Web Application
+**Source:** Accepted HLD
+
+## 1. Introduction and Source Traceability
+Detailed design derived from the stub HLD for testing.
+
+## 3. Classes, Responsibilities and Interfaces
+- RegistrationService: creates and validates customer accounts.
+
+## 9. Error Handling
+Invalid input returns a 400 with a machine-readable error code.
+"""
+
 
 class StubBAAgent:
     """Stands in for BusinessAnalystAgent. Returns canned markdown."""
@@ -142,6 +160,28 @@ class StubUserStoryAgent:
         return current_stories + f"\n\n## US-002 — Added Story\n{user_feedback}\n"
 
 
+class StubLLDAgent:
+    """Stands in for LowLevelDesignAgent. Returns canned markdown."""
+
+    def __init__(self):
+        self.generate_calls = []
+        self.refine_calls = []
+
+    def generate_lld(
+        self,
+        hld_text: str,
+        brd_text: str,
+        user_stories_text: str,
+        metadata: ProjectMetadata,
+    ) -> str:
+        self.generate_calls.append((hld_text, brd_text, user_stories_text, metadata))
+        return STUB_LLD
+
+    def refine_lld(self, current_lld: str, user_feedback: str, current_version: int) -> str:
+        self.refine_calls.append((current_lld, user_feedback, current_version))
+        return current_lld + f"\n\n## 14. Addendum\n{user_feedback}\n"
+
+
 @pytest.fixture
 def stub_ba_agent():
     return StubBAAgent()
@@ -155,6 +195,11 @@ def stub_sa_agent():
 @pytest.fixture
 def stub_us_agent():
     return StubUserStoryAgent()
+
+
+@pytest.fixture
+def stub_lld_agent():
+    return StubLLDAgent()
 
 
 @pytest.fixture
