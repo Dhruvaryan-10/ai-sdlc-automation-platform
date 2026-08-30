@@ -34,7 +34,13 @@ from app.agents.business_analyst.service import (
     EmptyDocumentError,
     UnsupportedFileTypeError,
 )
-from app.document_generator.brd_generator import generate_brd_docx
+from app.agents.solution_architect.agent import SolutionArchitectAgentError
+from app.agents.solution_architect.service import (
+    HLDLockedError,
+    NoFinalBRDError,
+    SolutionArchitectService,
+)
+from app.document_generator.brd_generator import generate_brd_docx, generate_hld_docx
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -61,10 +67,12 @@ def friendly_error(exc: Exception) -> str:
     if isinstance(exc, EmptyDocumentError):
         return ("No readable text was found in that document. If it's a scanned PDF, "
                 "please upload a text-based version instead.")
-    if isinstance(exc, BusinessAnalystAgentError):
+    if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError)):
         return ("Unable to reach the Gemini API. Please check your API key and network "
                 "connection, then try again.")
-    if isinstance(exc, BRDLockedError):
+    if isinstance(exc, NoFinalBRDError):
+        return str(exc)
+    if isinstance(exc, (BRDLockedError, HLDLockedError)):
         return str(exc)
     if isinstance(exc, ValueError):
         return str(exc)
@@ -89,6 +97,17 @@ if "service" not in st.session_state:
 
 service: BusinessAnalystService = st.session_state.service
 
+if "sa_service" not in st.session_state:
+    try:
+        st.session_state.sa_service = SolutionArchitectService(
+            project_id=st.session_state.project_id, ba_service=service
+        )
+    except Exception as exc:
+        st.error(friendly_error(exc))
+        st.stop()
+
+sa_service: SolutionArchitectService = st.session_state.sa_service
+
 
 def refresh_versions() -> None:
     try:
@@ -98,13 +117,29 @@ def refresh_versions() -> None:
         st.error(friendly_error(exc))
 
 
+def refresh_hld_versions() -> None:
+    try:
+        st.session_state.hld_versions = sa_service.get_all_versions()
+    except Exception as exc:
+        st.session_state.hld_versions = []
+        st.error(friendly_error(exc))
+
+
 if "versions" not in st.session_state:
     refresh_versions()
+
+if "hld_versions" not in st.session_state:
+    refresh_hld_versions()
 
 versions = st.session_state.versions
 latest_version = versions[-1] if versions else None
 final_version = next((v for v in versions if v.is_final), None)
 is_locked = bool(final_version and final_version.is_locked)
+
+hld_versions = st.session_state.hld_versions
+hld_latest = hld_versions[-1] if hld_versions else None
+hld_final = next((v for v in hld_versions if v.is_final), None)
+hld_is_locked = bool(hld_final and hld_final.is_locked)
 
 
 # --- sidebar: project status + version history --------------------------------------
@@ -146,6 +181,20 @@ with st.sidebar:
                     st.rerun()
 
     st.divider()
+    st.subheader("HLD")
+    if hld_latest:
+        st.metric("Current HLD Version", f"v{hld_latest.version}")
+        if hld_final:
+            hld_status = "Locked" if hld_final.is_locked else "Unlocked"
+            st.success(f"Final HLD: v{hld_final.version}\n\nStatus: {hld_status}")
+        else:
+            st.info("No final HLD selected yet.")
+    elif final_version:
+        st.caption("Ready to generate. Open the HLD Workspace tab.")
+    else:
+        st.caption("Accept a BRD first to unlock the HLD stage.")
+
+    st.divider()
     if st.button("Start New Project"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -157,7 +206,9 @@ with st.sidebar:
 st.title("Business Analyst Agent - SOW to BRD")
 st.caption("Phase 1: Statement of Work to Business Requirement Document")
 
-tab_generate, tab_workspace = st.tabs(["Step 1: Upload & Generate", "Step 2: BRD Workspace"])
+tab_generate, tab_workspace, tab_hld = st.tabs(
+    ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace"]
+)
 
 
 # --- STEP 1: upload + generate ----------------------------------------------------------
@@ -415,6 +466,248 @@ with tab_workspace:
                             file_name=f"BRD_v{viewing_version.version}.docx",
                             mime=("application/vnd.openxmlformats-officedocument"
                                   ".wordprocessingml.document"),
+                        )
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+
+# --- STEP 3: HLD workspace (Solution Architect Agent) --------------------------------------
+
+with tab_hld:
+    st.caption("Phase 2: accepted BRD to High-Level Design")
+
+    if final_version is None:
+        st.warning("Accept a BRD before generating the HLD.")
+        st.caption("Go to the BRD Workspace, choose a version as the Final BRD, and it will "
+                   "become available here. The HLD is only ever generated from the accepted "
+                   "BRD - never from the SOW or a draft.")
+        st.button("Generate HLD", disabled=True)
+
+    elif hld_latest is None:
+        st.subheader("Generate the High-Level Design")
+        st.caption(f"The HLD will be generated from the Accepted BRD (v{final_version.version}). "
+                   "This creates HLD Version 1.")
+        if st.button("Generate HLD", type="primary"):
+            with st.spinner("Sending the accepted BRD to Gemini and drafting the HLD..."):
+                try:
+                    start = time.time()
+                    hld_version = sa_service.generate_initial_hld()
+                    elapsed = time.time() - start
+                    logger.info(f"HLD v{hld_version.version} generated in {elapsed:.1f}s")
+
+                    refresh_hld_versions()
+                    st.session_state.hld_viewing_version = hld_version.version
+                    st.success(f"HLD Version {hld_version.version} generated in {elapsed:.1f}s.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+    else:
+        hld_viewing_number = st.session_state.get("hld_viewing_version", hld_latest.version)
+        try:
+            hld_viewing = sa_service.get_version(hld_viewing_number) or hld_latest
+        except Exception as exc:
+            st.error(friendly_error(exc))
+            hld_viewing = hld_latest
+
+        hld_is_current = hld_viewing.version == hld_latest.version
+        hld_editable = hld_is_current and not hld_is_locked
+
+        # --- stale-vs-BRD hint (non-blocking; no auto-regeneration) ---
+        try:
+            if sa_service.brd_changed_since_hld():
+                src = sa_service.source_brd_version()
+                src_text = f"BRD v{src}" if src is not None else "an earlier BRD version"
+                st.warning(
+                    f"This HLD was generated from {src_text}, but the Accepted BRD is now "
+                    f"v{final_version.version}. The HLD may be stale. Review it, refine it, "
+                    "or start a new project to regenerate from scratch - nothing is changed "
+                    "automatically."
+                )
+        except Exception as exc:
+            st.error(friendly_error(exc))
+
+        # --- status banner ---
+        hld_status_cols = st.columns([2, 2, 2])
+        with hld_status_cols[0]:
+            st.metric("Viewing", f"v{hld_viewing.version}")
+        with hld_status_cols[1]:
+            st.metric("Type", SOURCE_LABELS.get(hld_viewing.source, hld_viewing.source))
+        with hld_status_cols[2]:
+            st.metric("Status", "Accepted" if hld_viewing.is_final else "Draft")
+
+        if hld_is_locked:
+            if hld_viewing.is_final:
+                st.success(f"This is the Final HLD (v{hld_viewing.version}) and it is locked "
+                           "against further changes.")
+            else:
+                st.warning(f"The Final HLD (v{hld_final.version}) is locked. "
+                           "Unlock it below to make further changes.")
+        elif not hld_is_current:
+            st.info(f"You are viewing an older HLD version (v{hld_viewing.version}). "
+                    f"Editing is only available on the current version (v{hld_latest.version}).")
+
+        st.divider()
+
+        hld_tab_preview, hld_tab_edit, hld_tab_refine, hld_tab_history = st.tabs(
+            ["Preview", "Edit", "AI Refine", "History"]
+        )
+
+        with hld_tab_preview:
+            st.markdown(hld_viewing.content)
+
+        with hld_tab_edit:
+            if not hld_editable:
+                st.info("Editing is disabled for this version. "
+                        + ("Unlock the Final HLD to continue." if hld_is_locked
+                           else "Switch to the current version to edit."))
+                st.text_area("HLD content (read-only)", value=hld_viewing.content,
+                             height=500, disabled=True, key=f"hld_ro_{hld_viewing.version}")
+            else:
+                st.caption("Edit the HLD below. Saving creates a NEW version - "
+                           "the current version is never overwritten.")
+                hld_edited_text = st.text_area(
+                    "HLD content (markdown)",
+                    value=hld_viewing.content,
+                    height=500,
+                    key=f"hld_editor_{hld_viewing.version}",
+                )
+                hld_change_note = st.text_input(
+                    "Change description (optional)",
+                    placeholder="e.g. Clarified deployment topology",
+                    key=f"hld_note_{hld_viewing.version}",
+                )
+                if st.button("Save as New Version", type="primary", key="hld_save_edit"):
+                    try:
+                        new_hld = sa_service.save_manual_edit(
+                            hld_edited_text, note=hld_change_note.strip() or "Manual edit"
+                        )
+                        refresh_hld_versions()
+                        st.session_state.hld_viewing_version = new_hld.version
+                        st.success(f"Saved as HLD Version {new_hld.version}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+        with hld_tab_refine:
+            if not hld_editable:
+                st.info("AI refinement is disabled for this version. "
+                        + ("Unlock the Final HLD to continue." if hld_is_locked
+                           else "Switch to the current version to refine."))
+            else:
+                st.caption("Describe your change in plain English. The AI receives the CURRENT "
+                           "HLD plus your feedback - unaffected sections are preserved.")
+                hld_feedback = st.text_area(
+                    "Refinement instruction",
+                    placeholder="e.g. Add a caching layer for frequently accessed product data.",
+                    key="hld_feedback_input",
+                    height=120,
+                )
+                if st.button("Refine with AI", type="primary",
+                             disabled=not hld_feedback.strip(), key="hld_refine_btn"):
+                    with st.spinner("Sending the current HLD and your feedback to Gemini..."):
+                        try:
+                            start = time.time()
+                            new_hld = sa_service.refine_with_ai(hld_feedback)
+                            elapsed = time.time() - start
+                            logger.info(f"HLD refined to v{new_hld.version} in {elapsed:.1f}s")
+
+                            refresh_hld_versions()
+                            st.session_state.hld_viewing_version = new_hld.version
+                            st.success(f"Created HLD Version {new_hld.version} in {elapsed:.1f}s.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+
+        with hld_tab_history:
+            st.caption("All HLD versions are permanent. Nothing is ever overwritten or deleted.")
+            for v in reversed(hld_versions):
+                cols = st.columns([1, 2, 3, 2, 1])
+                cols[0].markdown(f"**v{v.version}**")
+                cols[1].markdown(SOURCE_LABELS.get(v.source, v.source))
+                cols[2].caption(v.note or "-")
+                badges = []
+                if hld_latest and v.version == hld_latest.version:
+                    badges.append("Current")
+                if v.is_final:
+                    badges.append("Accepted")
+                    if v.is_locked:
+                        badges.append("Locked")
+                cols[3].caption(" / ".join(badges) if badges else "Draft")
+                if cols[4].button("View", key=f"hld_hist_view_{v.version}"):
+                    st.session_state.hld_viewing_version = v.version
+                    st.rerun()
+
+        st.divider()
+
+        st.subheader("Final HLD")
+        hld_final_cols = st.columns([2, 2, 2])
+
+        with hld_final_cols[0]:
+            if not hld_viewing.is_final:
+                if st.button(f"Choose v{hld_viewing.version} as Final HLD", key="hld_choose_final"):
+                    try:
+                        sa_service.choose_final_hld(hld_viewing.version)
+                        refresh_hld_versions()
+                        st.success(f"HLD Version {hld_viewing.version} is now the Final HLD.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+            else:
+                st.caption("This version is the Final HLD.")
+
+        with hld_final_cols[1]:
+            if hld_is_locked:
+                if st.session_state.get("hld_confirm_unlock"):
+                    st.warning("Unlock the Final HLD? It stays in history unchanged; "
+                               "any new edit creates a new version.")
+                    yes_col, no_col = st.columns(2)
+                    if yes_col.button("Yes, unlock", key="hld_unlock_yes"):
+                        try:
+                            sa_service.unlock_final_hld()
+                            st.session_state.hld_confirm_unlock = False
+                            refresh_hld_versions()
+                            st.success("Final HLD unlocked. Further edits will create a new version.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+                    if no_col.button("Cancel", key="hld_unlock_cancel"):
+                        st.session_state.hld_confirm_unlock = False
+                        st.rerun()
+                else:
+                    if st.button("Unlock Final HLD", key="hld_unlock_btn"):
+                        st.session_state.hld_confirm_unlock = True
+                        st.rerun()
+
+        with hld_final_cols[2]:
+            # Export always uses the version being viewed, so what you see is what you download.
+            if st.button("Prepare .docx for download", key="hld_prepare_docx"):
+                with st.spinner("Formatting Word document..."):
+                    try:
+                        hld_docx_path = (Path(settings.resolved_output_dir())
+                                         / st.session_state.project_id
+                                         / "hld"
+                                         / f"HLD_v{hld_viewing.version}.docx")
+                        generate_hld_docx(hld_viewing.content, hld_docx_path)
+                        st.session_state.hld_docx_ready_path = str(hld_docx_path)
+                        st.session_state.hld_docx_ready_version = hld_viewing.version
+                        logger.info(f"HLD DOCX exported for v{hld_viewing.version}")
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+            hld_ready_path = st.session_state.get("hld_docx_ready_path")
+            hld_ready_version = st.session_state.get("hld_docx_ready_version")
+            if (hld_ready_path and Path(hld_ready_path).exists()
+                    and hld_ready_version == hld_viewing.version):
+                try:
+                    with open(hld_ready_path, "rb") as f:
+                        st.download_button(
+                            f"Download HLD v{hld_viewing.version}.docx",
+                            data=f.read(),
+                            file_name=f"HLD_v{hld_viewing.version}.docx",
+                            mime=("application/vnd.openxmlformats-officedocument"
+                                  ".wordprocessingml.document"),
+                            key="hld_download_btn",
                         )
                 except Exception as exc:
                     st.error(friendly_error(exc))

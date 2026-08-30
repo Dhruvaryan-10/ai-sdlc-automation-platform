@@ -1,11 +1,17 @@
-# BA Agent — Phase 1 (SOW → BRD)
+# SDLC Agent — Phase 1 (SOW → BRD) + Phase 2 (BRD → HLD)
 
-This is **Phase 1** of the AI-powered SDLC platform: a single AI Agent (the
-**Business Analyst Agent**) that turns an uploaded Statement of Work (SOW)
-into a Business Requirement Document (BRD), with manual editing, AI-assisted
-refinement, full version history, final-version locking, and Word export.
+The AI-powered SDLC platform, built one agent at a time:
 
-No databases, no LangGraph, no other agents — just this one, done properly.
+- **Phase 1 — Business Analyst Agent:** turns an uploaded Statement of Work
+  (SOW) into a Business Requirement Document (BRD).
+- **Phase 2 — Solution Architect Agent:** turns the **accepted/final BRD**
+  into a High-Level Design (HLD).
+
+Both stages share the same lifecycle: manual editing, AI-assisted refinement,
+full version history, final-version locking/unlocking, and Word export. BRD and
+HLD versions are stored independently.
+
+No databases, no LangGraph, no RAG — plain JSON persistence, done properly.
 
 ---
 
@@ -117,6 +123,23 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
    upload a different SOW. Each project's version history is saved under
    `outputs/<project_id>/versions.json`.
 
+4. **Tab 3 — HLD Workspace** (Phase 2, Solution Architect Agent)
+   - Available only once a BRD has been marked **Final** (Tab 2). Until then
+     the tab shows *"Accept a BRD before generating the HLD."* and the button
+     is disabled — the HLD is never built from the SOW or a draft BRD.
+   - Click **Generate HLD** to produce **HLD Version 1** from the accepted
+     BRD. It contains Architecture Overview, Architecture Description, Modules /
+     Components, Responsibilities, Interactions, API Overview, Deployment,
+     Database Design Overview, Security, Scalability/Performance, and
+     Assumptions & Architectural Decisions — kept deliberately high-level.
+   - **Edit**, **AI Refine** (e.g. *"Add a caching layer for frequently
+     accessed product data."*), **History**, **Choose Final HLD**, **Unlock**,
+     and **Download HLD.docx** work exactly like the BRD workspace.
+   - If the accepted BRD is changed after the HLD was generated, a
+     non-blocking warning appears saying the HLD may be stale. Nothing is
+     regenerated or deleted automatically — the HLD stays independently
+     versioned under `outputs/<project_id>/hld/versions.json`.
+
 ---
 
 ## 5. Project Structure
@@ -132,6 +155,12 @@ sdlc-ba-agent/
         prompts/
           generate_brd.txt
           refine_brd.txt
+      solution_architect/    <- Phase 2: accepted BRD -> HLD
+        agent.py             <- Gemini/LangChain wrapper (generate_hld + refine_hld)
+        service.py           <- BRD gate + orchestrates agent -> HLD versions (subdir "hld")
+        prompts/
+          generate_hld.txt
+          refine_hld.txt
     parsers/
       detector.py            <- detects .docx / .pdf / .txt
       docx_parser.py
@@ -139,19 +168,28 @@ sdlc-ba-agent/
       text_parser.py
       text_cleaner.py        <- preprocessing (removes headers/footers/page numbers)
     document_generator/
-      brd_generator.py       <- markdown BRD -> formatted .docx
+      brd_generator.py       <- markdown -> formatted .docx (generate_brd_docx / generate_hld_docx)
     services/
-      version_service.py     <- version history (JSON file per project, no DB yet)
+      version_service.py     <- version history (JSON file per project/stream, no DB yet)
+      version_text.py        <- shared "**Version:** N" stamping helper (BRD + HLD)
     utils/
       config.py              <- reads .env via pydantic-settings
       logger.py               <- centralized logging to logs/app.log
     ui/
       streamlit_app.py       <- the UI, calls the service layer only
+  tests/                     <- deterministic pytest suite (stub agents, no Gemini calls)
   uploads/                   <- uploaded SOW files land here
-  outputs/                   <- generated BRDs + exported .docx files
+  outputs/                   <- BRD versions + outputs/<id>/hld/ HLD versions + .docx exports
   logs/                      <- app.log (rotating)
   requirements.txt
+  pytest.ini
   .env.example
+```
+
+Run the test suite (no API key or network needed):
+
+```bash
+pytest
 ```
 
 ---
@@ -171,9 +209,12 @@ sdlc-ba-agent/
 
 ---
 
-## 7. What's Deliberately NOT in Phase 1
+## 7. What's Deliberately NOT in Phases 1–2
 
-Per scope, this build does **not** include: HLD/LLD generation, User Story or
-Test Case generation, LangGraph multi-agent orchestration, a real database,
-authentication/multi-user support, or the Solution Architect Agent. Those are
-Phase 2+.
+Phase 1 delivered the Business Analyst Agent (SOW → BRD). Phase 2 adds the
+Solution Architect Agent (accepted BRD → HLD). Still **not** included, by
+scope: LLD / Technical Architect Agent, Initial User Story / User Story
+Refinement Agents, QA / Test Case Agent, Documentation and Project Closure
+Agents, Project Memory, LangGraph multi-agent orchestration, RAG, a real
+database, and authentication / multi-user support. Persistence is still plain
+JSON files; the database decision is deferred to the Project Memory phase.

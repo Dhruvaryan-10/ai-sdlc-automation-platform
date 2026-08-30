@@ -151,3 +151,14 @@ def generate_brd_docx(brd_markdown: str, output_path: str | Path) -> Path:
 
     logger.info(f"Generated BRD .docx at '{output_path}'")
     return output_path
+
+
+def generate_hld_docx(hld_markdown: str, output_path: str | Path) -> Path:
+    """Convert a markdown-flavored HLD string into a formatted .docx file.
+
+    The HLD produced by the Solution Architect Agent uses the same markdown
+    conventions as the BRD (# / ## / ### headings, - bullets, 1. numbered items,
+    | pipe tables, **Key:** metadata lines), so this simply reuses the BRD
+    converter. Kept as a separate named entry point so call sites read clearly.
+    """
+    return generate_brd_docx(hld_markdown, output_path)
