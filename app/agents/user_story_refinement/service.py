@@ -61,6 +61,37 @@ _ANY_H1_PATTERN = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 # Composite source_ref token, e.g. "brd_v3;us_v1;hld_v2;lld_vnone".
 _REF_TOKEN_PATTERN = re.compile(r"(brd|us|hld|lld)_v(\d+|none)")
 
+# Application-managed provenance lines in the user-story document body.
+_SOURCE_LINE_PATTERN = re.compile(r"^\*\*Source:\*\*[^\n]*$", re.MULTILINE)
+_BUILT_FROM_LINE_PATTERN = re.compile(r"^\*\*Built From:\*\*[^\n]*$", re.MULTILINE)
+
+
+def _stamp_source_provenance(content: str, source_label: str, built_from: str) -> str:
+    """Force the document's own '**Source:**' / '**Built From:**' lines to match reality.
+
+    Phase 3 initial generation writes '**Source:** Accepted BRD'. When the User Story
+    Refinement Agent produces an artifact-refined version, the document body must say
+    '**Source:** Artifact Refinement' plus a '**Built From:**' line listing the exact
+    source versions used — not lean on the surrounding Streamlit metadata. These two
+    lines are owned by the application (the refine prompt is told not to touch them),
+    so this stamps them deterministically after the model returns.
+    """
+    new_source = f"**Source:** {source_label}"
+    new_built = f"**Built From:** {built_from}"
+
+    if _SOURCE_LINE_PATTERN.search(content):
+        content = _SOURCE_LINE_PATTERN.sub(new_source, content, count=1)
+    else:
+        logger.warning("No '**Source:**' line found in user-story content to stamp")
+        return content
+
+    if _BUILT_FROM_LINE_PATTERN.search(content):
+        content = _BUILT_FROM_LINE_PATTERN.sub(new_built, content, count=1)
+    else:
+        # Insert the Built From line immediately after the (now corrected) Source line.
+        content = _SOURCE_LINE_PATTERN.sub(f"{new_source}\n{new_built}", content, count=1)
+    return content
+
 
 class NoFinalBRDError(Exception):
     """Raised when refinement is attempted without an accepted/final BRD.
@@ -197,6 +228,16 @@ class UserStoryRefinementService:
             current_version=source_stories.version,
         )
         refined_text = stamp_version_number(refined_text, self._next_version_number())
+
+        hld_txt = f"v{final_hld.version}" if final_hld else "not used"
+        lld_txt = f"v{final_lld.version}" if final_lld else "not used"
+        built_from = (
+            f"BRD v{final_brd.version}, HLD {hld_txt}, LLD {lld_txt}, "
+            f"User Stories v{source_stories.version}"
+        )
+        refined_text = _stamp_source_provenance(
+            refined_text, "Artifact Refinement", built_from
+        )
 
         note = f"Refined from accepted BRD v{final_brd.version}"
         if final_hld:

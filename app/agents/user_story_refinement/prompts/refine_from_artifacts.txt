@@ -39,7 +39,7 @@ INSTRUCTIONS
 5. The BRD is the primary business source of truth. The HLD and LLD are CONTEXT ONLY — use them to improve completeness, dependencies, feasibility, and acceptance criteria. Do NOT turn user stories into technical design documents; detailed technical design stays in the LLD. Make the stories more implementation-ready without replacing them with implementation specifications.
 6. Do NOT invent requirements, actors, or capabilities that are not supported by the BRD/HLD/LLD.
 7. Preserve useful existing BRD references, dependencies, priorities, and notes. Only adjust them when the artifacts justify it (e.g. add a dependency the HLD/LLD reveals, correct a priority the BRD contradicts).
-8. Keep the existing document structure, heading style, field labels, and the title/header block. The application re-stamps the "**Version:**" line, so leave its number as-is.
+8. Keep the existing document structure, heading style, field labels, and the title/header block. The application manages these header lines and will overwrite them, so leave them exactly as they appear and do NOT edit their values: "**Version:**", "**Source:**", and "**Built From:**" (the latter may be absent — do not add it yourself).
 9. Do not add commentary, explanations, change logs, or notes about what you changed. Output ONLY the full, updated user stories document — from the title block onward — so it can fully replace the previous version.
 
 Now output the complete, reconciled user stories document.
