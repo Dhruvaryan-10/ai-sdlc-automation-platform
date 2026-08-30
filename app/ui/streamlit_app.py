@@ -40,7 +40,19 @@ from app.agents.solution_architect.service import (
     NoFinalBRDError,
     SolutionArchitectService,
 )
-from app.document_generator.brd_generator import generate_brd_docx, generate_hld_docx
+from app.agents.initial_user_story.agent import InitialUserStoryAgentError
+from app.agents.initial_user_story.service import (
+    InitialUserStoryService,
+    UserStoryLockedError,
+)
+from app.agents.initial_user_story.service import (
+    NoFinalBRDError as NoFinalBRDErrorForStories,
+)
+from app.document_generator.brd_generator import (
+    generate_brd_docx,
+    generate_hld_docx,
+    generate_user_stories_docx,
+)
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -67,12 +79,13 @@ def friendly_error(exc: Exception) -> str:
     if isinstance(exc, EmptyDocumentError):
         return ("No readable text was found in that document. If it's a scanned PDF, "
                 "please upload a text-based version instead.")
-    if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError)):
+    if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError,
+                        InitialUserStoryAgentError)):
         return ("Unable to reach the Gemini API. Please check your API key and network "
                 "connection, then try again.")
-    if isinstance(exc, NoFinalBRDError):
+    if isinstance(exc, (NoFinalBRDError, NoFinalBRDErrorForStories)):
         return str(exc)
-    if isinstance(exc, (BRDLockedError, HLDLockedError)):
+    if isinstance(exc, (BRDLockedError, HLDLockedError, UserStoryLockedError)):
         return str(exc)
     if isinstance(exc, ValueError):
         return str(exc)
@@ -108,6 +121,17 @@ if "sa_service" not in st.session_state:
 
 sa_service: SolutionArchitectService = st.session_state.sa_service
 
+if "us_service" not in st.session_state:
+    try:
+        st.session_state.us_service = InitialUserStoryService(
+            project_id=st.session_state.project_id, ba_service=service
+        )
+    except Exception as exc:
+        st.error(friendly_error(exc))
+        st.stop()
+
+us_service: InitialUserStoryService = st.session_state.us_service
+
 
 def refresh_versions() -> None:
     try:
@@ -125,11 +149,22 @@ def refresh_hld_versions() -> None:
         st.error(friendly_error(exc))
 
 
+def refresh_us_versions() -> None:
+    try:
+        st.session_state.us_versions = us_service.get_all_versions()
+    except Exception as exc:
+        st.session_state.us_versions = []
+        st.error(friendly_error(exc))
+
+
 if "versions" not in st.session_state:
     refresh_versions()
 
 if "hld_versions" not in st.session_state:
     refresh_hld_versions()
+
+if "us_versions" not in st.session_state:
+    refresh_us_versions()
 
 versions = st.session_state.versions
 latest_version = versions[-1] if versions else None
@@ -140,6 +175,11 @@ hld_versions = st.session_state.hld_versions
 hld_latest = hld_versions[-1] if hld_versions else None
 hld_final = next((v for v in hld_versions if v.is_final), None)
 hld_is_locked = bool(hld_final and hld_final.is_locked)
+
+us_versions = st.session_state.us_versions
+us_latest = us_versions[-1] if us_versions else None
+us_final = next((v for v in us_versions if v.is_final), None)
+us_is_locked = bool(us_final and us_final.is_locked)
 
 
 # --- sidebar: project status + version history --------------------------------------
@@ -195,6 +235,20 @@ with st.sidebar:
         st.caption("Accept a BRD first to unlock the HLD stage.")
 
     st.divider()
+    st.subheader("User Stories")
+    if us_latest:
+        st.metric("Current User Stories Version", f"v{us_latest.version}")
+        if us_final:
+            us_status = "Locked" if us_final.is_locked else "Unlocked"
+            st.success(f"Final User Stories: v{us_final.version}\n\nStatus: {us_status}")
+        else:
+            st.info("No final user stories selected yet.")
+    elif final_version:
+        st.caption("Ready to generate. Open the User Story Workspace tab.")
+    else:
+        st.caption("Accept a BRD first to unlock the User Story stage.")
+
+    st.divider()
     if st.button("Start New Project"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -206,8 +260,9 @@ with st.sidebar:
 st.title("Business Analyst Agent - SOW to BRD")
 st.caption("Phase 1: Statement of Work to Business Requirement Document")
 
-tab_generate, tab_workspace, tab_hld = st.tabs(
-    ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace"]
+tab_generate, tab_workspace, tab_hld, tab_stories = st.tabs(
+    ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace",
+     "Step 4: User Story Workspace"]
 )
 
 
@@ -708,6 +763,253 @@ with tab_hld:
                             mime=("application/vnd.openxmlformats-officedocument"
                                   ".wordprocessingml.document"),
                             key="hld_download_btn",
+                        )
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+
+# --- STEP 4: User Story workspace (Initial User Story Agent) ------------------------------
+
+with tab_stories:
+    st.caption("Phase 3: accepted BRD to draft user stories")
+
+    if final_version is None:
+        st.warning("Accept a BRD before generating user stories.")
+        st.caption("Go to the BRD Workspace, choose a version as the Final BRD, and it will "
+                   "become available here. Draft user stories are generated only from the "
+                   "accepted BRD - never from the SOW, a draft BRD, the HLD, or an LLD.")
+        st.button("Generate Draft User Stories", disabled=True)
+
+    elif us_latest is None:
+        st.subheader("Generate the Draft User Stories")
+        st.caption(f"The user stories will be generated from the Accepted BRD "
+                   f"(v{final_version.version}). This creates User Stories Version 1.")
+        if st.button("Generate Draft User Stories", type="primary"):
+            with st.spinner("Sending the accepted BRD to Gemini and drafting user stories..."):
+                try:
+                    start = time.time()
+                    us_version = us_service.generate_initial_stories()
+                    elapsed = time.time() - start
+                    logger.info(f"User stories v{us_version.version} generated in {elapsed:.1f}s")
+
+                    refresh_us_versions()
+                    st.session_state.us_viewing_version = us_version.version
+                    st.success(f"User Stories Version {us_version.version} generated "
+                               f"in {elapsed:.1f}s.")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+    else:
+        us_viewing_number = st.session_state.get("us_viewing_version", us_latest.version)
+        try:
+            us_viewing = us_service.get_version(us_viewing_number) or us_latest
+        except Exception as exc:
+            st.error(friendly_error(exc))
+            us_viewing = us_latest
+
+        us_is_current = us_viewing.version == us_latest.version
+        us_editable = us_is_current and not us_is_locked
+
+        # --- stale-vs-BRD hint (non-blocking; no auto-regeneration) ---
+        try:
+            if us_service.brd_changed_since_stories():
+                src = us_service.source_brd_version()
+                src_text = f"BRD v{src}" if src is not None else "an earlier BRD version"
+                st.warning(
+                    f"These user stories were generated from {src_text}, but the Accepted BRD "
+                    f"is now v{final_version.version}. They may be stale. Review them, refine "
+                    "them, or start a new project to regenerate from scratch - nothing is "
+                    "changed automatically."
+                )
+        except Exception as exc:
+            st.error(friendly_error(exc))
+
+        # --- status banner ---
+        us_status_cols = st.columns([2, 2, 2])
+        with us_status_cols[0]:
+            st.metric("Viewing", f"v{us_viewing.version}")
+        with us_status_cols[1]:
+            st.metric("Type", SOURCE_LABELS.get(us_viewing.source, us_viewing.source))
+        with us_status_cols[2]:
+            st.metric("Status", "Accepted" if us_viewing.is_final else "Draft")
+
+        if us_is_locked:
+            if us_viewing.is_final:
+                st.success(f"This is the Final User Stories set (v{us_viewing.version}) and it "
+                           "is locked against further changes.")
+            else:
+                st.warning(f"The Final User Stories (v{us_final.version}) are locked. "
+                           "Unlock them below to make further changes.")
+        elif not us_is_current:
+            st.info(f"You are viewing an older user stories version (v{us_viewing.version}). "
+                    f"Editing is only available on the current version (v{us_latest.version}).")
+
+        st.divider()
+
+        us_tab_preview, us_tab_edit, us_tab_refine, us_tab_history = st.tabs(
+            ["Preview", "Edit", "AI Refine", "History"]
+        )
+
+        with us_tab_preview:
+            st.markdown(us_viewing.content)
+
+        with us_tab_edit:
+            if not us_editable:
+                st.info("Editing is disabled for this version. "
+                        + ("Unlock the Final User Stories to continue." if us_is_locked
+                           else "Switch to the current version to edit."))
+                st.text_area("User stories content (read-only)", value=us_viewing.content,
+                             height=500, disabled=True, key=f"us_ro_{us_viewing.version}")
+            else:
+                st.caption("Edit the user stories below. Saving creates a NEW version - "
+                           "the current version is never overwritten.")
+                us_edited_text = st.text_area(
+                    "User stories content (markdown)",
+                    value=us_viewing.content,
+                    height=500,
+                    key=f"us_editor_{us_viewing.version}",
+                )
+                us_change_note = st.text_input(
+                    "Change description (optional)",
+                    placeholder="e.g. Reworded the checkout story",
+                    key=f"us_note_{us_viewing.version}",
+                )
+                if st.button("Save as New Version", type="primary", key="us_save_edit"):
+                    try:
+                        new_us = us_service.save_manual_edit(
+                            us_edited_text, note=us_change_note.strip() or "Manual edit"
+                        )
+                        refresh_us_versions()
+                        st.session_state.us_viewing_version = new_us.version
+                        st.success(f"Saved as User Stories Version {new_us.version}.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+        with us_tab_refine:
+            if not us_editable:
+                st.info("AI refinement is disabled for this version. "
+                        + ("Unlock the Final User Stories to continue." if us_is_locked
+                           else "Switch to the current version to refine."))
+            else:
+                st.caption("Describe your change in plain English. The AI receives the CURRENT "
+                           "user stories plus your feedback - unaffected stories are preserved.")
+                us_feedback = st.text_area(
+                    "Refinement instruction",
+                    placeholder="e.g. Add a story for password reset via email.",
+                    key="us_feedback_input",
+                    height=120,
+                )
+                if st.button("Refine with AI", type="primary",
+                             disabled=not us_feedback.strip(), key="us_refine_btn"):
+                    with st.spinner("Sending the current user stories and your feedback to Gemini..."):
+                        try:
+                            start = time.time()
+                            new_us = us_service.refine_with_ai(us_feedback)
+                            elapsed = time.time() - start
+                            logger.info(f"User stories refined to v{new_us.version} in {elapsed:.1f}s")
+
+                            refresh_us_versions()
+                            st.session_state.us_viewing_version = new_us.version
+                            st.success(f"Created User Stories Version {new_us.version} "
+                                       f"in {elapsed:.1f}s.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+
+        with us_tab_history:
+            st.caption("All user stories versions are permanent. "
+                       "Nothing is ever overwritten or deleted.")
+            for v in reversed(us_versions):
+                cols = st.columns([1, 2, 3, 2, 1])
+                cols[0].markdown(f"**v{v.version}**")
+                cols[1].markdown(SOURCE_LABELS.get(v.source, v.source))
+                cols[2].caption(v.note or "-")
+                badges = []
+                if us_latest and v.version == us_latest.version:
+                    badges.append("Current")
+                if v.is_final:
+                    badges.append("Accepted")
+                    if v.is_locked:
+                        badges.append("Locked")
+                cols[3].caption(" / ".join(badges) if badges else "Draft")
+                if cols[4].button("View", key=f"us_hist_view_{v.version}"):
+                    st.session_state.us_viewing_version = v.version
+                    st.rerun()
+
+        st.divider()
+
+        st.subheader("Final User Stories")
+        us_final_cols = st.columns([2, 2, 2])
+
+        with us_final_cols[0]:
+            if not us_viewing.is_final:
+                if st.button(f"Choose v{us_viewing.version} as Final User Stories",
+                             key="us_choose_final"):
+                    try:
+                        us_service.choose_final_stories(us_viewing.version)
+                        refresh_us_versions()
+                        st.success(f"User Stories Version {us_viewing.version} is now Final.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+            else:
+                st.caption("This version is the Final User Stories set.")
+
+        with us_final_cols[1]:
+            if us_is_locked:
+                if st.session_state.get("us_confirm_unlock"):
+                    st.warning("Unlock the Final User Stories? They stay in history unchanged; "
+                               "any new edit creates a new version.")
+                    yes_col, no_col = st.columns(2)
+                    if yes_col.button("Yes, unlock", key="us_unlock_yes"):
+                        try:
+                            us_service.unlock_final_stories()
+                            st.session_state.us_confirm_unlock = False
+                            refresh_us_versions()
+                            st.success("Final User Stories unlocked. Further edits will create "
+                                       "a new version.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+                    if no_col.button("Cancel", key="us_unlock_cancel"):
+                        st.session_state.us_confirm_unlock = False
+                        st.rerun()
+                else:
+                    if st.button("Unlock Final User Stories", key="us_unlock_btn"):
+                        st.session_state.us_confirm_unlock = True
+                        st.rerun()
+
+        with us_final_cols[2]:
+            # Export always uses the version being viewed, so what you see is what you download.
+            if st.button("Prepare .docx for download", key="us_prepare_docx"):
+                with st.spinner("Formatting Word document..."):
+                    try:
+                        us_docx_path = (Path(settings.resolved_output_dir())
+                                        / st.session_state.project_id
+                                        / "user_stories"
+                                        / f"UserStories_v{us_viewing.version}.docx")
+                        generate_user_stories_docx(us_viewing.content, us_docx_path)
+                        st.session_state.us_docx_ready_path = str(us_docx_path)
+                        st.session_state.us_docx_ready_version = us_viewing.version
+                        logger.info(f"User stories DOCX exported for v{us_viewing.version}")
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+            us_ready_path = st.session_state.get("us_docx_ready_path")
+            us_ready_version = st.session_state.get("us_docx_ready_version")
+            if (us_ready_path and Path(us_ready_path).exists()
+                    and us_ready_version == us_viewing.version):
+                try:
+                    with open(us_ready_path, "rb") as f:
+                        st.download_button(
+                            f"Download UserStories v{us_viewing.version}.docx",
+                            data=f.read(),
+                            file_name=f"UserStories_v{us_viewing.version}.docx",
+                            mime=("application/vnd.openxmlformats-officedocument"
+                                  ".wordprocessingml.document"),
+                            key="us_download_btn",
                         )
                 except Exception as exc:
                     st.error(friendly_error(exc))
