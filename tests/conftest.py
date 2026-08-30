@@ -67,6 +67,30 @@ Client -> API -> Service -> Data Store
 **Assumption:** relational storage, pending confirmation.
 """
 
+STUB_USER_STORIES = """# Test Project — Draft User Stories
+
+**Version:** 0
+**Generated Date:** 2026-01-01
+**Client:** Acme Corp
+**Project Type:** Web Application
+**Source:** Accepted BRD
+
+## US-001 — Customer Registration
+
+**User Story:**
+As a customer,
+I want to create an account,
+so that I can access the application.
+
+**Acceptance Criteria:**
+- Required registration information can be entered.
+- Invalid registration information is rejected.
+- A valid account can be created.
+
+**Priority:** High
+**BRD Reference:** FR-1
+"""
+
 
 class StubBAAgent:
     """Stands in for BusinessAnalystAgent. Returns canned markdown."""
@@ -100,6 +124,24 @@ class StubSAAgent:
         return current_hld + f"\n\n## 12. Caching\n{user_feedback}\n"
 
 
+class StubUserStoryAgent:
+    """Stands in for InitialUserStoryAgent. Returns canned markdown."""
+
+    def __init__(self):
+        self.generate_calls = []
+        self.refine_calls = []
+
+    def generate_stories(self, brd_text: str, metadata: ProjectMetadata) -> str:
+        self.generate_calls.append((brd_text, metadata))
+        return STUB_USER_STORIES
+
+    def refine_stories(
+        self, current_stories: str, user_feedback: str, current_version: int
+    ) -> str:
+        self.refine_calls.append((current_stories, user_feedback, current_version))
+        return current_stories + f"\n\n## US-002 — Added Story\n{user_feedback}\n"
+
+
 @pytest.fixture
 def stub_ba_agent():
     return StubBAAgent()
@@ -108,6 +150,11 @@ def stub_ba_agent():
 @pytest.fixture
 def stub_sa_agent():
     return StubSAAgent()
+
+
+@pytest.fixture
+def stub_us_agent():
+    return StubUserStoryAgent()
 
 
 @pytest.fixture

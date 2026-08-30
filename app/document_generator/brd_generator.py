@@ -162,3 +162,15 @@ def generate_hld_docx(hld_markdown: str, output_path: str | Path) -> Path:
     converter. Kept as a separate named entry point so call sites read clearly.
     """
     return generate_brd_docx(hld_markdown, output_path)
+
+
+def generate_user_stories_docx(user_stories_markdown: str, output_path: str | Path) -> Path:
+    """Convert a markdown-flavored draft-user-stories string into a formatted .docx file.
+
+    The draft user stories produced by the Initial User Story Agent use the same
+    markdown conventions as the BRD and HLD (## headings for US-NNN blocks,
+    **Key:** metadata lines, - bullets for acceptance criteria, a **Version:**
+    line), so this reuses the BRD converter. Separate named entry point for
+    call-site clarity.
+    """
+    return generate_brd_docx(user_stories_markdown, output_path)
