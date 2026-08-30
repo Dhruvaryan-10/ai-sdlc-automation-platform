@@ -109,6 +109,10 @@ Detailed design derived from the stub HLD for testing.
 Invalid input returns a 400 with a machine-readable error code.
 """
 
+# Marker the stub refinement agent appends — small, evidence-flavoured, and it
+# leaves every existing US-NNN id and every story body byte-for-byte intact.
+STUB_REFINEMENT_MARKER = "**Refinement note:** reconciled against project artifacts."
+
 
 class StubBAAgent:
     """Stands in for BusinessAnalystAgent. Returns canned markdown."""
@@ -182,6 +186,32 @@ class StubLLDAgent:
         return current_lld + f"\n\n## 14. Addendum\n{user_feedback}\n"
 
 
+class StubUserStoryRefinementAgent:
+    """Stands in for UserStoryRefinementAgent.
+
+    Preserves the input verbatim (every US-NNN id, every story body) and appends a
+    single small marker line, mimicking an evidence-based reconciliation that
+    leaves unaffected stories untouched.
+    """
+
+    def __init__(self):
+        self.refine_calls = []
+
+    def refine_user_stories(
+        self,
+        current_stories: str,
+        brd_text: str,
+        hld_text: str,
+        lld_text: str,
+        metadata: ProjectMetadata,
+        current_version: int = 1,
+    ) -> str:
+        self.refine_calls.append(
+            (current_stories, brd_text, hld_text, lld_text, metadata, current_version)
+        )
+        return current_stories.rstrip() + f"\n\n{STUB_REFINEMENT_MARKER}\n"
+
+
 @pytest.fixture
 def stub_ba_agent():
     return StubBAAgent()
@@ -200,6 +230,11 @@ def stub_us_agent():
 @pytest.fixture
 def stub_lld_agent():
     return StubLLDAgent()
+
+
+@pytest.fixture
+def stub_usr_agent():
+    return StubUserStoryRefinementAgent()
 
 
 @pytest.fixture
