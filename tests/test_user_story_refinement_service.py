@@ -162,8 +162,17 @@ def test_final_hld_but_no_final_lld(stub_ba_agent, stub_us_agent, stub_sa_agent,
 
 # --- TEST 8 + 9: US-NNN ids stable, unaffected stories unchanged --
 
-def _strip_version_line(text: str) -> str:
-    return re.sub(r"\*\*Version:\*\*\s*\d+", "**Version:** N", text)
+def _strip_managed_lines(text: str) -> str:
+    """Normalise the application-managed header lines (Version / Source / Built From).
+
+    The service stamps '**Version:**', and (Phase 5 provenance fix) rewrites
+    '**Source:**' and inserts '**Built From:**' on an artifact-refined version.
+    Everything else — every story body — must be byte-identical.
+    """
+    text = re.sub(r"\*\*Version:\*\*\s*\d+", "**Version:** N", text)
+    text = re.sub(r"^\*\*Source:\*\*[^\n]*$", "**Source:** X", text, flags=re.MULTILINE)
+    text = re.sub(r"^\*\*Built From:\*\*[^\n]*\n?", "", text, flags=re.MULTILINE)
+    return text
 
 
 def test_ids_stable_and_unaffected_stories_unchanged(stub_ba_agent, stub_us_agent,
@@ -176,9 +185,9 @@ def test_ids_stable_and_unaffected_stories_unchanged(stub_ba_agent, stub_us_agen
 
     assert "## US-001 — Customer Registration" in v2.content  # id + title preserved
     # every story body up to the appended marker is byte-identical to v1
-    # (only the service-stamped "**Version:**" line legitimately differs).
+    # (only the application-managed header lines legitimately differ).
     body_before_marker = v2.content.split(STUB_REFINEMENT_MARKER)[0].rstrip()
-    assert _strip_version_line(body_before_marker) == _strip_version_line(v1_content.rstrip())
+    assert _strip_managed_lines(body_before_marker) == _strip_managed_lines(v1_content.rstrip())
 
 
 # --- TEST 10 + 11: new version; previous versions unchanged ------
@@ -363,3 +372,58 @@ def test_refinement_package_has_no_downstream_agent_imports():
             elif isinstance(node, ast.ImportFrom):
                 imported.append(node.module or "")
         assert not any(f in name for name in imported for f in forbidden), imported
+
+
+# --- Phase 5 provenance correction (Phase 6 items 28-30) ------------------
+
+def test_initial_user_stories_document_label_is_accepted_brd(
+    stub_ba_agent, stub_us_agent, sow_file, sample_metadata
+):
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    us = _initial_stories(ba, stub_us_agent)
+    assert "**Source:** Accepted BRD" in us.get_version(1).content
+    assert "**Built From:**" not in us.get_version(1).content
+
+
+def test_artifact_refined_document_label_is_artifact_refinement(
+    stub_ba_agent, stub_us_agent, stub_sa_agent, stub_lld_agent, stub_usr_agent,
+    sow_file, sample_metadata,
+):
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    _initial_stories(ba, stub_us_agent)
+    sa = _final_hld(ba, stub_sa_agent)
+    _final_lld(sa, ba, stub_lld_agent)
+
+    v2 = _usr(stub_usr_agent).refine()
+
+    assert "**Source:** Artifact Refinement" in v2.content
+    assert "**Source:** Accepted BRD" not in v2.content
+    # the initial version is left untouched (append-only; historical versions unchanged)
+    us = InitialUserStoryService(project_id=PID, ba_service=ba)
+    assert "**Source:** Accepted BRD" in us.get_version(1).content
+
+
+def test_artifact_refined_document_embeds_source_version_provenance(
+    stub_ba_agent, stub_us_agent, stub_sa_agent, stub_lld_agent, stub_usr_agent,
+    sow_file, sample_metadata,
+):
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    _initial_stories(ba, stub_us_agent)
+    sa = _final_hld(ba, stub_sa_agent)
+    _final_lld(sa, ba, stub_lld_agent)
+
+    v2 = _usr(stub_usr_agent).refine()
+
+    assert "**Built From:** BRD v1, HLD v1, LLD v1, User Stories v1" in v2.content
+
+
+def test_artifact_refined_document_built_from_marks_missing_optional(
+    stub_ba_agent, stub_us_agent, stub_usr_agent, sow_file, sample_metadata
+):
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    _initial_stories(ba, stub_us_agent)  # no HLD / LLD
+
+    v2 = _usr(stub_usr_agent).refine()
+
+    assert "**Source:** Artifact Refinement" in v2.content
+    assert "**Built From:** BRD v1, HLD not used, LLD not used, User Stories v1" in v2.content

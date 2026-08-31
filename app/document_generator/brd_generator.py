@@ -185,3 +185,17 @@ def generate_lld_docx(lld_markdown: str, output_path: str | Path) -> Path:
     converter. Separate named entry point for call-site clarity.
     """
     return generate_brd_docx(lld_markdown, output_path)
+
+
+def generate_test_cases_docx(test_cases_markdown: str, output_path: str | Path) -> Path:
+    """Convert a markdown-flavored Test Case document into a formatted .docx file.
+
+    The QA / Test Case Service renders the agent's JSON into a Markdown document
+    that follows the same conventions as the other artifacts (# / ## headings for
+    the title and each TC-NNN block, **Key:** metadata lines incl. **Version:** /
+    **Source:** / **Built From:**, - bullet lists for preconditions / data /
+    steps), so this reuses the BRD converter. The exported .docx therefore
+    preserves the Test Case version and provenance header. Separate named entry
+    point for call-site clarity.
+    """
+    return generate_brd_docx(test_cases_markdown, output_path)

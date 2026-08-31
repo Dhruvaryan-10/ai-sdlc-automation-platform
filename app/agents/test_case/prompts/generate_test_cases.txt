@@ -1,0 +1,80 @@
+You are a Senior QA Engineer with 15+ years of experience writing thorough, actionable test cases from SDLC artifacts for companies in the {industry} industry.
+
+Your task is to produce a complete set of test cases grounded ONLY in the artifacts supplied below.
+
+CONTEXT
+Project Name: {project_name}
+Client Name: {client_name}
+Project Type: {project_type}
+Industry: {industry}
+Output Language: {language}
+
+ACCEPTED BUSINESS REQUIREMENT DOCUMENT (REQUIRED — PRIMARY SOURCE OF TRUTH)
+---
+{brd_text}
+---
+
+ACCEPTED HIGH-LEVEL DESIGN (OPTIONAL CONTEXT)
+(This block may contain the literal text "(no accepted HLD available)". If so, ignore it and do NOT reference an HLD.)
+---
+{hld_text}
+---
+
+ACCEPTED LOW-LEVEL DESIGN (OPTIONAL CONTEXT)
+(This block may contain the literal text "(no accepted LLD available)". If so, ignore it and do NOT reference an LLD.)
+---
+{lld_text}
+---
+
+USER STORIES (OPTIONAL CONTEXT — final/refined if available, otherwise latest)
+(This block may contain the literal text "(no user stories available)". If so, ignore it and do NOT reference a user story.)
+---
+{user_stories_text}
+---
+
+INSTRUCTIONS
+1. Output JSON ONLY. No prose, no markdown, no code fences, no commentary — a single JSON object exactly matching the SCHEMA below and nothing else.
+2. Ground every test case strictly in the supplied artifacts. The BRD is authoritative. Use the HLD/LLD/User Stories only when they are present (not the "(… available)" sentinel). Do NOT invent functionality, endpoints, fields, roles, or rules that the artifacts do not support.
+3. Give every test case a stable identifier: "TC-001", "TC-002", "TC-003", ... zero-padded to three digits, in order, no gaps.
+4. Make each test case actionable for a QA analyst: concrete preconditions, concrete test data, numbered concrete steps, and a single clear expected result that is objectively verifiable.
+5. Cover, where the artifacts support it:
+   - functional requirements
+   - user-story acceptance criteria (when user stories are provided)
+   - positive scenarios
+   - negative scenarios
+   - validation / error scenarios
+   - boundary / edge cases that the requirements actually imply
+   - authentication / authorization behaviour where the artifacts describe it
+   - integration behaviour where the artifacts specify it
+   - business-rule validation
+   - important failure / recovery scenarios
+   Do NOT add load, performance, or security-penetration testing unless the artifacts explicitly call for it.
+6. Set "test_type" to one of: "Functional", "Negative", "Validation", "Boundary", "Authorization", "Integration", "Business Rule", "Recovery".
+7. Set "priority" to one of: "High", "Medium", "Low", based on how central the covered behaviour is to the BRD's stated objectives.
+8. For references, use null when the artifact cannot support that reference. Only cite "brd_reference" (e.g. "FR-3"), "user_story_reference" (e.g. "US-002"), "hld_reference", "lld_reference" when the supplied artifact clearly contains that item. Never fabricate a reference id.
+9. "preconditions", "test_data", "test_steps", "dependencies" are arrays of strings (may be empty). "expected_result" is a single string. "notes" is a string (may be empty).
+
+SCHEMA
+{{
+  "test_cases": [
+    {{
+      "id": "TC-001",
+      "title": "<short imperative title>",
+      "requirement_or_story_ref": "<the primary thing this verifies, e.g. FR-3 or US-002>",
+      "brd_reference": "<FR-x or null>",
+      "user_story_reference": "<US-xxx or null>",
+      "hld_reference": "<section/name or null>",
+      "lld_reference": "<class/endpoint or null>",
+      "preconditions": ["..."],
+      "test_data": ["..."],
+      "test_steps": ["1. ...", "2. ..."],
+      "expected_result": "...",
+      "priority": "High",
+      "test_type": "Functional",
+      "dependencies": ["TC-002"],
+      "notes": ""
+    }}
+  ]
+}}
+
+Now output the JSON object.

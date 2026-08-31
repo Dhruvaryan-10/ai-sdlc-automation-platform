@@ -8,6 +8,7 @@ exactly this purpose. Real generation/refinement is covered by manual
 integration testing through the Streamlit UI.
 """
 
+import json
 import os
 import tempfile
 
@@ -113,6 +114,48 @@ Invalid input returns a 400 with a machine-readable error code.
 # leaves every existing US-NNN id and every story body byte-for-byte intact.
 STUB_REFINEMENT_MARKER = "**Refinement note:** reconciled against project artifacts."
 
+# Canned JSON the stub QA agent returns (the real agent's contract is JSON-only).
+STUB_TEST_CASES = {
+    "test_cases": [
+        {
+            "id": "TC-001",
+            "title": "Register a new customer account",
+            "requirement_or_story_ref": "FR-1",
+            "brd_reference": "FR-1",
+            "user_story_reference": "US-001",
+            "hld_reference": None,
+            "lld_reference": None,
+            "preconditions": ["The registration page is reachable."],
+            "test_data": ["email: new@example.com", "password: Str0ng!pass"],
+            "test_steps": ["1. Open the registration page.", "2. Enter valid details.",
+                           "3. Submit the form."],
+            "expected_result": "A new account is created and the customer is signed in.",
+            "priority": "High",
+            "test_type": "Functional",
+            "dependencies": [],
+            "notes": "",
+        },
+        {
+            "id": "TC-002",
+            "title": "Reject registration with an invalid email",
+            "requirement_or_story_ref": "FR-1",
+            "brd_reference": "FR-1",
+            "user_story_reference": "US-001",
+            "hld_reference": None,
+            "lld_reference": None,
+            "preconditions": ["The registration page is reachable."],
+            "test_data": ["email: not-an-email"],
+            "test_steps": ["1. Open the registration page.", "2. Enter an invalid email.",
+                           "3. Submit the form."],
+            "expected_result": "The form is rejected with a validation message; no account is created.",
+            "priority": "Medium",
+            "test_type": "Validation",
+            "dependencies": [],
+            "notes": "",
+        },
+    ]
+}
+
 
 class StubBAAgent:
     """Stands in for BusinessAnalystAgent. Returns canned markdown."""
@@ -212,6 +255,50 @@ class StubUserStoryRefinementAgent:
         return current_stories.rstrip() + f"\n\n{STUB_REFINEMENT_MARKER}\n"
 
 
+class StubTestCaseAgent:
+    """Stands in for TestCaseAgent. Returns canned JSON (the real contract is JSON-only).
+
+    `refine_test_cases` keeps every TC-NNN id and every case body, changing only
+    TC-002's title, so tests can assert unaffected cases survive refinement.
+    """
+
+    def __init__(self):
+        self.generate_calls = []
+        self.refine_calls = []
+
+    def generate_test_cases(
+        self,
+        brd_text: str,
+        hld_text: str,
+        lld_text: str,
+        user_stories_text: str,
+        metadata: ProjectMetadata,
+    ) -> str:
+        self.generate_calls.append(
+            (brd_text, hld_text, lld_text, user_stories_text, metadata)
+        )
+        return json.dumps(STUB_TEST_CASES)
+
+    def refine_test_cases(
+        self,
+        current_test_cases: str,
+        user_feedback: str,
+        current_version: int,
+        brd_text: str,
+        hld_text: str,
+        lld_text: str,
+        user_stories_text: str,
+        metadata: ProjectMetadata,
+    ) -> str:
+        self.refine_calls.append(
+            (current_test_cases, user_feedback, current_version,
+             brd_text, hld_text, lld_text, user_stories_text, metadata)
+        )
+        refined = json.loads(json.dumps(STUB_TEST_CASES))  # deep copy
+        refined["test_cases"][1]["title"] = f"Reject registration ({user_feedback})"
+        return json.dumps(refined)
+
+
 @pytest.fixture
 def stub_ba_agent():
     return StubBAAgent()
@@ -235,6 +322,11 @@ def stub_lld_agent():
 @pytest.fixture
 def stub_usr_agent():
     return StubUserStoryRefinementAgent()
+
+
+@pytest.fixture
+def stub_tc_agent():
+    return StubTestCaseAgent()
 
 
 @pytest.fixture

@@ -27,15 +27,31 @@ LangChain), plain JSON persistence (no database — deferred to a later Project 
   `solution_architect`, `low_level_design`). A refinement version has `source="ai_refine"`
   and a **composite** `source_ref` `"brd_v{b};us_v{u};hld_v{h|none};lld_v{l|none}"`. Three-way
   staleness: `is_stale()` / `stale_sources()` compare that composite to the current final
-  BRD/HLD/LLD — one live boolean, itemised reasons, never stored, never auto-refines.
+  BRD/HLD/LLD — one live boolean, itemised reasons, never stored, never auto-refines. `refine()`
+  also stamps the document body's own `**Source:** Artifact Refinement` + `**Built From:**`
+  lines (initial generation keeps `**Source:** Accepted BRD`; the refine prompt is told not
+  to touch those lines; historical versions are never rewritten).
+- **Phase 6 — QA / Test Case Agent** (`app/agents/test_case/`): accepted/final BRD (the
+  **only** hard prerequisite) + accepted HLD + accepted LLD + final/refined-or-latest User
+  Stories (all **optional context**) → test cases in an **own** `test_cases` stream. The
+  agent returns **JSON** (prompt contract); `TestCaseService` validates it, renders a
+  Markdown document with stable `TC-NNN` sections (same storage convention as every other
+  artifact), and appends via `VersionService(subdir="test_cases")`. Imports **no** other
+  agent package (only `ProjectMetadata` + `PromptManager` from `business_analyst`). Actions:
+  `generate()` (v1), `regenerate()` (fresh rebuild → new version), `refine_with_ai(feedback)`
+  (feedback-driven, preserves unaffected `TC-NNN`), `save_manual_edit()`. Composite
+  `source_ref` `"brd_v{b};hld_v{h|none};lld_v{l|none};us_v{u|none}"`. **Per-source** staleness
+  (`stale_sources()`): BRD stale if its version changed; HLD/LLD/User Stories stale **only**
+  if they were *used* (recorded as an int) and their authoritative version later changed — a
+  previously-absent optional artifact appearing later is **not** stale. Never auto-regenerates.
 
 Every stage shares one lifecycle: generate → manual edit / AI refine → append-only version
-history → choose final (locks) → unlock → Word export. BRD, HLD, user-story, and LLD
-versions are stored in separate streams; **Phase 3 and Phase 5 both write the one
-`user_stories` stream** (single source of truth). Each new agent is built **structurally
-parallel** to the existing ones (same wrapper/service shape) — there is deliberately no
-shared base class and `_extract_text` / `_invoke` / `_derive_metadata_*` are duplicated per
-agent. Do not consolidate until a dedicated post-Phase-5 cleanup.
+history → choose final (locks) → unlock → Word export. BRD, HLD, user-story, LLD, and
+test-case versions are stored in separate streams; **Phase 3 and Phase 5 both write the one
+`user_stories` stream** and the QA agent only ever writes `test_cases`. Each new agent is
+built **structurally parallel** to the existing ones (same wrapper/service shape) — there is
+deliberately no shared base class and `_extract_text` / `_invoke` / `_derive_metadata_*` are
+duplicated per agent. Do not consolidate until a dedicated post-Phase-6 cleanup.
 
 ## Commands
 
@@ -68,15 +84,16 @@ sets a dummy key before importing `app`.
 Work flows in one direction only; keep it that way.
 
 - **`app/ui/streamlit_app.py`** renders widgets and maps exceptions to plain-English
-  messages (`friendly_error`). It calls **only** the five services and the docx helpers
-  (`generate_brd_docx` / `generate_hld_docx` / `generate_user_stories_docx` /
-  `generate_lld_docx`) — never parsers, the agents, or `VersionService` directly. Users must
-  never see a traceback. Five tabs: Upload & Generate, BRD Workspace, HLD Workspace, User
-  Story Workspace (which hosts **both** Phase 3 generation/AI-refine **and** the Phase 5
-  "Refine (Artifacts)" sub-tab + stale banner), LLD Workspace. `session_state` keys are
-  prefixed per workspace — `hld_`, `us_`, `lld_` — so they never collide. `story_version_label(v)`
-  labels a Phase 5 refinement version "Artifact Refinement" (`source=="ai_refine"` **and**
-  composite `source_ref`).
+  messages (`friendly_error`). It calls **only** the six services and the docx helpers
+  (`generate_brd_docx` / `_hld_docx` / `_user_stories_docx` / `_lld_docx` / `_test_cases_docx`)
+  — never parsers, the agents, or `VersionService` directly. Users must never see a traceback.
+  **Seven tabs**: Step 1 Upload & Generate, Step 2 BRD, Step 3 HLD, Step 4 User Story (Phase 3
+  generation + freeform AI refine), Step 5 LLD, **Step 6 User Story Refinement** (standalone —
+  hosts the Phase 5 "Refine from Artifacts" action + three-way stale banner, writing the same
+  `user_stories` stream), **Step 7 QA / Test Case Workspace** (Phase 6). `session_state` keys
+  are prefixed per workspace — `hld_`, `us_`, `lld_`, `usr_`, `qa_` — so they never collide.
+  `story_version_label(v)` labels a Phase 5 refinement version "Artifact Refinement"
+  (`source=="ai_refine"` **and** composite `source_ref`).
 - **`…/business_analyst/service.py::BusinessAnalystService`** — orchestration point for the
   BRD: `extract → clean → agent → version`, plus manual edit, AI refine, finalize/lock.
 - **`…/solution_architect/service.py::SolutionArchitectService`**,
@@ -95,25 +112,28 @@ Work flows in one direction only; keep it that way.
   on v1 (`"brd_v{n}"` / `"hld_v{n}"`) — display hint only, no dependency tracking /
   invalidation / regeneration. The LLD tracks **only** its direct source (HLD); BRD→LLD and
   user-story→LLD staleness are deliberately not tracked.
-  Phase 5's **`…/user_story_refinement/service.py::UserStoryRefinementService`** takes no
-  service DI at all — it reads BRD/HLD/LLD and the source stories through four
-  `VersionService(subdir=…)` instances and appends to the `user_stories` one. `refine()`
-  gates on a final BRD (`NoFinalBRDError`) + an existing story version
-  (`NoInitialUserStoriesError`) + the story stream being unlocked (`RefinementLockedError`);
-  missing/unaccepted HLD or LLD is passed to the agent as a sentinel string, never a block.
+  Phase 5's **`…/user_story_refinement/service.py::UserStoryRefinementService`** and Phase 6's
+  **`…/test_case/service.py::TestCaseService`** take **no** service DI — they read the other
+  streams through `VersionService(subdir=…)` instances directly. Phase 5 `refine()` gates on a
+  final BRD + an existing story version + the story stream being unlocked. Phase 6 gates on a
+  final BRD (`NoFinalBRDError`) + the test-case stream being unlocked (`TestCaseLockedError`);
+  HLD/LLD/User Stories are optional — a sentinel is passed when absent, never a block.
 - **`…/business_analyst/agent.py`**, **`…/solution_architect/agent.py`**,
-  **`…/initial_user_story/agent.py`**, **`…/low_level_design/agent.py`**, and
-  **`…/user_story_refinement/agent.py`** are the only modules that know about Gemini
-  (`langchain_google_genai.ChatGoogleGenerativeAI`). `_extract_text` (normalizes Gemini 3+
-  str/dict/list content blocks) and `_invoke` are intentionally duplicated across all five.
+  **`…/initial_user_story/agent.py`**, **`…/low_level_design/agent.py`**,
+  **`…/user_story_refinement/agent.py`**, and **`…/test_case/agent.py`** are the only modules
+  that know about Gemini (`langchain_google_genai.ChatGoogleGenerativeAI`). `_extract_text`
+  (normalizes Gemini 3+ str/dict/list content blocks) and `_invoke` are intentionally
+  duplicated across all six. (`test_case` classes carry `__test__ = False` so pytest does not
+  try to collect the `Test*`-named classes.)
 - **`app/services/version_service.py::VersionService`** is the only persistence layer. One
   JSON file per version stream: `outputs/<project_id>/versions.json` (BRD),
-  `…/hld/versions.json`, `…/user_stories/versions.json`, `…/lld/versions.json` — via the
-  `subdir` kwarg. Each instance only ever reads/writes its own file, so the streams are
-  fully isolated (the `user_stories` file is written by both the Phase 3 and Phase 5
-  services). `BRDVersion` is the shared record type (name kept for history); `source_ref`
-  is optional provenance (single `"brd_v{n}"` for Phases 2–4; composite for Phase 5).
-  **Unchanged since Phase 1** — do not modify it.
+  `…/hld/versions.json`, `…/user_stories/versions.json`, `…/lld/versions.json`,
+  `…/test_cases/versions.json` — via the `subdir` kwarg. Each instance only ever reads/writes
+  its own file, so the streams are fully isolated (the `user_stories` file is written by both
+  the Phase 3 and Phase 5 services; `test_cases` only by Phase 6). `BRDVersion` is the shared
+  record type (name kept for history); `source_ref` is optional provenance (single
+  `"brd_v{n}"` for Phases 2–4; composite for Phases 5–6). **Unchanged since Phase 1** — do
+  not modify it.
 - **`app/services/version_text.py::stamp_version_number`** — shared helper both services use
   to force the in-document `**Version:** N` line to match the tracked version.
 - **`app/parsers/`**: `detector.py` picks a parser by file extension; `docx_parser` /
@@ -131,19 +151,21 @@ Work flows in one direction only; keep it that way.
   `mark_final` / `unlock_final` only flip the `is_final` / `is_locked` booleans — they
   never rewrite a version's `content`, so finalizing never rewrites history.
 - **Lock semantics** (same for all streams). `choose_final_brd` / `choose_final_hld` /
-  `choose_final_stories` / `choose_final_lld` mark a version final *and* lock it. While
-  locked, `save_manual_edit` / `refine_with_ai` (and Phase 5's `refine()`) raise
-  `BRDLockedError` / `HLDLockedError` / `UserStoryLockedError` / `LLDLockedError` /
-  `RefinementLockedError`. `unlock_final*` releases the lock but keeps `is_final` and the
+  `choose_final_stories` / `choose_final_lld` / `TestCaseService.choose_final` mark a version
+  final *and* lock it. While locked, `save_manual_edit` / `refine_with_ai` (and Phase 5's
+  `refine()`, Phase 6's `generate/regenerate/refine_with_ai`) raise `BRDLockedError` /
+  `HLDLockedError` / `UserStoryLockedError` / `LLDLockedError` / `RefinementLockedError` /
+  `TestCaseLockedError`. `unlock_final*` releases the lock but keeps `is_final` and the
   content; any later edit creates a brand new version.
 - **Version-line stamping.** `stamp_version_number` (in `app/services/version_text.py`)
   force-rewrites the in-document `**Version:** N` line to match the tracked version after
   every generate, edit, and refine — because the refine prompts deliberately tell the model
   to leave unrelated content untouched, so it would never bump that line itself.
 - **`app/document_generator/brd_generator.py`** is the only markdown→docx path.
-  `generate_hld_docx`, `generate_user_stories_docx`, and `generate_lld_docx` all delegate to
-  `generate_brd_docx` (every document stream shares markdown conventions). It is intentionally
-  a minimal converter that handles only what the prompt templates emit: `#`/`##`/`###`
+  `generate_hld_docx`, `generate_user_stories_docx`, `generate_lld_docx`, and
+  `generate_test_cases_docx` all delegate to `generate_brd_docx` (every stored document is
+  Markdown — the QA service renders the agent's JSON to Markdown before persisting). It is
+  intentionally a minimal converter that handles only what the templates emit: `#`/`##`/`###`
   headings, `-`/`*` bullets, `1.` numbered items, `|`-delimited tables, and `**Key:** value`
   metadata lines. Don't grow it into a full markdown engine — change the prompt templates'
   output shape instead.
@@ -154,15 +176,15 @@ Work flows in one direction only; keep it that way.
 - **Imports are absolute from the `app.` package root.** `streamlit_app.py` appends the
   repo root to `sys.path` so `streamlit run app/ui/streamlit_app.py` works from the root.
 
-## Scope boundaries (Phases 1–5)
+## Scope boundaries (Phases 1–6)
 
-Deliberately **not** in this build — do not add without being asked: a QA / Test Case Agent,
-Documentation and Project Closure Agents, Project Memory, LangGraph multi-agent
-orchestration, RAG, a real database (SQLite/H2/Postgres/Supabase/…), authentication /
-multi-user, and any generic multi-agent framework or shared base agent/service class
-(including consolidating the duplicated `_extract_text` / `_invoke` / `_derive_metadata_*`
-across the five agent packages). Persistence stays JSON; the database decision is deferred to
-the Project Memory phase.
+Deliberately **not** in this build — do not add without being asked: a Documentation Agent, a
+Project Closure / Report Agent, Project Memory, LangGraph multi-agent orchestration, RAG, a
+real database (SQLite/H2/Postgres/Supabase/…), authentication / multi-user,
+load/perf/security-penetration test generation, and any generic multi-agent framework or
+shared base agent/service class (including consolidating the duplicated `_extract_text` /
+`_invoke` / `_derive_metadata_*` across the six agent packages). Persistence stays JSON; the
+database decision is deferred to the Project Memory phase.
 
 ## Environment variables (`.env`)
 

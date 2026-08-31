@@ -63,10 +63,19 @@ from app.agents.user_story_refinement.service import (
 from app.agents.user_story_refinement.service import (
     NoFinalBRDError as NoFinalBRDErrorForRefinement,
 )
+from app.agents.test_case.agent import TestCaseAgentError
+from app.agents.test_case.service import (
+    TestCaseLockedError,
+    TestCaseService,
+)
+from app.agents.test_case.service import (
+    NoFinalBRDError as NoFinalBRDErrorForQA,
+)
 from app.document_generator.brd_generator import (
     generate_brd_docx,
     generate_hld_docx,
     generate_lld_docx,
+    generate_test_cases_docx,
     generate_user_stories_docx,
 )
 from app.utils.config import settings
@@ -109,14 +118,15 @@ def friendly_error(exc: Exception) -> str:
                 "please upload a text-based version instead.")
     if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError,
                         InitialUserStoryAgentError, LLDAgentError,
-                        UserStoryRefinementAgentError)):
+                        UserStoryRefinementAgentError, TestCaseAgentError)):
         return ("Unable to reach the Gemini API. Please check your API key and network "
                 "connection, then try again.")
     if isinstance(exc, (NoFinalBRDError, NoFinalBRDErrorForStories, NoFinalHLDError,
-                        NoFinalBRDErrorForRefinement, NoInitialUserStoriesError)):
+                        NoFinalBRDErrorForRefinement, NoInitialUserStoriesError,
+                        NoFinalBRDErrorForQA)):
         return str(exc)
     if isinstance(exc, (BRDLockedError, HLDLockedError, UserStoryLockedError, LLDLockedError,
-                        RefinementLockedError)):
+                        RefinementLockedError, TestCaseLockedError)):
         return str(exc)
     if isinstance(exc, ValueError):
         return str(exc)
@@ -187,6 +197,15 @@ if "usr_service" not in st.session_state:
 
 usr_service: UserStoryRefinementService = st.session_state.usr_service
 
+if "qa_service" not in st.session_state:
+    try:
+        st.session_state.qa_service = TestCaseService(project_id=st.session_state.project_id)
+    except Exception as exc:
+        st.error(friendly_error(exc))
+        st.stop()
+
+qa_service: TestCaseService = st.session_state.qa_service
+
 
 def refresh_versions() -> None:
     try:
@@ -220,6 +239,14 @@ def refresh_lld_versions() -> None:
         st.error(friendly_error(exc))
 
 
+def refresh_qa_versions() -> None:
+    try:
+        st.session_state.qa_versions = qa_service.get_all_versions()
+    except Exception as exc:
+        st.session_state.qa_versions = []
+        st.error(friendly_error(exc))
+
+
 if "versions" not in st.session_state:
     refresh_versions()
 
@@ -231,6 +258,9 @@ if "us_versions" not in st.session_state:
 
 if "lld_versions" not in st.session_state:
     refresh_lld_versions()
+
+if "qa_versions" not in st.session_state:
+    refresh_qa_versions()
 
 versions = st.session_state.versions
 latest_version = versions[-1] if versions else None
@@ -260,6 +290,20 @@ except Exception:
     usr_recorded, usr_stale_sources = None, []
 usr_is_refined = usr_recorded is not None      # latest user-story version came from artifact refinement
 usr_stale = bool(usr_stale_sources)            # a recorded source artifact changed since that refinement
+
+qa_versions = st.session_state.qa_versions
+qa_latest = qa_versions[-1] if qa_versions else None
+qa_final = next((v for v in qa_versions if v.is_final), None)
+qa_is_locked = bool(qa_final and qa_final.is_locked)
+
+# --- Phase 6 test-case provenance / per-source staleness (own test_cases stream) ---
+try:
+    qa_recorded = qa_service.recorded_source_versions()
+    qa_current = qa_service.current_source_versions()
+    qa_stale_sources = qa_service.stale_sources()
+except Exception:
+    qa_recorded, qa_current, qa_stale_sources = None, {}, []
+qa_stale = bool(qa_stale_sources)
 
 
 # --- sidebar: project status + version history --------------------------------------
@@ -364,6 +408,32 @@ with st.sidebar:
         st.caption("Accept a BRD first to unlock refinement.")
 
     st.divider()
+    st.subheader("QA / Test Cases")
+    if qa_latest is not None:
+        st.metric("Current Test Case Version", f"v{qa_latest.version}")
+        if qa_recorded is not None:
+            def _v(x):
+                return f"v{x}" if x is not None else "—"
+            st.caption(
+                "Built from: "
+                f"BRD v{qa_recorded['brd']} · "
+                f"HLD {_v(qa_recorded['hld'])} · "
+                f"LLD {_v(qa_recorded['lld'])} · "
+                f"US {_v(qa_recorded['us'])}"
+            )
+        if qa_final:
+            qa_status = "Locked" if qa_final.is_locked else "Unlocked"
+            st.success(f"Final Test Cases: v{qa_final.version}\n\nStatus: {qa_status}")
+        if qa_stale:
+            st.warning(f"STALE — changed since generation: {', '.join(qa_stale_sources)}")
+        elif not qa_final:
+            st.info("No final test cases selected yet.")
+    elif final_version is not None:
+        st.caption("Ready to generate. Open the QA / Test Case tab.")
+    else:
+        st.caption("Accept a BRD first to unlock test-case generation.")
+
+    st.divider()
     if st.button("Start New Project"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
@@ -376,10 +446,10 @@ st.title("Business Analyst Agent - SOW to BRD")
 st.caption("Phase 1: Statement of Work to Business Requirement Document")
 
 (tab_generate, tab_workspace, tab_hld, tab_stories,
- tab_lld, tab_usr) = st.tabs(
+ tab_lld, tab_usr, tab_qa) = st.tabs(
     ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace",
      "Step 4: User Story Workspace", "Step 5: LLD Workspace",
-     "Step 6: User Story Refinement"]
+     "Step 6: User Story Refinement", "Step 7: QA / Test Case Workspace"]
 )
 
 
@@ -1510,3 +1580,324 @@ with tab_usr:
                 if cols[4].button("View", key=f"usr_hist_view_{v.version}"):
                     st.session_state.usr_viewing_version = v.version
                     st.rerun()
+
+
+# --- STEP 7: QA / Test Case workspace (QA / Test Case Agent) -----------------------------
+#
+# Standalone stage. Generates test cases from the accepted BRD (required) plus the
+# accepted HLD / LLD / User Stories (optional context). Every generate / regenerate /
+# manual edit / AI refine appends a NEW version to the OWN test_cases stream
+# (outputs/<pid>/test_cases/versions.json) via TestCaseService - no other stream is
+# written and no second copy of any artifact is created.
+
+with tab_qa:
+    st.caption("Phase 6: generate QA test cases from the accepted BRD (required) plus "
+               "the accepted HLD / LLD / User Stories (optional context). Own version "
+               "stream; nothing is regenerated automatically.")
+
+    if final_version is None:
+        st.warning("QA / Test Case generation is unavailable: no accepted BRD.")
+        st.caption("Accept a BRD in the BRD Workspace first. The accepted BRD is the "
+                   "required source of truth for test cases.")
+
+    else:
+        qa_viewing_number = st.session_state.get(
+            "qa_viewing_version", qa_latest.version if qa_latest else 0
+        )
+        qa_viewing = None
+        if qa_latest is not None:
+            try:
+                qa_viewing = qa_service.get_version(qa_viewing_number) or qa_latest
+            except Exception as exc:
+                st.error(friendly_error(exc))
+                qa_viewing = qa_latest
+
+        qa_is_current = qa_viewing is not None and qa_viewing.version == qa_latest.version
+        qa_editable = qa_is_current and not qa_is_locked
+
+        # --- 1. Source Artifacts ------------------------------------------------
+        st.subheader("Source Artifacts")
+        qa_src_cols = st.columns(4)
+        qa_src_cols[0].metric("BRD", f"v{final_version.version}", "Accepted / Required")
+        qa_src_cols[1].metric(
+            "HLD",
+            f"v{hld_final.version}" if hld_final is not None else "—",
+            "Accepted / Context" if hld_final is not None else "none / optional",
+        )
+        qa_src_cols[2].metric(
+            "LLD",
+            f"v{lld_final.version}" if lld_final is not None else "—",
+            "Accepted / Context" if lld_final is not None else "none / optional",
+        )
+        if us_final is not None:
+            us_label, us_state = f"v{us_final.version}", "Final / Context"
+        elif us_latest is not None:
+            us_label, us_state = f"v{us_latest.version}", "Latest / Context"
+        else:
+            us_label, us_state = "—", "none / optional"
+        qa_src_cols[3].metric("User Stories", us_label, us_state)
+        st.caption("HLD, LLD and User Stories are optional context - their absence never "
+                   "blocks BRD-based generation. Only accepted/final versions are used "
+                   "(User Stories fall back to the latest available).")
+
+        if qa_latest is None:
+            # --- 3. First generation ----------------------------------------
+            st.divider()
+            st.subheader("Generate Test Cases")
+            st.caption(f"Test cases will be generated from the Accepted BRD "
+                       f"(v{final_version.version}) and whatever optional context is "
+                       "available. This creates Test Cases Version 1.")
+            if st.button("Generate Test Cases", type="primary", key="qa_generate_btn"):
+                with st.spinner("Sending the artifacts to Gemini and drafting test cases..."):
+                    try:
+                        start = time.time()
+                        qa_v = qa_service.generate()
+                        elapsed = time.time() - start
+                        logger.info(f"Test cases v{qa_v.version} generated in {elapsed:.1f}s")
+                        refresh_qa_versions()
+                        st.session_state.qa_viewing_version = qa_v.version
+                        st.success(f"Test Cases Version {qa_v.version} generated in "
+                                   f"{elapsed:.1f}s.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+        else:
+            # --- 5. Stale-source warning (non-blocking; no auto-regeneration) ---
+            if qa_stale and qa_recorded is not None:
+                parts = []
+                for label, key in (("BRD", "brd"), ("HLD", "hld"), ("LLD", "lld"),
+                                   ("User Stories", "us")):
+                    if label in qa_stale_sources:
+                        rec = qa_recorded.get(key)
+                        cur = qa_current.get(key)
+                        rec_txt = f"v{rec}" if rec is not None else "unavailable"
+                        cur_txt = f"v{cur}" if cur is not None else "unavailable"
+                        parts.append(f"{label} {rec_txt} -> {cur_txt}")
+                st.warning(
+                    "These test cases may be **stale** - a source artifact changed since "
+                    f"they were generated: **{'; '.join(parts)}**. Nothing is regenerated "
+                    "automatically. Use **Regenerate from Artifacts** or **AI Refine** to "
+                    "rebuild against the current artifacts (creates a new version; this "
+                    "one stays in History)."
+                )
+
+            # --- 4. Provenance of the current version ---
+            if qa_recorded is not None:
+                st.info(f"Current version **v{qa_latest.version}** built from: {qa_latest.note}")
+
+            # --- status banner ---
+            qa_status_cols = st.columns([2, 2, 2])
+            with qa_status_cols[0]:
+                st.metric("Viewing", f"v{qa_viewing.version}")
+            with qa_status_cols[1]:
+                st.metric("Type", SOURCE_LABELS.get(qa_viewing.source, qa_viewing.source))
+            with qa_status_cols[2]:
+                st.metric("Status", "Accepted" if qa_viewing.is_final else "Draft")
+
+            if qa_is_locked:
+                if qa_viewing.is_final:
+                    st.success(f"This is the Final Test Cases set (v{qa_viewing.version}) "
+                               "and it is locked against further changes.")
+                else:
+                    st.warning(f"The Final Test Cases (v{qa_final.version}) are locked. "
+                               "Unlock them below to make further changes.")
+            elif not qa_is_current:
+                st.info(f"You are viewing an older test-case version (v{qa_viewing.version}). "
+                        f"Editing is only available on the current version "
+                        f"(v{qa_latest.version}).")
+
+            st.divider()
+
+            qa_tab_preview, qa_tab_edit, qa_tab_refine, qa_tab_history = st.tabs(
+                ["Preview", "Edit", "AI Refine", "History"]
+            )
+
+            with qa_tab_preview:
+                st.markdown(qa_viewing.content)
+
+            with qa_tab_edit:
+                if not qa_editable:
+                    st.info("Editing is disabled for this version. "
+                            + ("Unlock the Final Test Cases to continue." if qa_is_locked
+                               else "Switch to the current version to edit."))
+                    st.text_area("Test cases (read-only)", value=qa_viewing.content,
+                                 height=500, disabled=True, key=f"qa_ro_{qa_viewing.version}")
+                else:
+                    st.caption("Edit the test cases below (Markdown). Saving creates a NEW "
+                               "version - the current version is never overwritten. Keep "
+                               "the '## TC-NNN' headings.")
+                    qa_edited = st.text_area(
+                        "Test cases (markdown)",
+                        value=qa_viewing.content,
+                        height=500,
+                        key=f"qa_editor_{qa_viewing.version}",
+                    )
+                    qa_note = st.text_input(
+                        "Change description (optional)",
+                        placeholder="e.g. Corrected TC-004 expected result",
+                        key=f"qa_note_{qa_viewing.version}",
+                    )
+                    if st.button("Save as New Version", type="primary", key="qa_save_edit"):
+                        try:
+                            new_qa = qa_service.save_manual_edit(
+                                qa_edited, note=qa_note.strip() or "Manual edit"
+                            )
+                            refresh_qa_versions()
+                            st.session_state.qa_viewing_version = new_qa.version
+                            st.success(f"Saved as Test Cases Version {new_qa.version}.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+
+            with qa_tab_refine:
+                if not qa_editable:
+                    st.info("AI refinement is disabled for this version. "
+                            + ("Unlock the Final Test Cases to continue." if qa_is_locked
+                               else "Switch to the current version to refine."))
+                else:
+                    st.caption("Describe your change in plain English. The AI receives the "
+                               "CURRENT test cases plus the artifacts - unaffected cases and "
+                               "their TC-NNN ids are preserved.")
+                    qa_feedback = st.text_area(
+                        "Refinement instruction",
+                        placeholder="e.g. Add boundary cases for the password length rule.",
+                        key="qa_feedback_input",
+                        height=120,
+                    )
+                    if st.button("Refine with AI", type="primary",
+                                 disabled=not qa_feedback.strip(), key="qa_refine_btn"):
+                        with st.spinner("Sending the current test cases and your feedback "
+                                        "to Gemini..."):
+                            try:
+                                start = time.time()
+                                new_qa = qa_service.refine_with_ai(qa_feedback)
+                                elapsed = time.time() - start
+                                logger.info(f"Test cases refined to v{new_qa.version} in "
+                                            f"{elapsed:.1f}s")
+                                refresh_qa_versions()
+                                st.session_state.qa_viewing_version = new_qa.version
+                                st.success(f"Created Test Cases Version {new_qa.version} in "
+                                           f"{elapsed:.1f}s.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(friendly_error(exc))
+
+            with qa_tab_history:
+                st.caption("All test-case versions are permanent. "
+                           "Nothing is ever overwritten or deleted.")
+                for v in reversed(qa_versions):
+                    cols = st.columns([1, 2, 3, 2, 1])
+                    cols[0].markdown(f"**v{v.version}**")
+                    cols[1].markdown(SOURCE_LABELS.get(v.source, v.source))
+                    cols[2].caption(v.note or "-")
+                    badges = []
+                    if v.version == qa_latest.version:
+                        badges.append("Current")
+                        if qa_stale:
+                            badges.append("STALE")
+                    if v.is_final:
+                        badges.append("Accepted")
+                        if v.is_locked:
+                            badges.append("Locked")
+                    cols[3].caption(" / ".join(badges) if badges else "Draft")
+                    if cols[4].button("View", key=f"qa_hist_view_{v.version}"):
+                        st.session_state.qa_viewing_version = v.version
+                        st.rerun()
+
+            st.divider()
+
+            st.subheader("Regenerate")
+            st.caption("Rebuild the test cases from scratch against the CURRENT artifacts "
+                       "(ignores the current test-case content). Creates a new version.")
+            if st.button("Regenerate from Artifacts", disabled=qa_is_locked,
+                         key="qa_regen_btn"):
+                with st.spinner("Rebuilding test cases from the current artifacts..."):
+                    try:
+                        start = time.time()
+                        new_qa = qa_service.regenerate()
+                        elapsed = time.time() - start
+                        logger.info(f"Test cases regenerated to v{new_qa.version} in "
+                                    f"{elapsed:.1f}s")
+                        refresh_qa_versions()
+                        st.session_state.qa_viewing_version = new_qa.version
+                        st.success(f"Created Test Cases Version {new_qa.version} in "
+                                   f"{elapsed:.1f}s.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+            st.divider()
+
+            st.subheader("Final Test Cases")
+            qa_final_cols = st.columns([2, 2, 2])
+
+            with qa_final_cols[0]:
+                if not qa_viewing.is_final:
+                    if st.button(f"Choose v{qa_viewing.version} as Final Test Cases",
+                                 key="qa_choose_final"):
+                        try:
+                            qa_service.choose_final(qa_viewing.version)
+                            refresh_qa_versions()
+                            st.success(f"Test Cases Version {qa_viewing.version} is now Final.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+                else:
+                    st.caption("This version is the Final Test Cases set.")
+
+            with qa_final_cols[1]:
+                if qa_is_locked:
+                    if st.session_state.get("qa_confirm_unlock"):
+                        st.warning("Unlock the Final Test Cases? They stay in history "
+                                   "unchanged; any new edit creates a new version.")
+                        yes_col, no_col = st.columns(2)
+                        if yes_col.button("Yes, unlock", key="qa_unlock_yes"):
+                            try:
+                                qa_service.unlock_final()
+                                st.session_state.qa_confirm_unlock = False
+                                refresh_qa_versions()
+                                st.success("Final Test Cases unlocked. Further edits will "
+                                           "create a new version.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(friendly_error(exc))
+                        if no_col.button("Cancel", key="qa_unlock_cancel"):
+                            st.session_state.qa_confirm_unlock = False
+                            st.rerun()
+                    else:
+                        if st.button("Unlock Final Test Cases", key="qa_unlock_btn"):
+                            st.session_state.qa_confirm_unlock = True
+                            st.rerun()
+
+            with qa_final_cols[2]:
+                if st.button("Prepare .docx for download", key="qa_prepare_docx"):
+                    with st.spinner("Formatting Word document..."):
+                        try:
+                            qa_docx_path = (Path(settings.resolved_output_dir())
+                                            / st.session_state.project_id
+                                            / "test_cases"
+                                            / f"TestCases_v{qa_viewing.version}.docx")
+                            generate_test_cases_docx(qa_viewing.content, qa_docx_path)
+                            st.session_state.qa_docx_ready_path = str(qa_docx_path)
+                            st.session_state.qa_docx_ready_version = qa_viewing.version
+                            logger.info(f"Test cases DOCX exported for v{qa_viewing.version}")
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+
+                qa_ready_path = st.session_state.get("qa_docx_ready_path")
+                qa_ready_version = st.session_state.get("qa_docx_ready_version")
+                if (qa_ready_path and Path(qa_ready_path).exists()
+                        and qa_ready_version == qa_viewing.version):
+                    try:
+                        with open(qa_ready_path, "rb") as f:
+                            st.download_button(
+                                f"Download TestCases v{qa_viewing.version}.docx",
+                                data=f.read(),
+                                file_name=f"TestCases_v{qa_viewing.version}.docx",
+                                mime=("application/vnd.openxmlformats-officedocument"
+                                      ".wordprocessingml.document"),
+                                key="qa_download_btn",
+                            )
+                    except Exception as exc:
+                        st.error(friendly_error(exc))

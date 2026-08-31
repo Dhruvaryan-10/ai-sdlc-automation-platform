@@ -1,4 +1,4 @@
-# SDLC Agent — BRD · HLD · User Stories · LLD · User Story Refinement
+# SDLC Agent — BRD · HLD · User Stories · LLD · Story Refinement · Test Cases
 
 The AI-powered SDLC platform, built one agent at a time:
 
@@ -19,12 +19,25 @@ The AI-powered SDLC platform, built one agent at a time:
   user-story stream** — no second history. It reads BRD/HLD/LLD only through
   the shared version-store interface and imports no other agent package. If the
   BRD, HLD, or LLD later changes, the refined stories are *flagged stale*
-  (never mutated); only an explicit "Refine Again" produces a new version.
+  (never mutated); only an explicit "Refine Again" produces a new version. A
+  refined document carries its own provenance: `Source: Artifact Refinement`
+  and a `Built From:` line listing the exact source versions used.
+- **Phase 6 — QA / Test Case Agent:** generates QA test cases from the
+  **accepted/final BRD** (the only hard prerequisite) plus the accepted HLD,
+  LLD, and final/refined-or-latest User Stories (all **optional context** — a
+  missing one never blocks BRD-based generation and is recorded as
+  `unavailable` in provenance). The LLM returns strict JSON; the service
+  validates it and renders a Markdown test-case document (stable `TC-NNN` ids)
+  into its **own** append-only `test_cases` stream. Per-source staleness:
+  a used artifact whose authoritative version later changes flags the test
+  cases stale (never auto-regenerated); a previously-absent optional artifact
+  appearing later does **not**.
 
 Every stage shares the same lifecycle: manual editing, AI-assisted refinement,
 full version history, final-version locking/unlocking, and Word export. The BRD,
-HLD, user-story, and LLD version streams are each independent; Phase 3 and
-Phase 5 both write to the one user-story stream.
+HLD, user-story, LLD, and test-case version streams are each independent; Phase
+3 and Phase 5 both write to the one user-story stream, and the QA agent only
+ever writes the test-case stream.
 
 No databases, no LangGraph, no RAG — plain JSON persistence, done properly.
 
@@ -214,6 +227,25 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
      surfaced in the HLD workspace; re-finalising the HLD then triggers this
      LLD warning.)
 
+7. **Tab 7 — QA / Test Case Workspace** (Phase 6, QA / Test Case Agent)
+   - Available once a BRD has been marked **Final**. The **Source Artifacts**
+     panel shows BRD (Accepted / Required), HLD / LLD (Accepted / Context /
+     Optional or *none / optional*), and User Stories (Final or Latest /
+     Context / Optional). Optional artifacts never block generation.
+   - Click **Generate Test Cases** to produce **Test Cases Version 1** from the
+     accepted BRD plus whatever optional context exists. Each case has a stable
+     `TC-NNN` id, Title, Requirement/User-Story reference, Preconditions, Test
+     Data, Test Steps, Expected Result, Priority and Test Type.
+   - **Edit** (Markdown), **AI Refine** (feedback-driven; unaffected cases and
+     their `TC-NNN` ids preserved), **Regenerate from Artifacts** (fresh
+     rebuild), **History**, **Choose Final**, **Unlock**, and **Download
+     TestCases.docx** work like the other workspaces.
+   - Per-source **stale** warning: if a source artifact that was *used* changes
+     its authoritative version (`BRD v1 → v2`, …), the test cases are flagged
+     stale and never regenerated automatically; a previously-absent optional
+     artifact appearing later is not stale. Everything is independently
+     versioned under `outputs/<project_id>/test_cases/versions.json`.
+
 ---
 
 ## 5. Project Structure
@@ -249,9 +281,15 @@ sdlc-ba-agent/
           refine_lld.txt
       user_story_refinement/ <- Phase 5: BRD (+ optional HLD/LLD) reconciles user stories
         agent.py             <- Gemini/LangChain wrapper (refine_user_stories)
-        service.py           <- BRD gate + reads BRD/HLD/LLD via VersionService; appends to the "user_stories" stream; three-way staleness
+        service.py           <- BRD gate + reads BRD/HLD/LLD via VersionService; appends to the "user_stories" stream; three-way staleness + Source/Built From stamping
         prompts/
           refine_from_artifacts.txt
+      test_case/             <- Phase 6: accepted BRD (+ optional HLD/LLD/User Stories) -> test cases
+        agent.py             <- Gemini/LangChain wrapper (generate_test_cases + refine_test_cases; JSON output)
+        service.py           <- BRD gate + reads BRD/HLD/LLD/User Stories via VersionService; validates JSON, renders Markdown; own "test_cases" stream; per-source staleness
+        prompts/
+          generate_test_cases.txt
+          refine_test_cases.txt
     parsers/
       detector.py            <- detects .docx / .pdf / .txt
       docx_parser.py
@@ -259,7 +297,7 @@ sdlc-ba-agent/
       text_parser.py
       text_cleaner.py        <- preprocessing (removes headers/footers/page numbers)
     document_generator/
-      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx / _lld_docx)
+      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx / _lld_docx / _test_cases_docx)
     services/
       version_service.py     <- version history (JSON file per project/stream, no DB yet)
       version_text.py        <- shared "**Version:** N" stamping helper (all document streams)
@@ -270,7 +308,7 @@ sdlc-ba-agent/
       streamlit_app.py       <- the UI, calls the service layer only
   tests/                     <- deterministic pytest suite (stub agents, no Gemini calls)
   uploads/                   <- uploaded SOW files land here
-  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + <id>/lld/ + .docx exports
+  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + <id>/lld/ + <id>/test_cases/ + .docx exports
   logs/                      <- app.log (rotating)
   requirements.txt
   pytest.ini
@@ -300,14 +338,16 @@ pytest
 
 ---
 
-## 7. What's Deliberately NOT in Phases 1–5
+## 7. What's Deliberately NOT in Phases 1–6
 
-Phases 1–5 deliver: Business Analyst (SOW → BRD), Solution Architect
+Phases 1–6 deliver: Business Analyst (SOW → BRD), Solution Architect
 (BRD → HLD), Initial User Story (BRD → draft stories), Low-Level Design
-(HLD → LLD), and User Story Refinement (BRD + HLD + LLD reconcile the stories).
-Still **not** included, by scope: a QA / Test Case Agent, Documentation and
-Project Closure Agents, Project Memory, LangGraph / multi-agent orchestration,
-RAG, a real database, and authentication / multi-user support. Persistence is
-still plain JSON files; the database decision is deferred to the Project Memory
-phase. The known `_extract_text` / `_invoke` / metadata-helper duplication
-across the five agent packages is a deliberately deferred cleanup.
+(HLD → LLD), User Story Refinement (BRD + HLD + LLD reconcile the stories), and
+QA / Test Case (BRD + optional HLD/LLD/User Stories → test cases).
+Still **not** included, by scope: a Documentation Agent, a Project Closure /
+Report Agent, Project Memory, LangGraph / multi-agent orchestration, RAG, a
+real database, load/perf/security-penetration test generation, and
+authentication / multi-user support. Persistence is still plain JSON files; the
+database decision is deferred to the Project Memory phase. The known
+`_extract_text` / `_invoke` / metadata-helper duplication across the six agent
+packages is a deliberately deferred cleanup.

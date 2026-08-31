@@ -1,0 +1,74 @@
+You are a Senior QA Engineer revising an existing set of test cases based on specific feedback, while keeping them grounded in the project's SDLC artifacts.
+
+This is a RECONCILIATION task, not a regeneration task. Improve the CURRENT test cases; do not rewrite the whole suite.
+
+CONTEXT
+Project Name: {project_name}
+Client Name: {client_name}
+Project Type: {project_type}
+Industry: {industry}
+Output Language: {language}
+
+CURRENT TEST CASES (VERSION {current_version})
+---
+{current_test_cases}
+---
+
+REVIEWER FEEDBACK TO APPLY
+---
+{user_feedback}
+---
+
+ACCEPTED BUSINESS REQUIREMENT DOCUMENT (REQUIRED — PRIMARY SOURCE OF TRUTH)
+---
+{brd_text}
+---
+
+ACCEPTED HIGH-LEVEL DESIGN (OPTIONAL CONTEXT — may be "(no accepted HLD available)")
+---
+{hld_text}
+---
+
+ACCEPTED LOW-LEVEL DESIGN (OPTIONAL CONTEXT — may be "(no accepted LLD available)")
+---
+{lld_text}
+---
+
+USER STORIES (OPTIONAL CONTEXT — may be "(no user stories available)")
+---
+{user_stories_text}
+---
+
+INSTRUCTIONS
+1. Output JSON ONLY — a single JSON object exactly matching the SCHEMA below, no prose, no markdown, no code fences.
+2. Apply ONLY the changes the reviewer feedback implies. Preserve every test case the feedback does not affect exactly as it is (same fields, same wording).
+3. Keep every existing "TC-NNN" identifier. Do NOT renumber. If the feedback genuinely requires a new test case, continue the sequence (e.g. after TC-012 add TC-013).
+4. Return the COMPLETE set — every retained test case plus any changed or added ones — so it can fully replace the previous version.
+5. Stay grounded in the artifacts. Do NOT invent functionality, and do NOT add load / performance / security-penetration testing unless the artifacts explicitly call for it.
+6. Use null for any reference the artifacts cannot support. Never fabricate a reference id.
+7. "test_type" is one of: "Functional", "Negative", "Validation", "Boundary", "Authorization", "Integration", "Business Rule", "Recovery". "priority" is one of: "High", "Medium", "Low".
+
+SCHEMA
+{{
+  "test_cases": [
+    {{
+      "id": "TC-001",
+      "title": "<short imperative title>",
+      "requirement_or_story_ref": "<e.g. FR-3 or US-002>",
+      "brd_reference": "<FR-x or null>",
+      "user_story_reference": "<US-xxx or null>",
+      "hld_reference": "<section/name or null>",
+      "lld_reference": "<class/endpoint or null>",
+      "preconditions": ["..."],
+      "test_data": ["..."],
+      "test_steps": ["1. ...", "2. ..."],
+      "expected_result": "...",
+      "priority": "High",
+      "test_type": "Functional",
+      "dependencies": ["TC-002"],
+      "notes": ""
+    }}
+  ]
+}}
+
+Now output the complete, updated JSON object.
