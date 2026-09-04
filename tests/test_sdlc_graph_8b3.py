@@ -1,15 +1,18 @@
 """
 Phase 8B-3 — LLD hop (sequential) + LLD approval gate.
 
-    gate_hld(complete) -> ensure_lld -> gate_lld -> END
+    gate_hld(complete) -> ensure_lld -> gate_lld -> ensure_test_cases (8B-4) -> ...
 
 Proves the orchestration graph delegates LLD generation to the EXISTING
 LowLevelDesignService, never finalizes, keeps VersionService the only writer,
 enforces the "final HLD first" invariant, is idempotent, and stops at the LLD
 approval gate.
 
-Deterministic: BA / SA / US / LLD LLMs are stubs injected via `agent=` /
-`*_service=`. No Gemini calls.
+Deterministic: BA / SA / US / LLD / TC LLMs are stubs injected via `agent=` /
+`*_service=`. No Gemini calls. Since 8B-4, `gate_lld(complete)` continues into
+the QA/Test-Case hop (see test_sdlc_graph_8b4.py), so `_run` here always injects
+a StubTestCaseAgent-backed TestCaseService too, even though most tests in this
+file never finalize LLD and therefore never actually reach that hop.
 """
 
 import json
@@ -21,6 +24,7 @@ from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.agent import LLDAgentError
 from app.agents.low_level_design.service import LowLevelDesignService, NoFinalHLDError
 from app.agents.solution_architect.service import SolutionArchitectService
+from app.agents.test_case.service import TestCaseService
 from app.orchestration.graph import (
     _gate_lld_node,
     _make_ensure_lld_node,
@@ -33,11 +37,17 @@ from app.orchestration.status import (
     NEXT_APPROVE_LLD,
     NEXT_GENERATE_BRD,
     NEXT_GENERATE_LLD,
-    NEXT_NONE,
+    NEXT_GENERATE_TEST_CASES,
     sdlc_status,
 )
 from app.services.version_service import BRDVersion, VersionService
-from tests.conftest import StubBAAgent, StubLLDAgent, StubSAAgent, StubUserStoryAgent
+from tests.conftest import (
+    StubBAAgent,
+    StubLLDAgent,
+    StubSAAgent,
+    StubTestCaseAgent,
+    StubUserStoryAgent,
+)
 
 PID = "sdlc8b3"
 
@@ -52,10 +62,17 @@ def _svcs(pid=PID, *, ba_agent=None, sa_agent=None, us_agent=None, lld_agent=Non
     return ba, sa, us, lld
 
 
-def _run(pid, ba, sa, us, lld, sow_file, sample_metadata):
+def _stub_tc(pid):
+    """A StubTestCaseAgent-backed TestCaseService so no `_run` path can reach real
+    Gemini once `gate_lld` is `complete` (8B-4 continues into `ensure_test_cases`)."""
+    return TestCaseService(project_id=pid, agent=StubTestCaseAgent())
+
+
+def _run(pid, ba, sa, us, lld, sow_file, sample_metadata, *, tc=None):
     return run_step(
         pid, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata,
         ba_service=ba, sa_service=sa, us_service=us, lld_service=lld,
+        tc_service=tc or _stub_tc(pid),
     )
 
 
@@ -71,32 +88,37 @@ def _to_final_hld(ba, sa, us, lld, sow_file, sample_metadata):
     sa.choose_final_hld(1)                                 # human finalization, OUTSIDE the graph
 
 
-# --- A. exact topology --------------------------------------------------
+# --- A. topology (exact end-to-end shape now lives in test_sdlc_graph_8b4.py) ---
 
-def test_topology_is_the_8b3_shape(stub_ba_agent):
+def test_topology_lld_subpath_is_intact(stub_ba_agent):
+    """The LLD hop (8B-3 invariant) must survive graph extensions.
+
+    Exact end-to-end topology (incl. the 8B-4 QA hop) is asserted in
+    test_sdlc_graph_8b4.py; here we only pin the LLD sub-path.
+    """
     ba, sa, us, lld = _svcs(ba_agent=stub_ba_agent)
     g = build_sdlc_graph(ba, sa_service=sa, us_service=us, lld_service=lld).get_graph()
 
-    assert set(g.nodes) == {
+    assert {
         "__start__", "resolve_state", "ensure_brd", "gate_brd",
         "ensure_hld", "ensure_user_stories", "gate_hld",
         "ensure_lld", "gate_lld", "__end__",
-    }
+    } <= set(g.nodes)
     plain = {(e.source, e.target) for e in g.edges if not e.conditional}
-    assert plain == {
+    assert {
         ("__start__", "resolve_state"),
         ("resolve_state", "ensure_brd"),
         ("ensure_brd", "gate_brd"),
         ("ensure_hld", "ensure_user_stories"),
         ("ensure_user_stories", "gate_hld"),
         ("ensure_lld", "gate_lld"),
-    }
+    } <= plain
     cond = {(e.source, e.target) for e in g.edges if e.conditional}
     assert ("gate_brd", "__end__") in cond
     assert ("gate_brd", "ensure_hld") in cond
     assert ("gate_hld", "__end__") in cond          # awaiting_approval -> END
     assert ("gate_hld", "ensure_lld") in cond        # complete -> LLD hop
-    assert ("gate_lld", "__end__") in cond           # both LLD-gate routes end 8B-3
+    assert ("gate_lld", "__end__") in cond           # LLD awaiting_approval -> END
     assert type(build_sdlc_graph(ba, sa_service=sa, us_service=us, lld_service=lld)).__name__ == "CompiledStateGraph"
 
 
@@ -243,10 +265,11 @@ def test_graph_never_finalizes_when_lld_already_final(
     monkeypatch.setattr(VersionService, "mark_final", lambda self, n: calls.append(("mark_final", n)))
     monkeypatch.setattr(VersionService, "unlock_final", lambda self: calls.append("unlock_final"))
 
+    # With a final LLD the run now continues into the 8B-4 QA hop (stub TC -> no Gemini).
     s = _run(PID, ba, sa, us, lld, sow_file, sample_metadata)
-    assert s["status"] == "complete" and s["awaiting"] is None
-    assert s["produced"] == {}
-    assert calls == []
+    assert s["produced"] == {"tc": 1}
+    assert s["status"] == "awaiting_approval" and s["awaiting"] == "tc_final"
+    assert calls == []  # the graph finalized nothing (LLD or TC)
 
 
 # --- G. awaiting LLD approval ------------------------------
@@ -264,9 +287,9 @@ def test_final_hld_non_final_lld_awaits_lld_final(
     assert s["awaiting"] == "lld_final"
 
 
-# --- H. final LLD -> complete, no regeneration ------------
+# --- H. final LLD -> the run continues into the 8B-4 QA hop; LLD not regenerated ---
 
-def test_final_lld_outside_graph_then_run_is_complete(
+def test_final_lld_outside_graph_then_run_reaches_qa_hop(
     stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, sow_file, sample_metadata
 ):
     ba, sa, us, lld = _svcs(
@@ -277,9 +300,8 @@ def test_final_lld_outside_graph_then_run_is_complete(
     lld.choose_final_lld(1)                                    # OUTSIDE the graph
 
     s = _run(PID, ba, sa, us, lld, sow_file, sample_metadata)
-    assert s["status"] == "complete"
-    assert s["awaiting"] is None
-    assert s["produced"] == {}
+    assert s["produced"] == {"tc": 1}                         # QA generated; LLD not regenerated
+    assert s["status"] == "awaiting_approval" and s["awaiting"] == "tc_final"
     assert len(stub_lld_agent.generate_calls) == 1
 
 
@@ -415,7 +437,9 @@ def test_status_lld_final(stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_
     st = _status(PID, ba, sa, us, lld)
     assert st["lld_final_version"] == 1
     assert st["awaiting_lld_approval"] is False
-    assert st["next_step"] is NEXT_NONE
+    assert st["tc_exists"] is False
+    # final LLD, no test cases yet -> the pipeline's next runnable step is the QA hop
+    assert st["next_step"] == NEXT_GENERATE_TEST_CASES
 
 
 def test_status_repeated_calls_are_side_effect_free(

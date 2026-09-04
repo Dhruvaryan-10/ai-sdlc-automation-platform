@@ -24,6 +24,7 @@ from app.agents.business_analyst.service import (
 from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
+from app.agents.test_case.service import TestCaseService
 from app.orchestration.graph import (
     _gate_brd_node,
     _make_ensure_brd_node,
@@ -45,6 +46,7 @@ from tests.conftest import (
     StubBAAgent,
     StubLLDAgent,
     StubSAAgent,
+    StubTestCaseAgent,
     StubUserStoryAgent,
 )
 
@@ -91,20 +93,22 @@ def test_sdlc_state_fields():
         "brd_latest_version", "brd_final_version",
         "hld_latest_version", "hld_final_version", "us_latest_version",  # 8B-2
         "lld_latest_version", "lld_final_version",                       # 8B-3
+        "tc_latest_version", "tc_final_version",                        # 8B-4
         "produced", "status", "awaiting",
     }
 
 
-# --- 2. resolve_state (BRD pointers; 8B-2 adds hld_*/us_latest which are None here) ---
+# --- 2. resolve_state (BRD pointers; 8B-2/3/4 add hld_*/us_latest/lld_*/tc_* which are None here) ---
 
 def _resolve_node(svc):
-    """resolve_state bound with stub SA / US / LLD services (no Gemini)."""
+    """resolve_state bound with stub SA / US / LLD / TC services (no Gemini)."""
     sa = SolutionArchitectService(project_id=svc.project_id, ba_service=svc, agent=StubSAAgent())
     us = InitialUserStoryService(project_id=svc.project_id, ba_service=svc, agent=StubUserStoryAgent())
     lld = LowLevelDesignService(
         project_id=svc.project_id, sa_service=sa, ba_service=svc, agent=StubLLDAgent()
     )
-    return _make_resolve_state_node(svc, sa, us, lld)
+    tc = TestCaseService(project_id=svc.project_id, agent=StubTestCaseAgent())
+    return _make_resolve_state_node(svc, sa, us, lld, tc)
 
 
 def test_resolve_state_empty_project(stub_ba_agent):
@@ -114,6 +118,7 @@ def test_resolve_state_empty_project(stub_ba_agent):
         "brd_latest_version": None, "brd_final_version": None,
         "hld_latest_version": None, "hld_final_version": None, "us_latest_version": None,
         "lld_latest_version": None, "lld_final_version": None,
+        "tc_latest_version": None, "tc_final_version": None,
     }
 
 
@@ -361,6 +366,10 @@ def test_sdlc_status_empty_project(stub_ba_agent):
         "lld_latest_version": None,
         "lld_final_version": None,
         "awaiting_lld_approval": False,
+        "tc_exists": False,
+        "tc_latest_version": None,
+        "tc_final_version": None,
+        "awaiting_test_cases_approval": False,
         "next_step": NEXT_GENERATE_BRD,
     }
 

@@ -22,6 +22,7 @@ from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.agent import SolutionArchitectAgentError
 from app.agents.solution_architect.service import SolutionArchitectService
+from app.agents.test_case.service import TestCaseService
 from app.orchestration.graph import (
     _gate_hld_node,
     _make_ensure_hld_node,
@@ -41,7 +42,13 @@ from app.orchestration.status import (
     sdlc_status,
 )
 from app.services.version_service import BRDVersion, VersionService
-from tests.conftest import StubBAAgent, StubLLDAgent, StubSAAgent, StubUserStoryAgent
+from tests.conftest import (
+    StubBAAgent,
+    StubLLDAgent,
+    StubSAAgent,
+    StubTestCaseAgent,
+    StubUserStoryAgent,
+)
 
 PID = "sdlc8b2"
 
@@ -58,6 +65,13 @@ def _stub_lld(pid, ba, sa):
     return LowLevelDesignService(
         project_id=pid, sa_service=sa, ba_service=ba, agent=StubLLDAgent()
     )
+
+
+def _stub_tc(pid):
+    """A StubTestCaseAgent-backed TestCaseService (no path in this file finalizes LLD,
+    so `ensure_test_cases` is never reached here — kept for resolve_state's exact-dict
+    determinism, matching the `_stub_lld` precedent)."""
+    return TestCaseService(project_id=pid, agent=StubTestCaseAgent())
 
 
 def _run(pid, ba, sa, us, sow_file, sample_metadata, *, lld=None):
@@ -120,12 +134,13 @@ def test_resolve_state_reads_brd_hld_us_pointers(stub_ba_agent, stub_sa_agent, s
     sa.generate_initial_hld()
     us.generate_initial_stories()
 
-    out = _make_resolve_state_node(ba, sa, us, _stub_lld(PID, ba, sa))({})
+    out = _make_resolve_state_node(ba, sa, us, _stub_lld(PID, ba, sa), _stub_tc(PID))({})
     assert out == {
         "brd_latest_version": 1, "brd_final_version": 1,
         "hld_latest_version": 1, "hld_final_version": None,
         "us_latest_version": 1,
         "lld_latest_version": None, "lld_final_version": None,
+        "tc_latest_version": None, "tc_final_version": None,
     }
 
 
@@ -385,6 +400,8 @@ def test_status_empty_project(stub_ba_agent, stub_sa_agent, stub_us_agent):
         "us_exists": False, "us_latest_version": None,
         "lld_exists": False, "lld_latest_version": None, "lld_final_version": None,
         "awaiting_lld_approval": False,
+        "tc_exists": False, "tc_latest_version": None, "tc_final_version": None,
+        "awaiting_test_cases_approval": False,
         "next_step": NEXT_GENERATE_BRD,
     }
 
