@@ -17,6 +17,7 @@ unexpected. API keys and secrets are never rendered or logged.
 Run with:  streamlit run app/ui/streamlit_app.py
 """
 
+import re
 import sys
 import time
 import uuid
@@ -78,6 +79,7 @@ from app.document_generator.brd_generator import (
     generate_test_cases_docx,
     generate_user_stories_docx,
 )
+from app.ui.project_registry import list_existing_projects, sanitize_project_id
 from app.utils.config import settings
 from app.utils.logger import get_logger
 
@@ -93,6 +95,115 @@ SOURCE_LABELS = {
     "manual_edit": "Manual Edit",
     "ai_refine": "AI Refinement",
 }
+
+
+def switch_project(pid: str) -> None:
+    """Wipe the session and reopen the app on project `pid`.
+
+    Uses the same safe session_state wipe the "Start New Project" button has
+    always used, then records the chosen id in both session_state and the URL
+    (so a browser refresh reopens the same project) and reruns so every service
+    and cached version list is rebuilt against `pid`.
+    """
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    st.session_state.project_id = pid
+    st.query_params["project"] = pid
+    st.rerun()
+
+
+# A metadata line: "**Key:** value" (key may contain spaces / "/" but no "*",
+# and there must be a real value after the closing "**"). Label-only lines such
+# as "**Preconditions:**" / "**Expected Result:**" deliberately do NOT match —
+# they are already separated by the list / prose that follows them.
+_METADATA_LINE_RE = re.compile(r"^\s*\*\*[^*\n]+:\*\*\s+\S")
+
+# A legacy bullet-wrapped numbered step: "- 1. text" / "  - 2) text". Test Case
+# versions persisted before canonical step numbering stored steps this way;
+# CommonMark then renders a bullet AND a number ("• 1. text").
+_LEGACY_NUMBERED_BULLET_RE = re.compile(r"^(\s*)-\s+(\d+)[.)]\s+")
+
+
+def _flatten_legacy_numbered_bullets(content: str) -> str:
+    """Display-only: rewrite legacy "- N. text" step lines to "N. text".
+
+    Test Case documents generated before the renderer emitted a real ordered
+    list stored steps as bullet items that themselves start with "1." / "2)" —
+    CommonMark reads that as a bullet containing an ordered list and paints
+    "• 1. text". Dropping the leading "- " (and normalising ")" to ".") makes it
+    render as a plain ordered list while keeping the stored numbers.
+
+    Never touches the stored artifact. Ordinary bullets ("- Preconditions text")
+    have no leading number and are left alone; current-format lines ("1. text")
+    have no leading "- " and are left alone. Lines inside fenced code blocks are
+    skipped. Idempotent.
+    """
+    if not content:
+        return content or ""
+
+    lines = content.split("\n")
+    in_fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        lines[i] = _LEGACY_NUMBERED_BULLET_RE.sub(r"\1\2. ", line, count=1)
+    return "\n".join(lines)
+
+
+def _hard_break_metadata_lines(content: str) -> str:
+    """Display-only: give each "**Key:** value" line a Markdown hard line break.
+
+    Streamlit's st.markdown (CommonMark) folds a run of consecutive non-blank
+    lines into ONE paragraph, rendering the newlines as spaces — so the
+    per-test-case metadata block ("Requirement / User Story Reference: ... BRD
+    Reference: ... Priority: ...") and the document header block run together on
+    one line. Appending two trailing spaces turns the soft break into a hard
+    break so each field keeps its own line. Long HLD/LLD references then wrap
+    naturally within the viewport.
+
+    This never touches the stored artifact — it is applied only to the string
+    handed to st.markdown for preview. It does not add blank lines, skips lines
+    inside fenced code blocks, skips label-only lines, and is idempotent.
+    """
+    if not content:
+        return content or ""
+
+    lines = content.split("\n")
+    in_fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if in_fence or not _METADATA_LINE_RE.match(line):
+            continue
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        if next_line.strip() == "" or line.endswith("  "):
+            continue  # last line of a run needs no break; don't double up
+        lines[i] = line + "  "
+    return "\n".join(lines)
+
+
+def render_artifact_markdown(content: str) -> None:
+    """Render a stored artifact document in a preview pane.
+
+    Three display-only fixes, none of which changes the stored Markdown or the
+    DOCX export. Applied in order:
+
+    1. Legacy "- N. text" step lines -> "N. text" so they render as a plain
+       ordered list instead of "• 1. text" (see _flatten_legacy_numbered_bullets).
+    2. Consecutive "**Key:** value" metadata lines get Markdown hard line breaks
+       so st.markdown does not fold them into one paragraph
+       (see _hard_break_metadata_lines).
+    3. A literal "$" is escaped to "\\$" — st.markdown treats "$...$" as LaTeX,
+       which mangles currency values (e.g. "$29.99 and B2B price $19.99").
+    """
+    prepared = _flatten_legacy_numbered_bullets(content or "")
+    prepared = _hard_break_metadata_lines(prepared)
+    prepared = prepared.replace("$", "\\$")
+    st.markdown(prepared)
 
 
 def story_version_label(v) -> str:
@@ -140,7 +251,14 @@ def friendly_error(exc: Exception) -> str:
 # --- session bootstrapping --------------------------------------------------------
 
 if "project_id" not in st.session_state:
-    st.session_state.project_id = str(uuid.uuid4())[:8]
+    # Prefer a valid ?project=<id> from the URL so a browser refresh reopens the
+    # same persisted project; otherwise fall back to the historic behaviour of
+    # minting a fresh short UUID for a brand-new project.
+    from_url = sanitize_project_id(st.query_params.get("project", ""))
+    st.session_state.project_id = from_url or str(uuid.uuid4())[:8]
+
+# Keep the URL in sync with the active project (no-op when already equal).
+st.query_params["project"] = st.session_state.project_id
 
 if "service" not in st.session_state:
     try:
@@ -312,6 +430,45 @@ with st.sidebar:
     st.header("Project")
     st.caption(f"Project ID: `{st.session_state.project_id}`")
 
+    with st.expander("Open / switch project"):
+        _existing = list_existing_projects(settings.resolved_output_dir())
+        if _existing:
+            _default_idx = (
+                _existing.index(st.session_state.project_id)
+                if st.session_state.project_id in _existing
+                else 0
+            )
+            _picked = st.selectbox(
+                "Existing projects", _existing, index=_default_idx, key="project_picker"
+            )
+            if st.button("Open selected", key="open_selected_project"):
+                if _picked and _picked != st.session_state.project_id:
+                    switch_project(_picked)
+        else:
+            st.caption("No saved projects found under the outputs folder yet.")
+
+        _typed = st.text_input(
+            "Open by ID", key="open_by_id_input",
+            placeholder="e.g. d1801c21",
+        )
+        if st.button("Open by ID", key="open_by_id_btn"):
+            _clean = sanitize_project_id(_typed)
+            if _clean is None:
+                st.warning(
+                    "Not a valid project ID. Use letters, digits, '-' or '_' "
+                    "(max 64 characters)."
+                )
+            elif _clean not in list_existing_projects(settings.resolved_output_dir()):
+                # Never create a project just because an ID was typed.
+                st.warning(
+                    f"No saved project '{_clean}'. Use \"Start New Project\" to "
+                    "create one — typing an ID here never creates a project."
+                )
+            elif _clean != st.session_state.project_id:
+                switch_project(_clean)
+            else:
+                st.info(f"Project '{_clean}' is already open.")
+
     if latest_version:
         st.metric("Current Version", f"v{latest_version.version}")
     if final_version:
@@ -435,9 +592,7 @@ with st.sidebar:
 
     st.divider()
     if st.button("Start New Project"):
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
+        switch_project(str(uuid.uuid4())[:8])
 
 
 # --- main area ------------------------------------------------------------------------
@@ -553,7 +708,7 @@ with tab_workspace:
 
         # --- PREVIEW: render markdown as a real document ---
         with tab_preview:
-            st.markdown(viewing_version.content)
+            render_artifact_markdown(viewing_version.content)
 
         # --- EDIT: manual editing, saving creates a new version ---
         with tab_edit:
@@ -796,7 +951,7 @@ with tab_hld:
         )
 
         with hld_tab_preview:
-            st.markdown(hld_viewing.content)
+            render_artifact_markdown(hld_viewing.content)
 
         with hld_tab_edit:
             if not hld_editable:
@@ -1039,7 +1194,7 @@ with tab_stories:
         )
 
         with us_tab_preview:
-            st.markdown(us_viewing.content)
+            render_artifact_markdown(us_viewing.content)
 
         with us_tab_edit:
             if not us_editable:
@@ -1290,7 +1445,7 @@ with tab_lld:
         )
 
         with lld_tab_preview:
-            st.markdown(lld_viewing.content)
+            render_artifact_markdown(lld_viewing.content)
 
         with lld_tab_edit:
             if not lld_editable:
@@ -1557,7 +1712,7 @@ with tab_usr:
             if usr_viewing.version != us_latest.version:
                 st.info(f"Viewing v{usr_viewing.version}. The latest version is "
                         f"v{us_latest.version}.")
-            st.markdown(usr_viewing.content)
+            render_artifact_markdown(usr_viewing.content)
 
         with usr_tab_history:
             st.caption("The whole user-story history — initial generation, manual edits, "
@@ -1714,7 +1869,7 @@ with tab_qa:
             )
 
             with qa_tab_preview:
-                st.markdown(qa_viewing.content)
+                render_artifact_markdown(qa_viewing.content)
 
             with qa_tab_edit:
                 if not qa_editable:

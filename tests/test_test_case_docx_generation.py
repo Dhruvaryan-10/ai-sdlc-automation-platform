@@ -24,8 +24,8 @@ SAMPLE_MD = """# Sample — Test Cases
 - The registration page is reachable.
 
 **Test Steps:**
-- 1. Open the registration page.
-- 2. Enter valid details and submit.
+1. Open the registration page.
+2. Enter valid details and submit.
 
 **Expected Result:**
 A new account is created and the customer is signed in.
@@ -47,7 +47,13 @@ def test_generate_test_cases_docx_writes_readable_file(tmp_path):
     assert any("Source: Artifact-refined" in p.text for p in doc.paragraphs)
     assert any("Built From: BRD v2, HLD v1" in p.text for p in doc.paragraphs)
     bullet_paras = [p for p in doc.paragraphs if p.style.name == "List Bullet"]
-    assert bullet_paras, "preconditions / steps should render as bullets"
+    assert bullet_paras, "preconditions should render as bullets"
+    # Steps render as a real numbered list with NO literal "1." prefix in the text
+    # (Word supplies the numbering) and never as doubled bullet+number.
+    number_paras = [p for p in doc.paragraphs if p.style.name == "List Number"]
+    assert any(p.text == "Open the registration page." for p in number_paras)
+    assert any(p.text == "Enter valid details and submit." for p in number_paras)
+    assert not any(p.text.lstrip().startswith(("1.", "2.", "1)", "2)")) for p in number_paras)
 
 
 def test_test_cases_docx_matches_supplied_content(tmp_path):

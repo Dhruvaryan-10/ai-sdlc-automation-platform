@@ -47,6 +47,7 @@ INSTRUCTIONS
 5. Stay grounded in the artifacts. Do NOT invent functionality, and do NOT add load / performance / security-penetration testing unless the artifacts explicitly call for it.
 6. Use null for any reference the artifacts cannot support. Never fabricate a reference id.
 7. "test_type" is one of: "Functional", "Negative", "Validation", "Boundary", "Authorization", "Integration", "Business Rule", "Recovery". "priority" is one of: "High", "Medium", "Low".
+8. Each "test_steps" item is a single action in plain text with NO leading number ("1.", "2)", etc.) — the document renders the numbering.
 
 SCHEMA
 {{
@@ -61,7 +62,7 @@ SCHEMA
       "lld_reference": "<class/endpoint or null>",
       "preconditions": ["..."],
       "test_data": ["..."],
-      "test_steps": ["1. ...", "2. ..."],
+      "test_steps": ["<action>", "<action>"],
       "expected_result": "...",
       "priority": "High",
       "test_type": "Functional",

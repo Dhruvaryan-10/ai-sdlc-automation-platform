@@ -384,3 +384,145 @@ def test_invalid_json_from_agent_is_reported(stub_ba_agent, sow_file, sample_met
     qa = TestCaseService(project_id=PID, agent=BadAgent())
     with pytest.raises(ValueError):
         qa.generate()
+
+
+# --- R1/R2: test steps render as a clean single ordered list ----------------
+
+def test_generated_test_steps_are_a_clean_ordered_list(
+    stub_ba_agent, stub_tc_agent, sow_file, sample_metadata
+):
+    _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    v1 = _qa(stub_tc_agent).generate()
+
+    steps_block = _tc_section(v1.content, "TC-001")
+    assert "1. Open the registration page." in steps_block
+    assert "2. Enter valid details." in steps_block
+    assert "3. Submit the form." in steps_block
+    # no bullet-wrapped steps, no doubled numbering
+    assert "- 1. " not in v1.content and "- 2. " not in v1.content
+    assert "1. 1. " not in v1.content
+
+
+def test_render_markdown_strips_stray_step_numbers():
+    cases = [{
+        "id": "TC-001", "title": "Doubled numbers",
+        "requirement_or_story_ref": "FR-1",
+        "test_steps": ["1. First action", "2) Second action", "3 ) Third action"],
+        "expected_result": "ok", "priority": "High", "test_type": "Functional",
+    }]
+    md = TestCaseService._render_markdown(
+        cases, project_name="P", client_name="C", project_type="T",
+        version=1, source_label="Generated from artifacts",
+        built_from="BRD v1, HLD unavailable, LLD unavailable, User Stories unavailable",
+    )
+    assert "1. First action" in md
+    assert "2. Second action" in md
+    assert "3. Third action" in md
+    for bad in ("1. 1.", "2. 2)", "3. 3 )", "- 1.", "- 2)"):
+        assert bad not in md
+
+
+# --- R5: non-blocking traceability warning ---------------------------------
+
+import logging as _logging
+
+_SVC_LOGGER = "app.agents.test_case.service"
+
+
+def _capture_service_warnings(monkeypatch, caplog):
+    """The app logger sets propagate=False; re-enable it so caplog can see it."""
+    monkeypatch.setattr(_logging.getLogger(_SVC_LOGGER), "propagate", True)
+    return caplog.at_level("WARNING", logger=_SVC_LOGGER)
+
+
+def test_ungrounded_reference_logs_warning_but_still_generates(
+    stub_ba_agent, sow_file, sample_metadata, caplog, monkeypatch
+):
+    _final_brd(stub_ba_agent, sow_file, sample_metadata)
+
+    class RefAgent:
+        def generate_test_cases(self, **kw):
+            import json as _json
+            return _json.dumps({"test_cases": [{
+                "id": "TC-001", "title": "Cites a missing FR",
+                "requirement_or_story_ref": "FR-999",
+                "brd_reference": "FR-999",
+                "test_steps": ["Do something"], "expected_result": "ok",
+                "priority": "High", "test_type": "Functional",
+            }]})
+
+    qa = TestCaseService(project_id=PID, agent=RefAgent())
+    with _capture_service_warnings(monkeypatch, caplog):
+        v1 = qa.generate()
+
+    assert v1.version == 1                       # generation NOT blocked
+    assert "## TC-001 — " in v1.content          # test case NOT discarded
+    assert any("Traceability" in r.message and "FR-999" in r.message
+               for r in caplog.records)
+
+
+def test_grounded_reference_produces_no_traceability_warning(
+    stub_ba_agent, stub_tc_agent, sow_file, sample_metadata, caplog, monkeypatch
+):
+    _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    with _capture_service_warnings(monkeypatch, caplog):
+        _qa(stub_tc_agent).generate()
+    assert not any("Traceability" in r.message for r in caplog.records)
+
+
+# --- LangChain structured-output pilot: end-to-end through the real agent ----
+
+def test_structured_output_path_feeds_service_unchanged(
+    stub_ba_agent, sow_file, sample_metadata, monkeypatch
+):
+    """A real TestCaseAgent on the structured path (fake structured LLM) still
+    produces a JSON string TestCaseService validates, renders and persists."""
+    from app.agents.test_case.agent import TestCaseAgent
+    from app.agents.test_case.schema import TestCaseList
+    from tests.conftest import STUB_TEST_CASES
+
+    _final_brd(stub_ba_agent, sow_file, sample_metadata)
+
+    class _FakeStructuredLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, prompt):
+            self.calls.append(prompt)
+            return TestCaseList(**STUB_TEST_CASES)
+
+    agent = TestCaseAgent(structured=True)          # constructs, no network at init
+    fake = _FakeStructuredLLM()
+    monkeypatch.setattr(agent, "_structured_llm", fake)
+
+    qa = TestCaseService(project_id=PID, agent=agent)
+    v1 = qa.generate()
+
+    assert fake.calls, "the structured LLM should have been invoked"
+    assert v1.version == 1 and v1.source == "initial"
+    assert "## TC-001 — " in v1.content and "## TC-002 — " in v1.content
+    assert "**Version:** 1" in v1.content
+    assert v1.source_ref == "brd_v1;hld_vnone;lld_vnone;us_vnone"
+
+
+def test_fallback_structured_false_uses_freeform_invoke(monkeypatch):
+    """structured=False must leave the original _invoke() string path in place."""
+    from app.agents.test_case.agent import TestCaseAgent
+
+    agent = TestCaseAgent(structured=False)
+    assert agent._structured is False
+    assert agent._structured_llm is None
+
+    captured = {}
+    monkeypatch.setattr(agent, "_invoke", lambda prompt: captured.setdefault("p", prompt) or '{"test_cases": []}')
+    agent.generate_test_cases(
+        brd_text="BRD body",
+        hld_text="(no accepted HLD available)",
+        lld_text="(no accepted LLD available)",
+        user_stories_text="(no user stories available)",
+        metadata=type("M", (), {
+            "project_name": "P", "client_name": "C", "project_type": "T",
+            "industry": "I", "language": "English",
+        })(),
+    )
+    assert "BRD body" in captured["p"]

@@ -36,7 +36,7 @@ INSTRUCTIONS
 1. Output JSON ONLY. No prose, no markdown, no code fences, no commentary — a single JSON object exactly matching the SCHEMA below and nothing else.
 2. Ground every test case strictly in the supplied artifacts. The BRD is authoritative. Use the HLD/LLD/User Stories only when they are present (not the "(… available)" sentinel). Do NOT invent functionality, endpoints, fields, roles, or rules that the artifacts do not support.
 3. Give every test case a stable identifier: "TC-001", "TC-002", "TC-003", ... zero-padded to three digits, in order, no gaps.
-4. Make each test case actionable for a QA analyst: concrete preconditions, concrete test data, numbered concrete steps, and a single clear expected result that is objectively verifiable.
+4. Make each test case actionable for a QA analyst: concrete preconditions, concrete test data, one concrete action per "test_steps" array item, and a single clear expected result that is objectively verifiable. Do NOT put step numbers ("1.", "2)", etc.) inside the array items — the document renders the numbering.
 5. Cover, where the artifacts support it:
    - functional requirements
    - user-story acceptance criteria (when user stories are provided)
@@ -52,7 +52,7 @@ INSTRUCTIONS
 6. Set "test_type" to one of: "Functional", "Negative", "Validation", "Boundary", "Authorization", "Integration", "Business Rule", "Recovery".
 7. Set "priority" to one of: "High", "Medium", "Low", based on how central the covered behaviour is to the BRD's stated objectives.
 8. For references, use null when the artifact cannot support that reference. Only cite "brd_reference" (e.g. "FR-3"), "user_story_reference" (e.g. "US-002"), "hld_reference", "lld_reference" when the supplied artifact clearly contains that item. Never fabricate a reference id.
-9. "preconditions", "test_data", "test_steps", "dependencies" are arrays of strings (may be empty). "expected_result" is a single string. "notes" is a string (may be empty).
+9. "preconditions", "test_data", "test_steps", "dependencies" are arrays of strings (may be empty). Each "test_steps" item is a single action in plain text with NO leading number. "expected_result" is a single string. "notes" is a string (may be empty).
 
 SCHEMA
 {{
@@ -67,7 +67,7 @@ SCHEMA
       "lld_reference": "<class/endpoint or null>",
       "preconditions": ["..."],
       "test_data": ["..."],
-      "test_steps": ["1. ...", "2. ..."],
+      "test_steps": ["<action>", "<action>"],
       "expected_result": "...",
       "priority": "High",
       "test_type": "Functional",

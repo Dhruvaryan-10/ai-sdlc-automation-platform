@@ -62,7 +62,14 @@ _PROJECT_TYPE_PATTERN = re.compile(r"\*\*Project Type:\*\*\s*(.+)")
 _ANY_H1_PATTERN = re.compile(r"^#\s+(.+)$", re.MULTILINE)
 _REF_TOKEN_PATTERN = re.compile(r"(brd|hld|lld|us)_v(\d+|none)")
 
-_REQUIRED_FIELDS = ("id", "title", "test_steps", "expected_result", "priority", "test_type")
+_REQUIRED_FIELDS = (
+    "id", "title", "requirement_or_story_ref",
+    "test_steps", "expected_result", "priority", "test_type",
+)
+
+# A leading "1. " / "2) " / "3 ) " style step number the model may still emit
+# inside a test_steps item — stripped so _render_markdown owns the numbering.
+_STEP_PREFIX_PATTERN = re.compile(r"^\s*\d+\s*[.)]\s+")
 
 
 class NoFinalBRDError(Exception):
@@ -232,6 +239,20 @@ class TestCaseService:
             out.append("")
             return out
 
+        def _numbered(label: str, items) -> list[str]:
+            """A real ordered Markdown list. Strips any leading step number the
+            model still put in an item so the numbering is never doubled."""
+            if not items:
+                return []
+            if isinstance(items, str):
+                items = [items]
+            out = [f"**{label}:**"]
+            for n, it in enumerate(items, start=1):
+                text = _STEP_PREFIX_PATTERN.sub("", str(it).strip()).strip()
+                out.append(f"{n}. {text}")
+            out.append("")
+            return out
+
         lines: list[str] = [
             f"# {project_name} — Test Cases",
             "",
@@ -266,7 +287,7 @@ class TestCaseService:
             lines.append("")
             lines += _bullets("Preconditions", case.get("preconditions"))
             lines += _bullets("Test Data", case.get("test_data"))
-            lines += _bullets("Test Steps", case.get("test_steps"))
+            lines += _numbered("Test Steps", case.get("test_steps"))
             lines += ["**Expected Result:**", str(case.get("expected_result", "")).strip(), ""]
             notes = str(case.get("notes") or "").strip()
             if notes:
@@ -336,11 +357,57 @@ class TestCaseService:
             source_label="Artifact-refined", note_prefix="Refined",
         )
 
+    @staticmethod
+    def _reference_is_grounded(ref: str, *artifact_texts: str) -> bool:
+        """True if `ref` (or a lenient variant) appears in any supplied artifact text."""
+        ref = str(ref).strip()
+        if not ref:
+            return True
+        candidates = {ref}
+        # "Section 3.2" / "§4" also count as grounded if a bare "3.2" / "4" is present.
+        bare = re.sub(r"^(section|sec\.?|§)\s+", "", ref, flags=re.IGNORECASE).strip()
+        if bare:
+            candidates.add(bare)
+        lowered = [t.lower() for t in artifact_texts if t]
+        return any(c.lower() in text for c in candidates for text in lowered)
+
+    def _check_traceability(self, cases, brd_text, hld_text, lld_text, us_text) -> None:
+        """Non-blocking: log a warning for any cited reference not found in its
+        source artifact. Never raises, never drops a test case, never changes
+        versioning/persistence — a debugging aid only."""
+        checks = (
+            ("requirement_or_story_ref", (brd_text, us_text), "BRD/User Stories"),
+            ("brd_reference", (brd_text,), "BRD"),
+            ("user_story_reference", (us_text,), "User Stories"),
+            ("hld_reference", (hld_text,), "HLD"),
+            ("lld_reference", (lld_text,), "LLD"),
+        )
+        for case in cases:
+            cid = case.get("id", "?")
+            for field, texts, label in checks:
+                val = case.get(field)
+                if val in (None, "", []):
+                    continue
+                if not any(t for t in texts):
+                    continue  # that optional artifact was not supplied — nothing to check
+                if not self._reference_is_grounded(val, *texts):
+                    logger.warning(
+                        "Traceability: %s %s=%r not found in the supplied %s text",
+                        cid, field, val, label,
+                    )
+
     def _commit(
         self, raw, brd, hld, lld, us, metadata, *,
         source_label: str, note_prefix: str = "Generated",
     ) -> BRDVersion:
         cases = self._parse_and_validate(raw)
+        self._check_traceability(
+            cases,
+            brd.content,
+            hld.content if hld else None,
+            lld.content if lld else None,
+            us.content if us else None,
+        )
         n = self._next_version_number()
         hld_v = hld.version if hld else None
         lld_v = lld.version if lld else None
