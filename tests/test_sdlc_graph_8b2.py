@@ -19,6 +19,7 @@ import pytest
 from app.agents.business_analyst.service import BusinessAnalystService
 from app.agents.initial_user_story.agent import InitialUserStoryAgentError
 from app.agents.initial_user_story.service import InitialUserStoryService
+from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.agent import SolutionArchitectAgentError
 from app.agents.solution_architect.service import SolutionArchitectService
 from app.orchestration.graph import (
@@ -35,11 +36,12 @@ from app.orchestration.status import (
     NEXT_APPROVE_HLD,
     NEXT_GENERATE_BRD,
     NEXT_GENERATE_HLD,
+    NEXT_GENERATE_LLD,
     NEXT_NONE,
     sdlc_status,
 )
 from app.services.version_service import BRDVersion, VersionService
-from tests.conftest import StubBAAgent, StubSAAgent, StubUserStoryAgent
+from tests.conftest import StubBAAgent, StubLLDAgent, StubSAAgent, StubUserStoryAgent
 
 PID = "sdlc8b2"
 
@@ -51,10 +53,18 @@ def _svcs(pid=PID, *, ba_agent=None, sa_agent=None, us_agent=None):
     return ba, sa, us
 
 
-def _run(pid, ba, sa, us, sow_file, sample_metadata):
+def _stub_lld(pid, ba, sa):
+    """A StubLLDAgent-backed LowLevelDesignService so no `_run` path can reach real Gemini."""
+    return LowLevelDesignService(
+        project_id=pid, sa_service=sa, ba_service=ba, agent=StubLLDAgent()
+    )
+
+
+def _run(pid, ba, sa, us, sow_file, sample_metadata, *, lld=None):
     return run_step(
         pid, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata,
         ba_service=ba, sa_service=sa, us_service=us,
+        lld_service=lld or _stub_lld(pid, ba, sa),
     )
 
 
@@ -63,28 +73,28 @@ def _final_brd(ba, sow_file, sample_metadata):
     ba.choose_final_brd(1)
 
 
-# --- A. exact topology ------------------------------------------------
+# --- A. HLD sub-path topology (exact full topology lives in test_sdlc_graph_8b3.py) --
 
-def test_topology_is_the_8b2_shape(stub_ba_agent):
+def test_topology_hld_subpath_is_intact(stub_ba_agent):
     ba, sa, us = _svcs(ba_agent=stub_ba_agent)
     g = build_sdlc_graph(ba, sa_service=sa, us_service=us).get_graph()
 
-    assert set(g.nodes) == {
+    assert {
         "__start__", "resolve_state", "ensure_brd", "gate_brd",
         "ensure_hld", "ensure_user_stories", "gate_hld", "__end__",
-    }
+    } <= set(g.nodes)
     plain = {(e.source, e.target) for e in g.edges if not e.conditional}
-    assert plain == {
+    assert {
         ("__start__", "resolve_state"),
         ("resolve_state", "ensure_brd"),
         ("ensure_brd", "gate_brd"),
         ("ensure_hld", "ensure_user_stories"),
         ("ensure_user_stories", "gate_hld"),
-    }
+    } <= plain
     cond = {(e.source, e.target) for e in g.edges if e.conditional}
     assert ("gate_brd", "__end__") in cond          # awaiting_approval
     assert ("gate_brd", "ensure_hld") in cond        # complete -> HLD hop
-    assert ("gate_hld", "__end__") in cond           # both HLD-gate routes end 8B-2
+    assert ("gate_hld", "__end__") in cond           # HLD awaiting_approval -> END
 
 
 def test_route_after_gate_hld_maps_both_outcomes():
@@ -110,11 +120,12 @@ def test_resolve_state_reads_brd_hld_us_pointers(stub_ba_agent, stub_sa_agent, s
     sa.generate_initial_hld()
     us.generate_initial_stories()
 
-    out = _make_resolve_state_node(ba, sa, us)({})
+    out = _make_resolve_state_node(ba, sa, us, _stub_lld(PID, ba, sa))({})
     assert out == {
         "brd_latest_version": 1, "brd_final_version": 1,
         "hld_latest_version": 1, "hld_final_version": None,
         "us_latest_version": 1,
+        "lld_latest_version": None, "lld_final_version": None,
     }
 
 
@@ -221,20 +232,22 @@ def test_graph_never_finalizes_hld_on_generation(monkeypatch, stub_ba_agent, stu
     assert calls == []  # the graph finalized nothing
 
 
-def test_graph_never_finalizes_when_hld_already_final(monkeypatch, stub_ba_agent, stub_sa_agent, stub_us_agent, sow_file, sample_metadata):
+def test_graph_never_finalizes_hld_when_hld_already_final(monkeypatch, stub_ba_agent, stub_sa_agent, stub_us_agent, sow_file, sample_metadata):
     ba, sa, us = _svcs(ba_agent=stub_ba_agent, sa_agent=stub_sa_agent, us_agent=stub_us_agent)
+    lld = _stub_lld(PID, ba, sa)
     _final_brd(ba, sow_file, sample_metadata)
-    _run(PID, ba, sa, us, sow_file, sample_metadata)
+    _run(PID, ba, sa, us, sow_file, sample_metadata, lld=lld)
     sa.choose_final_hld(1)  # human finalization — before patching
 
     calls: list = []
     monkeypatch.setattr(VersionService, "mark_final", lambda self, n: calls.append(("mark_final", n)))
     monkeypatch.setattr(VersionService, "unlock_final", lambda self: calls.append("unlock_final"))
 
-    s = _run(PID, ba, sa, us, sow_file, sample_metadata)
-    assert s["status"] == "complete" and s["awaiting"] is None
-    assert s["produced"] == {}
-    assert calls == []
+    # With a final HLD the run now continues into the 8B-3 LLD hop (stub LLD -> no Gemini).
+    s = _run(PID, ba, sa, us, sow_file, sample_metadata, lld=lld)
+    assert s["produced"] == {"lld": 1}
+    assert s["status"] == "awaiting_approval" and s["awaiting"] == "lld_final"
+    assert calls == []  # the graph finalized nothing (HLD or LLD)
 
 
 # --- H. awaiting HLD approval --------------------------------
@@ -248,18 +261,18 @@ def test_final_brd_non_final_hld_awaits_hld_final(stub_ba_agent, stub_sa_agent, 
     assert s["awaiting"] == "hld_final"
 
 
-# --- I. final HLD -> complete, no regeneration -----------------
+# --- I. final HLD -> the run continues into the 8B-3 LLD hop; HLD not regenerated ---
 
-def test_final_hld_outside_graph_then_run_is_complete(stub_ba_agent, stub_sa_agent, stub_us_agent, sow_file, sample_metadata):
+def test_final_hld_outside_graph_then_run_reaches_lld_hop(stub_ba_agent, stub_sa_agent, stub_us_agent, sow_file, sample_metadata):
     ba, sa, us = _svcs(ba_agent=stub_ba_agent, sa_agent=stub_sa_agent, us_agent=stub_us_agent)
+    lld = _stub_lld(PID, ba, sa)
     _final_brd(ba, sow_file, sample_metadata)
-    _run(PID, ba, sa, us, sow_file, sample_metadata)          # HLD v1 + US v1
-    sa.choose_final_hld(1)                                    # OUTSIDE the graph
+    _run(PID, ba, sa, us, sow_file, sample_metadata, lld=lld)  # HLD v1 + US v1
+    sa.choose_final_hld(1)                                     # OUTSIDE the graph
 
-    s = _run(PID, ba, sa, us, sow_file, sample_metadata)
-    assert s["status"] == "complete"
-    assert s["awaiting"] is None
-    assert s["produced"] == {}
+    s = _run(PID, ba, sa, us, sow_file, sample_metadata, lld=lld)
+    assert s["produced"] == {"lld": 1}                        # LLD generated; HLD/US not regenerated
+    assert s["status"] == "awaiting_approval" and s["awaiting"] == "lld_final"
     assert len(stub_sa_agent.generate_calls) == 1
     assert len(stub_us_agent.generate_calls) == 1
 
@@ -370,6 +383,8 @@ def test_status_empty_project(stub_ba_agent, stub_sa_agent, stub_us_agent):
         "hld_exists": False, "hld_latest_version": None, "hld_final_version": None,
         "awaiting_hld_approval": False,
         "us_exists": False, "us_latest_version": None,
+        "lld_exists": False, "lld_latest_version": None, "lld_final_version": None,
+        "awaiting_lld_approval": False,
         "next_step": NEXT_GENERATE_BRD,
     }
 
@@ -404,7 +419,9 @@ def test_status_hld_final(stub_ba_agent, stub_sa_agent, stub_us_agent, sow_file,
     st = _status(PID, ba, sa, us)
     assert st["hld_final_version"] == 1
     assert st["awaiting_hld_approval"] is False
-    assert st["next_step"] is NEXT_NONE
+    assert st["lld_exists"] is False
+    # final HLD, no LLD yet -> the pipeline's next runnable step is the LLD hop
+    assert st["next_step"] == NEXT_GENERATE_LLD
 
 
 def test_status_brd_not_final_next_step(stub_ba_agent, stub_sa_agent, stub_us_agent, sow_file, sample_metadata):

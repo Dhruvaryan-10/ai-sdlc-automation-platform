@@ -22,6 +22,7 @@ from app.agents.business_analyst.service import (
     UnsupportedFileTypeError,
 )
 from app.agents.initial_user_story.service import InitialUserStoryService
+from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
 from app.orchestration.graph import (
     _gate_brd_node,
@@ -39,7 +40,13 @@ from app.orchestration.status import (
     sdlc_status,
 )
 from app.services.version_service import BRDVersion, VersionService
-from tests.conftest import STUB_BRD, StubBAAgent, StubSAAgent, StubUserStoryAgent
+from tests.conftest import (
+    STUB_BRD,
+    StubBAAgent,
+    StubLLDAgent,
+    StubSAAgent,
+    StubUserStoryAgent,
+)
 
 PID = "sdlc8b1"
 
@@ -83,6 +90,7 @@ def test_sdlc_state_fields():
         "project_id", "sow_path", "metadata", "request",
         "brd_latest_version", "brd_final_version",
         "hld_latest_version", "hld_final_version", "us_latest_version",  # 8B-2
+        "lld_latest_version", "lld_final_version",                       # 8B-3
         "produced", "status", "awaiting",
     }
 
@@ -90,12 +98,13 @@ def test_sdlc_state_fields():
 # --- 2. resolve_state (BRD pointers; 8B-2 adds hld_*/us_latest which are None here) ---
 
 def _resolve_node(svc):
-    """resolve_state bound with stub SA / US services (no Gemini)."""
-    return _make_resolve_state_node(
-        svc,
-        SolutionArchitectService(project_id=svc.project_id, ba_service=svc, agent=StubSAAgent()),
-        InitialUserStoryService(project_id=svc.project_id, ba_service=svc, agent=StubUserStoryAgent()),
+    """resolve_state bound with stub SA / US / LLD services (no Gemini)."""
+    sa = SolutionArchitectService(project_id=svc.project_id, ba_service=svc, agent=StubSAAgent())
+    us = InitialUserStoryService(project_id=svc.project_id, ba_service=svc, agent=StubUserStoryAgent())
+    lld = LowLevelDesignService(
+        project_id=svc.project_id, sa_service=sa, ba_service=svc, agent=StubLLDAgent()
     )
+    return _make_resolve_state_node(svc, sa, us, lld)
 
 
 def test_resolve_state_empty_project(stub_ba_agent):
@@ -104,6 +113,7 @@ def test_resolve_state_empty_project(stub_ba_agent):
     assert out == {
         "brd_latest_version": None, "brd_final_version": None,
         "hld_latest_version": None, "hld_final_version": None, "us_latest_version": None,
+        "lld_latest_version": None, "lld_final_version": None,
     }
 
 
@@ -347,6 +357,10 @@ def test_sdlc_status_empty_project(stub_ba_agent):
         "awaiting_hld_approval": False,
         "us_exists": False,
         "us_latest_version": None,
+        "lld_exists": False,
+        "lld_latest_version": None,
+        "lld_final_version": None,
+        "awaiting_lld_approval": False,
         "next_step": NEXT_GENERATE_BRD,
     }
 

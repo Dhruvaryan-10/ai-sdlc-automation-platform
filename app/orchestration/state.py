@@ -1,5 +1,5 @@
 """
-Shared LangGraph orchestration state for the full-SDLC graph (Phase 8B-1/8B-2).
+Shared LangGraph orchestration state for the full-SDLC graph (Phase 8B-1/8B-2/8B-3).
 
 `SDLCState` holds ONLY orchestration pointers/status. It deliberately does not
 carry `BRDVersion` objects, document content, or version histories — those stay
@@ -42,7 +42,11 @@ class SDLCState(TypedDict, total=False):
     # --- Initial User Story pointer (8B-2; soft downstream context — no approval gate) ---
     us_latest_version: int | None
 
+    # --- LLD pointers (8B-3; populated by `resolve_state` / `ensure_lld`) ---
+    lld_latest_version: int | None
+    lld_final_version: int | None
+
     # --- results of THIS invocation ---
-    produced: dict[str, int]        # {"brd": 1, "hld": 1, "us": 1} — artifacts created this run
+    produced: dict[str, int]        # {"brd": 1, "hld": 1, "us": 1, "lld": 1} — artifacts created this run
     status: str                     # "awaiting_approval" | "complete"
-    awaiting: str | None            # blocking gate id, e.g. "brd_final" / "hld_final", or None
+    awaiting: str | None            # blocking gate id, e.g. "brd_final" / "hld_final" / "lld_final", or None
