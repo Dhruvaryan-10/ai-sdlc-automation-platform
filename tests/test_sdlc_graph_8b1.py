@@ -21,6 +21,8 @@ from app.agents.business_analyst.service import (
     EmptyDocumentError,
     UnsupportedFileTypeError,
 )
+from app.agents.initial_user_story.service import InitialUserStoryService
+from app.agents.solution_architect.service import SolutionArchitectService
 from app.orchestration.graph import (
     _gate_brd_node,
     _make_ensure_brd_node,
@@ -33,11 +35,11 @@ from app.orchestration.state import SDLCState
 from app.orchestration.status import (
     NEXT_APPROVE_BRD,
     NEXT_GENERATE_BRD,
-    NEXT_NONE,
+    NEXT_GENERATE_HLD,
     sdlc_status,
 )
 from app.services.version_service import BRDVersion, VersionService
-from tests.conftest import STUB_BRD, StubBAAgent
+from tests.conftest import STUB_BRD, StubBAAgent, StubSAAgent, StubUserStoryAgent
 
 PID = "sdlc8b1"
 
@@ -48,25 +50,25 @@ def _ba(pid=PID, agent=None):
 
 # --- 1. graph topology --------------------------------------------------
 
-def test_graph_topology_is_the_8b1_skeleton():
+def test_graph_topology_brd_subpath_is_intact():
+    """The BRD hop (8B-1 invariant) must survive graph extensions.
+
+    Exact end-to-end topology is asserted in test_sdlc_graph_8b2.py; here we only
+    pin the BRD sub-path: START -> resolve_state -> ensure_brd -> gate_brd, with
+    gate_brd conditionally routing to END on awaiting_approval.
+    """
     compiled = build_sdlc_graph(_ba())
     g = compiled.get_graph()
 
-    assert set(g.nodes) == {"__start__", "resolve_state", "ensure_brd", "gate_brd", "__end__"}
-    assert {(e.source, e.target) for e in g.edges} == {
-        ("__start__", "resolve_state"),
-        ("resolve_state", "ensure_brd"),
-        ("ensure_brd", "gate_brd"),
-        ("gate_brd", "__end__"),
-    }
-    # the plain edges are unconditional; the gate edge is conditional
+    assert {"__start__", "resolve_state", "ensure_brd", "gate_brd", "__end__"} <= set(g.nodes)
     plain = {(e.source, e.target) for e in g.edges if not e.conditional}
-    assert plain == {
+    assert {
         ("__start__", "resolve_state"),
         ("resolve_state", "ensure_brd"),
         ("ensure_brd", "gate_brd"),
-    }
-    assert any(e.source == "gate_brd" and e.conditional for e in g.edges)
+    } <= plain
+    cond = {(e.source, e.target) for e in g.edges if e.conditional}
+    assert ("gate_brd", "__end__") in cond   # awaiting_approval -> END
     assert type(compiled).__name__ == "CompiledStateGraph"
 
 
@@ -80,38 +82,52 @@ def test_sdlc_state_fields():
     assert set(SDLCState.__annotations__) == {
         "project_id", "sow_path", "metadata", "request",
         "brd_latest_version", "brd_final_version",
+        "hld_latest_version", "hld_final_version", "us_latest_version",  # 8B-2
         "produced", "status", "awaiting",
     }
 
 
-# --- 2. resolve_state ---------------------------------------------------
+# --- 2. resolve_state (BRD pointers; 8B-2 adds hld_*/us_latest which are None here) ---
+
+def _resolve_node(svc):
+    """resolve_state bound with stub SA / US services (no Gemini)."""
+    return _make_resolve_state_node(
+        svc,
+        SolutionArchitectService(project_id=svc.project_id, ba_service=svc, agent=StubSAAgent()),
+        InitialUserStoryService(project_id=svc.project_id, ba_service=svc, agent=StubUserStoryAgent()),
+    )
+
 
 def test_resolve_state_empty_project(stub_ba_agent):
     svc = _ba(agent=stub_ba_agent)
-    out = _make_resolve_state_node(svc)({})
-    assert out == {"brd_latest_version": None, "brd_final_version": None}
+    out = _resolve_node(svc)({})
+    assert out == {
+        "brd_latest_version": None, "brd_final_version": None,
+        "hld_latest_version": None, "hld_final_version": None, "us_latest_version": None,
+    }
 
 
 def test_resolve_state_with_brd_but_no_final(stub_ba_agent, sow_file, sample_metadata):
     svc = _ba(agent=stub_ba_agent)
     svc.generate_initial_brd(sow_file, sample_metadata)          # v1, not final
-    out = _make_resolve_state_node(svc)({})
-    assert out == {"brd_latest_version": 1, "brd_final_version": None}
+    out = _resolve_node(svc)({})
+    assert out["brd_latest_version"] == 1 and out["brd_final_version"] is None
+    assert out["hld_latest_version"] is None and out["us_latest_version"] is None
 
 
 def test_resolve_state_with_final_brd(stub_ba_agent, sow_file, sample_metadata):
     svc = _ba(agent=stub_ba_agent)
     svc.generate_initial_brd(sow_file, sample_metadata)
     svc.choose_final_brd(1)
-    out = _make_resolve_state_node(svc)({})
-    assert out == {"brd_latest_version": 1, "brd_final_version": 1}
+    out = _resolve_node(svc)({})
+    assert out["brd_latest_version"] == 1 and out["brd_final_version"] == 1
 
 
 def test_resolve_state_is_read_only_and_repeatable(stub_ba_agent, sow_file, sample_metadata, isolated_output_dir):
     svc = _ba(agent=stub_ba_agent)
     svc.generate_initial_brd(sow_file, sample_metadata)
     before = (isolated_output_dir / PID / "versions.json").read_bytes()
-    node = _make_resolve_state_node(svc)
+    node = _resolve_node(svc)
     node({}); node({}); node({})
     assert (isolated_output_dir / PID / "versions.json").read_bytes() == before
 
@@ -179,14 +195,23 @@ def test_gate_brd_final_present_is_complete():
     }
 
 
-def test_run_step_end_state_awaiting_then_complete(stub_ba_agent, sow_file, sample_metadata):
+def test_run_step_gate_brd_stops_at_end_when_brd_not_final(stub_ba_agent, sow_file, sample_metadata):
+    """8B-1 BRD-gate invariant: with no final BRD the run stops at gate_brd -> END,
+    awaiting brd_final. (After a final BRD the run continues into the 8B-2 HLD hop;
+    that path is covered by test_sdlc_graph_8b2.py.)"""
     svc = _ba(agent=stub_ba_agent)
     s1 = run_step(PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata, ba_service=svc)
     assert s1["status"] == "awaiting_approval" and s1["awaiting"] == "brd_final"
 
     svc.choose_final_brd(1)  # human finalization, via the service — NOT the graph
-    s2 = run_step(PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata, ba_service=svc)
-    assert s2["status"] == "complete" and s2["awaiting"] is None
+    # BRD is final -> gate_brd routes onward; stub SA/US injected so no Gemini.
+    s2 = run_step(
+        PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata,
+        ba_service=svc,
+        sa_service=SolutionArchitectService(project_id=PID, ba_service=svc, agent=StubSAAgent()),
+        us_service=InitialUserStoryService(project_id=PID, ba_service=svc, agent=StubUserStoryAgent()),
+    )
+    assert s2["status"] == "awaiting_approval" and s2["awaiting"] == "hld_final"
 
 
 # --- 5. approval invariant ---------------------------------------
@@ -205,7 +230,7 @@ def test_graph_never_finalizes_on_generation(monkeypatch, stub_ba_agent, sow_fil
     assert calls == []  # the graph finalized nothing
 
 
-def test_graph_never_finalizes_even_when_final_already_exists(monkeypatch, stub_ba_agent, sow_file, sample_metadata):
+def test_graph_never_finalizes_even_when_final_brd_already_exists(monkeypatch, stub_ba_agent, sow_file, sample_metadata):
     svc = _ba(agent=stub_ba_agent)
     run_step(PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata, ba_service=svc)
     svc.choose_final_brd(1)  # test finalizes, before patching
@@ -214,9 +239,15 @@ def test_graph_never_finalizes_even_when_final_already_exists(monkeypatch, stub_
     monkeypatch.setattr(VersionService, "mark_final", lambda self, n: calls.append(("mark_final", n)))
     monkeypatch.setattr(VersionService, "unlock_final", lambda self: calls.append("unlock_final"))
 
-    s = run_step(PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata, ba_service=svc)
-    assert s["status"] == "complete"
-    assert calls == []
+    # BRD final -> the run continues into the 8B-2 HLD hop; stub SA/US -> no Gemini.
+    s = run_step(
+        PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata,
+        ba_service=svc,
+        sa_service=SolutionArchitectService(project_id=PID, ba_service=svc, agent=StubSAAgent()),
+        us_service=InitialUserStoryService(project_id=PID, ba_service=svc, agent=StubUserStoryAgent()),
+    )
+    assert s["status"] == "awaiting_approval" and s["awaiting"] == "hld_final"
+    assert calls == []  # the graph finalized nothing (BRD or HLD)
 
 
 # --- 6. parity: graph BRD generation == direct BusinessAnalystService ----
@@ -310,6 +341,12 @@ def test_sdlc_status_empty_project(stub_ba_agent):
         "brd_latest_version": None,
         "brd_final_version": None,
         "awaiting_brd_approval": False,
+        "hld_exists": False,
+        "hld_latest_version": None,
+        "hld_final_version": None,
+        "awaiting_hld_approval": False,
+        "us_exists": False,
+        "us_latest_version": None,
         "next_step": NEXT_GENERATE_BRD,
     }
 
@@ -332,7 +369,9 @@ def test_sdlc_status_brd_final(stub_ba_agent, sow_file, sample_metadata):
     st = sdlc_status(PID, ba_service=svc)
     assert st["brd_final_version"] == 1
     assert st["awaiting_brd_approval"] is False
-    assert st["next_step"] is NEXT_NONE
+    assert st["hld_exists"] is False
+    # BRD is final but no HLD yet -> the pipeline's next runnable step is the HLD hop
+    assert st["next_step"] == NEXT_GENERATE_HLD
 
 
 def test_sdlc_status_is_pure_no_writes(stub_ba_agent, sow_file, sample_metadata, isolated_output_dir):
