@@ -96,9 +96,19 @@ class TestCaseService:
 
     __test__ = False  # not a pytest test class despite the "Test" prefix
 
-    def __init__(self, project_id: str, agent: TestCaseAgent | None = None):
+    def __init__(
+        self,
+        project_id: str,
+        agent: TestCaseAgent | None = None,
+        *,
+        use_graph: bool = False,
+    ):
         self.project_id = project_id
         self._agent = agent or TestCaseAgent()
+        # Phase 8A pilot: when True, generate()/refine_with_ai() run the SAME
+        # steps through a small LangGraph workflow instead of inline. Default
+        # False keeps the historic execution path byte-for-byte unchanged.
+        self._use_graph = use_graph
         # Required source.
         self._brd = VersionService(project_id=project_id)
         # Optional context (read-only).
@@ -308,6 +318,11 @@ class TestCaseService:
         Optional HLD/LLD/User Stories are used when present and recorded in
         provenance; their absence never blocks generation.
         """
+        if self._use_graph:
+            from app.agents.test_case.graph import run_qa
+
+            return run_qa(self, mode="generate")
+
         self._guard_unlocked()
         brd = self._require_final_brd()
         hld, lld, us = self._gather_optional()
@@ -333,6 +348,11 @@ class TestCaseService:
 
     def refine_with_ai(self, user_feedback: str) -> BRDVersion:
         """Apply reviewer feedback to the latest test-case version. Creates a new version."""
+        if self._use_graph:
+            from app.agents.test_case.graph import run_qa
+
+            return run_qa(self, mode="refine", feedback=user_feedback)
+
         self._guard_unlocked()
         latest = self._tc.get_latest_version()
         if latest is None:
