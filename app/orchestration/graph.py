@@ -1,5 +1,5 @@
 """
-Full-SDLC LangGraph — Phase 8B-4.
+Full-SDLC LangGraph — Phase 8B-5.
 
     START
       -> resolve_state
@@ -36,6 +36,16 @@ Mirrors app/agents/test_case/graph.py: TypedDict state, thin delegator nodes
 bound via closures, exceptions propagate, `StateGraph` compiled per invocation.
 Nodes NEVER finalize anything (no choose_final* / mark_final / unlock_final).
 `VersionService` (JSON) remains the only persistence authority. No checkpointer.
+
+Phase 8B-5 adds `refine_user_stories_step()` — an EXPLICIT, human-requested User
+Story Refinement action. It is deliberately NOT wired into the compiled graph
+above (no new node, no conditional routing, no new `run_step(request=...)`
+value): `UserStoryRefinementService.refine()` is intentionally non-idempotent
+(each explicit call creates the next version, v1 -> v2 -> v3 -> ...), which is
+fundamentally incompatible with the `ensure_*` nodes' "generate exactly once,
+guarded by a *_latest_version check" pattern used everywhere else in this graph.
+Keeping it a plain function outside `build_sdlc_graph()` guarantees, by
+construction, that a normal `run_step()` invocation can never trigger it.
 """
 
 from __future__ import annotations
@@ -49,11 +59,13 @@ from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
 from app.agents.test_case.service import TestCaseService
+from app.agents.user_story_refinement.service import UserStoryRefinementService
 from app.orchestration.state import SDLCState
 from app.utils.logger import get_logger
 
-if TYPE_CHECKING:  # ProjectMetadata is only referenced in type hints / caller code
+if TYPE_CHECKING:  # referenced only in type hints / caller code
     from app.agents.business_analyst.agent import ProjectMetadata
+    from app.services.version_service import BRDVersion
 
 logger = get_logger(__name__)
 
@@ -413,3 +425,50 @@ def run_step(
         final_state.get("produced"),
     )
     return final_state
+
+
+# --- 8B-5: explicit, human-requested User Story Refinement action ----------
+#
+# NOT a graph node. NOT reachable from `run_step()` / `build_sdlc_graph()` under
+# any `request` value. A separate, plain orchestration-level entry point that
+# does nothing but delegate to the EXISTING `UserStoryRefinementService.refine()`
+# — the same method the Step 6 Streamlit UI already calls directly. See the
+# module docstring above for why this is intentionally NOT a graph node.
+
+
+def refine_user_stories_step(
+    project_id: str,
+    *,
+    us_service: "UserStoryRefinementService | None" = None,
+) -> "BRDVersion":
+    """Explicitly trigger one User Story Refinement pass. Returns the new version.
+
+    `us_service` is an optional injection point (mirrors the pattern used by
+    `run_step` / `build_sdlc_graph`); when omitted, a plain
+    `UserStoryRefinementService(project_id=project_id)` is constructed — this
+    service takes no other service as a constructor dependency.
+
+    This function contains NO refinement business logic of its own: it does not
+    check prerequisites, compute version numbers, stamp source/provenance, derive
+    metadata, touch persistence, or check/change lock state. All of that remains
+    entirely owned by `UserStoryRefinementService.refine()`; any exception it
+    raises (`NoFinalBRDError`, `NoInitialUserStoriesError`,
+    `RefinementLockedError`, or an agent error) propagates unchanged.
+
+    Deliberately NOT idempotent: `UserStoryRefinementService.refine()` is itself
+    non-idempotent by design (repeated calls intentionally create v2, v3, v4,
+    ...), so — unlike every `ensure_*` node in this module — this function MUST
+    NOT guard on `us_latest_version` or any other "already exists" check.
+
+    NEVER finalizes: calls `refine()` only. Never `choose_final_stories()`,
+    `mark_final()`, or `unlock_final_stories()` — finalization stays a human
+    action via the existing Step 4 UI / `InitialUserStoryService`, unchanged.
+    """
+    service = us_service or UserStoryRefinementService(project_id=project_id)
+    logger.info("SDLC 8B-5: refine_user_stories_step project=%s", project_id)
+    version = service.refine()
+    logger.info(
+        "SDLC 8B-5: refine_user_stories_step project=%s produced v%d",
+        project_id, version.version,
+    )
+    return version
