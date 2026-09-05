@@ -72,6 +72,8 @@ from app.agents.test_case.service import (
 from app.agents.test_case.service import (
     NoFinalBRDError as NoFinalBRDErrorForQA,
 )
+from app.orchestration.graph import run_step
+from app.orchestration.status import sdlc_status
 from app.document_generator.brd_generator import (
     generate_brd_docx,
     generate_hld_docx,
@@ -246,6 +248,106 @@ def friendly_error(exc: Exception) -> str:
     if isinstance(exc, OSError):
         return "A file system error occurred while saving. Please try again."
     return "Something went wrong while processing that request. Please try again."
+
+
+# --- Phase 8B-6: pure SDLC Pipeline panel formatting helpers -----------------------
+#
+# These convert an `app.orchestration.status.sdlc_status()` dict into display text
+# ONLY - no `st.*` calls, no side effects, nothing invented beyond the dict's own
+# fields (User Stories intentionally has no final-version concept: sdlc_status()
+# does not expose one, because no approval gate is modeled for user stories).
+
+_NEXT_STEP_LABELS = {
+    "generate_brd": "Next: Generate the BRD",
+    "approve_brd": "Next: Review and approve the BRD in Step 2",
+    "generate_hld": "Next: Generate the HLD",
+    "approve_hld": "Next: Review and approve the HLD in Step 3",
+    "generate_lld": "Next: Generate the LLD",
+    "approve_lld": "Next: Review and approve the LLD in Step 5",
+    "generate_test_cases": "Next: Generate Test Cases in Step 7",
+    "approve_test_cases": "Next: Review and approve Test Cases in Step 7",
+    None: "SDLC pipeline complete — no further orchestrated action is required.",
+}
+
+_AWAITING_APPROVAL_MESSAGES = {
+    "approve_brd": "Waiting for BRD approval — review and choose the final BRD in Step 2.",
+    "approve_hld": "Waiting for HLD approval — review and choose the final HLD in Step 3.",
+    "approve_lld": "Waiting for LLD approval — review and choose the final LLD in Step 5.",
+    "approve_test_cases": (
+        "Waiting for Test Case approval — review and choose the final Test Cases in Step 7."
+    ),
+}
+
+
+def _next_step_label(status: dict) -> str:
+    """Pure: `sdlc_status()["next_step"]` -> a short human sentence.
+
+    Only the currently known `next_step` values are supported (generate_brd /
+    approve_brd / generate_hld / approve_hld / generate_lld / approve_lld /
+    generate_test_cases / approve_test_cases / None); an unrecognized value falls
+    back to a neutral message rather than raising.
+    """
+    next_step = status.get("next_step")
+    if next_step in _NEXT_STEP_LABELS:
+        return _NEXT_STEP_LABELS[next_step]
+    return "Status unavailable."
+
+
+def _awaiting_approval_message(status: dict) -> str | None:
+    """Pure: the approval-gate warning text for the current `next_step`, or None
+    when no artifact is currently awaiting approval."""
+    return _AWAITING_APPROVAL_MESSAGES.get(status.get("next_step"))
+
+
+def _pipeline_summary(status: dict) -> list[str]:
+    """Pure: one compact status line per artifact, using ONLY sdlc_status()'s
+    own fields - never internal dict syntax, never an invented field."""
+
+    def _line(label: str, exists: bool, latest, final=None, awaiting=None, *, has_gate: bool = True):
+        if not exists:
+            return f"{label}: not generated"
+        text = f"{label}: v{latest}"
+        if has_gate:
+            if final is not None:
+                text += f" (final: v{final})"
+            elif awaiting:
+                text += " (awaiting approval)"
+            else:
+                text += " (draft)"
+        return text
+
+    return [
+        _line("BRD", status["brd_exists"], status["brd_latest_version"],
+              status["brd_final_version"], status["awaiting_brd_approval"]),
+        _line("HLD", status["hld_exists"], status["hld_latest_version"],
+              status["hld_final_version"], status["awaiting_hld_approval"]),
+        _line("User Stories", status["us_exists"], status["us_latest_version"],
+              has_gate=False),
+        _line("LLD", status["lld_exists"], status["lld_latest_version"],
+              status["lld_final_version"], status["awaiting_lld_approval"]),
+        _line("Test Cases", status["tc_exists"], status["tc_latest_version"],
+              status["tc_final_version"], status["awaiting_test_cases_approval"]),
+    ]
+
+
+def run_pipeline_step(project_id: str, ba_service, sa_service, us_service, lld_service, tc_service):
+    """Thin, testable wrapper around `run_step()` for the pipeline panel's button.
+
+    Exists ONLY so tests can monkeypatch/spy on `run_step` without importing and
+    executing the whole Streamlit script's button-click branch. Contains no
+    business logic of its own - `run_step` remains the single source of truth,
+    unmodified. Never called except from the explicit "Run SDLC Pipeline" button
+    handler below (never on import, page load, or a plain rerun).
+    """
+    return run_step(
+        project_id,
+        request="ensure_brd",
+        ba_service=ba_service,
+        sa_service=sa_service,
+        us_service=us_service,
+        lld_service=lld_service,
+        tc_service=tc_service,
+    )
 
 
 # --- session bootstrapping --------------------------------------------------------
@@ -599,6 +701,80 @@ with st.sidebar:
 
 st.title("Business Analyst Agent - SOW to BRD")
 st.caption("Phase 1: Statement of Work to Business Requirement Document")
+
+# --- SDLC Pipeline panel (Phase 8B-6) -----------------------------------------------
+#
+# Additive orchestration status/action layer over the seven tabs below. Reads
+# sdlc_status() fresh on every render as its single source of truth; the "Run SDLC
+# Pipeline" button is the ONLY place run_step() is called, and only in direct
+# response to that explicit click - never on import, page load, project switch, or
+# a plain rerun. Reuses the SAME session-cached service instances the seven tabs
+# already use. Never calls choose_final_* / mark_final / unlock_final* - finalization
+# stays exclusively in each artifact's own tab below.
+with st.container():
+    st.subheader("SDLC Pipeline")
+    st.caption(
+        "This runs the existing orchestration pipeline from the current project "
+        "state and stops at the next required human approval. It may generate "
+        "multiple draft artifacts in one run."
+    )
+
+    try:
+        pipeline_status = sdlc_status(
+            st.session_state.project_id,
+            ba_service=service,
+            sa_service=sa_service,
+            us_service=us_service,
+            lld_service=lld_service,
+            tc_service=qa_service,
+        )
+    except Exception as exc:
+        pipeline_status = None
+        st.error(friendly_error(exc))
+
+    if pipeline_status is not None:
+        summary_cols = st.columns(5)
+        for col, line in zip(summary_cols, _pipeline_summary(pipeline_status)):
+            col.caption(line)
+
+        st.write(f"**{_next_step_label(pipeline_status)}**")
+
+        awaiting_message = _awaiting_approval_message(pipeline_status)
+        if awaiting_message:
+            st.warning(awaiting_message)
+
+        pipeline_ready = latest_version is not None
+        if not pipeline_ready:
+            st.info(
+                "Upload a SOW and generate the initial BRD in Step 1 first. Once "
+                "a BRD exists, use this panel to continue the pipeline through "
+                "the remaining steps."
+            )
+
+        if st.button(
+            "Run SDLC Pipeline", type="primary",
+            disabled=not pipeline_ready, key="pipeline_run_btn",
+        ):
+            with st.spinner("Running the SDLC orchestration pipeline..."):
+                try:
+                    run_pipeline_step(
+                        st.session_state.project_id,
+                        service, sa_service, us_service, lld_service, qa_service,
+                    )
+                    refresh_versions()
+                    refresh_hld_versions()
+                    refresh_us_versions()
+                    refresh_lld_versions()
+                    refresh_qa_versions()
+                    st.success(
+                        "SDLC orchestration completed. The pipeline stopped at "
+                        "the next required human action."
+                    )
+                    st.rerun()
+                except Exception as exc:
+                    st.error(friendly_error(exc))
+
+st.divider()
 
 (tab_generate, tab_workspace, tab_hld, tab_stories,
  tab_lld, tab_usr, tab_qa) = st.tabs(
