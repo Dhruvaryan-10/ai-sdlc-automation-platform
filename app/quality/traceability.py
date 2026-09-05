@@ -34,7 +34,7 @@ HARD RULES (do not violate when extending this module):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -108,6 +108,36 @@ class TestCaseRecord:
     user_story_reference: str | None
     hld_reference: str | None
     lld_reference: str | None
+
+
+@dataclass(frozen=True)
+class TraceabilityMatrixRow:
+    """One BRD requirement's end-to-end trace, Phase 9A-2.
+
+    `test_case_ids` is the stable-order, deduplicated UNION of
+    `test_case_ids_direct` (a test case citing this requirement directly via
+    `brd_reference`/`requirement_or_story_ref`) and `test_case_ids_via_story`
+    (a test case reached only through one of this requirement's user stories,
+    via `user_story_reference`). Phase 9A's own `requirement_to_test_cases()`
+    only ever captures the direct set - real persisted project data shows a
+    meaningful fraction of requirements (in one inspected project, 8 of 35)
+    have test coverage that is ONLY visible through the story-mediated path,
+    so a matrix row that only looked at the direct set would under-report
+    real coverage. HLD/LLD are deliberately absent: no artifact persists a
+    requirement-level HLD/LLD mapping (see the Phase 9/9A-2 reconnaissance
+    reports), so none is fabricated here.
+    """
+
+    requirement_id: str
+    requirement_kind: str          # "FR" | "NFR" | "BR"
+    requirement_title: str | None
+    user_story_ids: list[str]
+    test_case_ids: list[str]
+    test_case_ids_direct: list[str]
+    test_case_ids_via_story: list[str]
+    has_user_stories: bool
+    has_test_cases: bool
+    is_covered: bool                # has_user_stories and has_test_cases - objective, not a score
 
 
 # --- 1. pure extraction functions ---------------------------------------
@@ -268,6 +298,147 @@ def _coverage(mapping: dict[str, list[str]]) -> dict:
     }
 
 
+# --- 2b. Phase 9A-2: one matrix row per requirement, uniting the direct and
+#         story-mediated test-case paths ------------------------------------
+
+def build_traceability_matrix(
+    requirements: list[Requirement],
+    stories: list[UserStoryRecord],
+    test_cases: list[TestCaseRecord],
+) -> list[TraceabilityMatrixRow]:
+    """Exactly one `TraceabilityMatrixRow` per requirement, in requirement order.
+
+    Reuses `requirement_to_stories()` / `requirement_to_test_cases()` /
+    `story_to_test_cases()` as-is - no parsing or matching logic is
+    duplicated. `test_case_ids` is the stable-order deduplicated union of the
+    direct set (from `requirement_to_test_cases()`) and the story-mediated set
+    (this requirement's stories, per `requirement_to_stories()`, followed
+    through `story_to_test_cases()`), direct ids first. HLD/LLD are never
+    consulted or fabricated here - the matrix is authoritative only for
+    BRD -> User Stories -> Test Cases.
+    """
+    req_to_story_ids = requirement_to_stories(requirements, stories)
+    req_to_tc_direct = requirement_to_test_cases(requirements, test_cases)
+    story_to_tc_ids = story_to_test_cases(stories, test_cases)
+
+    rows: list[TraceabilityMatrixRow] = []
+    for req in requirements:
+        story_ids = req_to_story_ids.get(req.id, [])
+        direct = req_to_tc_direct.get(req.id, [])
+
+        via_story: list[str] = []
+        for story_id in story_ids:
+            for tc_id in story_to_tc_ids.get(story_id, []):
+                if tc_id not in via_story:
+                    via_story.append(tc_id)
+
+        union: list[str] = []
+        for tc_id in direct + via_story:
+            if tc_id not in union:
+                union.append(tc_id)
+
+        has_stories = bool(story_ids)
+        has_tests = bool(union)
+        rows.append(TraceabilityMatrixRow(
+            requirement_id=req.id,
+            requirement_kind=req.kind,
+            requirement_title=req.title,
+            user_story_ids=story_ids,
+            test_case_ids=union,
+            test_case_ids_direct=direct,
+            test_case_ids_via_story=via_story,
+            has_user_stories=has_stories,
+            has_test_cases=has_tests,
+            is_covered=has_stories and has_tests,
+        ))
+    return rows
+
+
+# The three requirement kinds this codebase's prompts/extractors ever
+# produce (see `extract_brd_requirements`) - always present in `by_kind`,
+# even with zero requirements of that kind, per the Phase 9A-2 contract.
+_KNOWN_REQUIREMENT_KINDS = ("FR", "NFR", "BR")
+
+
+def _matrix_coverage(rows: list[TraceabilityMatrixRow]) -> dict:
+    total = len(rows)
+    covered = sum(1 for r in rows if r.is_covered)
+    uncovered_ids = [r.requirement_id for r in rows if not r.is_covered]
+    return {
+        "total": total,
+        "covered": covered,
+        "coverage_pct": round((covered / total) * 100, 1) if total else 0.0,
+        "uncovered_ids": uncovered_ids,
+    }
+
+
+def summarize_traceability_matrix(rows: list[TraceabilityMatrixRow]) -> dict:
+    """Aggregate + per-kind coverage over `rows`. Purely descriptive: each
+    number is a direct count/percentage over objectively-measured `is_covered`
+    flags - no weighting, no composite quality score.
+
+    `by_kind` always includes "FR" / "NFR" / "BR" (with zeroed-out coverage
+    for a kind absent from `rows`), because real persisted project data shows
+    NFR story-coverage is structurally different from FR/BR (in one inspected
+    project, 0% vs. ~90-100%) - blending them into one aggregate number would
+    mask that distinction rather than reveal it. Any kind this codebase's
+    extractors don't currently produce would still be included, in
+    first-seen order, after the three known kinds.
+    """
+    summary = _matrix_coverage(rows)
+
+    seen_kinds: list[str] = []
+    for r in rows:
+        if r.requirement_kind not in seen_kinds:
+            seen_kinds.append(r.requirement_kind)
+    ordered_kinds = list(_KNOWN_REQUIREMENT_KINDS) + [
+        k for k in seen_kinds if k not in _KNOWN_REQUIREMENT_KINDS
+    ]
+
+    summary["by_kind"] = {
+        kind: _matrix_coverage([r for r in rows if r.requirement_kind == kind])
+        for kind in ordered_kinds
+    }
+    return summary
+
+
+def find_orphan_references(
+    requirements: list[Requirement],
+    stories: list[UserStoryRecord],
+    test_cases: list[TestCaseRecord],
+) -> list[dict]:
+    """Diagnostic only: references that LOOK like a BRD requirement id but do
+    not match any id `extract_brd_requirements()` actually found.
+
+    Checks `UserStoryRecord.brd_references`, `TestCaseRecord.brd_reference`,
+    and `TestCaseRecord.requirement_or_story_ref` (only when that value is
+    itself shaped like a requirement id - e.g. "FR-3" - and NOT a user-story
+    id like "US-002", which `requirement_or_story_ref` may equally hold).
+    Never changes any coverage/mapping computation and never attempts to
+    repair or normalize the orphan value - purely reporting a broken link so
+    a human can see it.
+    """
+    known_ids = {r.id for r in requirements}
+    orphans: list[dict] = []
+
+    for story in stories:
+        for ref in story.brd_references:
+            if ref not in known_ids:
+                orphans.append({"source_id": story.id, "field": "brd_references", "value": ref})
+
+    for tc in test_cases:
+        if tc.brd_reference and tc.brd_reference not in known_ids:
+            orphans.append({"source_id": tc.id, "field": "brd_reference", "value": tc.brd_reference})
+
+        ref = tc.requirement_or_story_ref
+        if ref and _REQ_ID_RE.fullmatch(ref.strip()) and ref.strip() not in known_ids:
+            orphans.append({
+                "source_id": tc.id, "field": "requirement_or_story_ref", "value": ref.strip(),
+            })
+
+    return orphans
+
+
 # --- 3. improved reference grounding (reporting-only; does not touch
 #        TestCaseService._reference_is_grounded) -----------------------
 
@@ -412,6 +583,10 @@ def build_project_traceability_report(
     story_to_tc = story_to_test_cases(stories, test_cases)
     req_to_tc = requirement_to_test_cases(requirements, test_cases)
 
+    matrix_rows = build_traceability_matrix(requirements, stories, test_cases)
+    matrix_summary = summarize_traceability_matrix(matrix_rows)
+    orphan_references = find_orphan_references(requirements, stories, test_cases)
+
     texts_by_artifact = {
         "brd": brd_text, "user_stories": us_text, "hld": hld_text, "lld": lld_text,
     }
@@ -459,4 +634,12 @@ def build_project_traceability_report(
         "story_to_test_coverage": _coverage(story_to_tc),
         "reference_field_population": reference_field_population,
         "ungrounded_references": ungrounded_references,
+        # --- Phase 9A-2: additive only - every key above is unchanged ---
+        # Rows are converted to plain dicts (via `dataclasses.asdict`), matching
+        # this report's existing convention (`requirement_ids`/`user_story_ids`
+        # are already plain dicts, not raw dataclasses) and keeping the whole
+        # report JSON-serializable, exactly like every other key here.
+        "traceability_matrix": [asdict(row) for row in matrix_rows],
+        "traceability_matrix_summary": matrix_summary,
+        "orphan_references": orphan_references,
     }

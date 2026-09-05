@@ -1,12 +1,14 @@
 """
-Phase 9A — Traceability & Quality Report (backend only).
+Phase 9A / 9A-2 — Traceability & Quality Report + Traceability Matrix (backend only).
 
 Deterministic tests only: pure-function unit tests on hand-built Markdown
 fixtures (covering flat/grouped-decimal FR ids, missing optional fields, and
-more than one heading-dash style), plus an end-to-end test of
-`build_project_traceability_report` using the REAL BA/SA/US/LLD/QA services
-wired to the existing stub agents from `tests/conftest.py` (same convention
-every other test file in this repo already uses). No Gemini calls anywhere.
+more than one heading-dash style), pure-function unit tests on hand-built
+dataclass fixtures for the 9A-2 matrix/summary/orphan functions, plus an
+end-to-end test of `build_project_traceability_report` using the REAL
+BA/SA/US/LLD/QA services wired to the existing stub agents from
+`tests/conftest.py` (same convention every other test file in this repo
+already uses). No Gemini calls anywhere.
 """
 
 import json
@@ -21,15 +23,19 @@ from app.agents.test_case.service import TestCaseService
 from app.quality.traceability import (
     Requirement,
     TestCaseRecord,
+    TraceabilityMatrixRow,
     UserStoryRecord,
     build_project_traceability_report,
+    build_traceability_matrix,
     extract_brd_requirements,
     extract_test_cases,
     extract_user_stories,
+    find_orphan_references,
     is_reference_grounded,
     requirement_to_stories,
     requirement_to_test_cases,
     story_to_test_cases,
+    summarize_traceability_matrix,
 )
 from tests.conftest import (
     STUB_BRD,
@@ -242,6 +248,172 @@ def test_missing_mappings_show_up_as_uncovered():
     assert uncovered == ["FR-2"]
 
 
+# --- 9A-2: build_traceability_matrix() ---------------------------------------
+
+# A. story-mediated test coverage: the TC has a user_story_reference but no
+# direct BRD reference of its own - this is the exact real-world gap the
+# Phase 9A-2 reconnaissance found (8/35 requirements in a real project were
+# only covered via this path, invisible to requirement_to_test_cases() alone).
+def test_matrix_row_captures_story_mediated_coverage_with_no_direct_reference():
+    reqs = [Requirement(id="BR-1", kind="BR", title="Inventory")]
+    stories = [UserStoryRecord(id="US-001", title=None, brd_references=["BR-1"])]
+    cases = [TestCaseRecord("TC-001", None, None, "US-001", None, None)]  # no brd_reference
+
+    rows = build_traceability_matrix(reqs, stories, cases)
+    assert rows == [TraceabilityMatrixRow(
+        requirement_id="BR-1", requirement_kind="BR", requirement_title="Inventory",
+        user_story_ids=["US-001"],
+        test_case_ids=["TC-001"],
+        test_case_ids_direct=[],
+        test_case_ids_via_story=["TC-001"],
+        has_user_stories=True, has_test_cases=True, is_covered=True,
+    )]
+
+
+# B. the same TC is reachable via BOTH the direct path and the story-mediated
+# path - the union must contain it exactly once, direct-first ordering.
+def test_matrix_row_deduplicates_a_tc_reachable_via_both_paths():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    stories = [UserStoryRecord(id="US-001", title=None, brd_references=["FR-1"])]
+    cases = [TestCaseRecord("TC-001", None, "FR-1", "US-001", None, None)]  # both fields set
+
+    row = build_traceability_matrix(reqs, stories, cases)[0]
+    assert row.test_case_ids_direct == ["TC-001"]
+    assert row.test_case_ids_via_story == ["TC-001"]
+    assert row.test_case_ids == ["TC-001"]  # deduplicated, not ["TC-001", "TC-001"]
+
+
+# C. requirement has a story but that story has no test case at all.
+def test_matrix_row_story_without_any_test_case_is_not_covered():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    stories = [UserStoryRecord(id="US-001", title=None, brd_references=["FR-1"])]
+    row = build_traceability_matrix(reqs, stories, test_cases=[])[0]
+    assert row.has_user_stories is True
+    assert row.has_test_cases is False
+    assert row.is_covered is False
+
+
+# D. requirement has neither a story nor a test case.
+def test_matrix_row_with_neither_story_nor_test_case():
+    reqs = [Requirement(id="NFR-1", kind="NFR")]
+    row = build_traceability_matrix(reqs, stories=[], test_cases=[])[0]
+    assert row.has_user_stories is False
+    assert row.has_test_cases is False
+    assert row.is_covered is False
+
+
+# E. multiple stories, multiple test cases, some overlapping - correct union
+# and stable (first-seen) ordering throughout.
+def test_matrix_row_multiple_stories_and_test_cases_stable_union_order():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    stories = [
+        UserStoryRecord(id="US-001", title=None, brd_references=["FR-1"]),
+        UserStoryRecord(id="US-002", title=None, brd_references=["FR-1"]),
+    ]
+    cases = [
+        TestCaseRecord("TC-001", None, "FR-1", None, None, None),        # direct
+        TestCaseRecord("TC-002", None, None, "US-001", None, None),      # via US-001
+        TestCaseRecord("TC-003", None, None, "US-002", None, None),      # via US-002
+    ]
+    row = build_traceability_matrix(reqs, stories, cases)[0]
+    assert row.user_story_ids == ["US-001", "US-002"]
+    assert row.test_case_ids_direct == ["TC-001"]
+    assert row.test_case_ids_via_story == ["TC-002", "TC-003"]
+    assert row.test_case_ids == ["TC-001", "TC-002", "TC-003"]
+    assert row.is_covered is True
+
+
+def test_matrix_preserves_requirement_order_and_one_row_per_requirement():
+    reqs = [Requirement(id="FR-2", kind="FR"), Requirement(id="FR-1", kind="FR")]  # deliberately out of numeric order
+    rows = build_traceability_matrix(reqs, stories=[], test_cases=[])
+    assert [r.requirement_id for r in rows] == ["FR-2", "FR-1"]  # input order preserved, not sorted
+
+
+# --- 9A-2: summarize_traceability_matrix() -----------------------------------
+
+def test_summary_aggregate_and_uncovered_ids():
+    rows = [
+        TraceabilityMatrixRow("FR-1", "FR", None, ["US-001"], ["TC-001"], ["TC-001"], [], True, True, True),
+        TraceabilityMatrixRow("FR-2", "FR", None, [], [], [], [], False, False, False),
+    ]
+    summary = summarize_traceability_matrix(rows)
+    assert summary["total"] == 2
+    assert summary["covered"] == 1
+    assert summary["coverage_pct"] == 50.0
+    assert summary["uncovered_ids"] == ["FR-2"]
+
+
+def test_summary_by_kind_breakdown_always_includes_fr_nfr_br():
+    rows = [
+        TraceabilityMatrixRow("FR-1", "FR", None, ["US-001"], ["TC-001"], ["TC-001"], [], True, True, True),
+        TraceabilityMatrixRow("NFR-1", "NFR", None, [], [], [], [], False, False, False),
+    ]
+    summary = summarize_traceability_matrix(rows)
+    assert summary["by_kind"]["FR"] == {"total": 1, "covered": 1, "coverage_pct": 100.0, "uncovered_ids": []}
+    assert summary["by_kind"]["NFR"] == {"total": 1, "covered": 0, "coverage_pct": 0.0, "uncovered_ids": ["NFR-1"]}
+    # BR present (zeroed) even though no BR requirement exists in `rows` at all.
+    assert summary["by_kind"]["BR"] == {"total": 0, "covered": 0, "coverage_pct": 0.0, "uncovered_ids": []}
+    assert list(summary["by_kind"].keys()) == ["FR", "NFR", "BR"]
+
+
+def test_summary_zero_total_case():
+    summary = summarize_traceability_matrix([])
+    assert summary["total"] == 0
+    assert summary["covered"] == 0
+    assert summary["coverage_pct"] == 0.0
+    assert summary["uncovered_ids"] == []
+    assert summary["by_kind"]["FR"]["coverage_pct"] == 0.0
+
+
+# --- 9A-2: find_orphan_references() ------------------------------------------
+
+# G. a User Story cites a BRD requirement id that does not exist.
+def test_orphan_reference_from_user_story_is_detected():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    stories = [UserStoryRecord(id="US-001", title=None, brd_references=["FR-99"])]
+    orphans = find_orphan_references(reqs, stories, test_cases=[])
+    assert orphans == [{"source_id": "US-001", "field": "brd_references", "value": "FR-99"}]
+
+
+def test_orphan_reference_from_test_case_brd_reference_is_detected():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    cases = [TestCaseRecord("TC-001", None, "FR-99", None, None, None)]
+    orphans = find_orphan_references(reqs, stories=[], test_cases=cases)
+    assert orphans == [{"source_id": "TC-001", "field": "brd_reference", "value": "FR-99"}]
+
+
+# H. every reference is valid -> empty list.
+def test_no_orphan_references_when_everything_is_valid():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    stories = [UserStoryRecord(id="US-001", title=None, brd_references=["FR-1"])]
+    cases = [TestCaseRecord("TC-001", "FR-1", "FR-1", "US-001", None, None)]
+    assert find_orphan_references(reqs, stories, cases) == []
+
+
+# I. requirement_or_story_ref distinguishes a US reference (never checked as
+# an orphan BRD reference) from a genuine, BRD-requirement-shaped reference.
+def test_orphan_check_distinguishes_us_reference_from_brd_reference_in_requirement_or_story_ref():
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    cases = [
+        TestCaseRecord("TC-001", "US-002", None, None, None, None),   # a US id - not a BRD reference at all
+        TestCaseRecord("TC-002", "FR-99", None, None, None, None),    # a BRD-shaped, nonexistent reference
+        TestCaseRecord("TC-003", "FR-1", None, None, None, None),     # a BRD-shaped, VALID reference
+    ]
+    orphans = find_orphan_references(reqs, stories=[], test_cases=cases)
+    assert orphans == [{"source_id": "TC-002", "field": "requirement_or_story_ref", "value": "FR-99"}]
+
+
+def test_orphan_detection_does_not_alter_mapping_or_coverage():
+    """Orphan detection is diagnostic only - it must not change the mapping/
+    coverage functions' own output."""
+    reqs = [Requirement(id="FR-1", kind="FR")]
+    stories = [UserStoryRecord(id="US-001", title=None, brd_references=["FR-1", "FR-99"])]
+    before = requirement_to_stories(reqs, stories)
+    find_orphan_references(reqs, stories, test_cases=[])  # merely calling it...
+    after = requirement_to_stories(reqs, stories)
+    assert before == after == {"FR-1": ["US-001"]}  # FR-99 silently ignored here, exactly as before
+
+
 # --- 3. improved reference grounding -----------------------------------------
 
 _LLD_SNIPPET = "## 8. Validation Rules\nAll inputs are validated server-side.\n"
@@ -333,6 +505,30 @@ def test_build_project_traceability_report_full_pipeline(sow_file, sample_metada
     assert pop["user_story_reference"] == {"populated": 2, "total": 2}
     assert pop["hld_reference"] == {"populated": 0, "total": 2}   # STUB_TEST_CASES leaves these None
     assert pop["lld_reference"] == {"populated": 0, "total": 2}
+
+    # --- 9A-2 additions: matrix / summary / orphans (mechanical additions to
+    # this existing test - every assertion above is unchanged) -------------
+    assert report["traceability_matrix"] == [{
+        "requirement_id": "FR-1",
+        "requirement_kind": "FR",
+        "requirement_title": None,
+        "user_story_ids": ["US-001"],
+        "test_case_ids": ["TC-001", "TC-002"],
+        "test_case_ids_direct": ["TC-001", "TC-002"],
+        "test_case_ids_via_story": ["TC-001", "TC-002"],
+        "has_user_stories": True,
+        "has_test_cases": True,
+        "is_covered": True,
+    }]
+    assert report["traceability_matrix_summary"] == {
+        "total": 1, "covered": 1, "coverage_pct": 100.0, "uncovered_ids": [],
+        "by_kind": {
+            "FR": {"total": 1, "covered": 1, "coverage_pct": 100.0, "uncovered_ids": []},
+            "NFR": {"total": 0, "covered": 0, "coverage_pct": 0.0, "uncovered_ids": []},
+            "BR": {"total": 0, "covered": 0, "coverage_pct": 0.0, "uncovered_ids": []},
+        },
+    }
+    assert report["orphan_references"] == []  # every reference in the stub data is valid
 
     assert report["ungrounded_references"] == []  # every populated ref in the stub data is grounded
 
