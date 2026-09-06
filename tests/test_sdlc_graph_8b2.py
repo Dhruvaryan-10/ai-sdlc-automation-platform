@@ -1,7 +1,9 @@
 """
-Phase 8B-2 — HLD + Initial User Stories fan-out (sequential) + HLD approval gate.
+Phase 8B-2 — HLD + Initial User Stories + HLD approval gate.
+Phase 11B — HLD and Initial User Stories now fan out CONCURRENTLY from gate_brd
+and fan back in at gate_hld (no explicit join node).
 
-    gate_brd(complete) -> ensure_hld -> ensure_user_stories -> gate_hld -> END
+    gate_brd(complete) -> [ ensure_hld , ensure_user_stories ] -> gate_hld -> END
 
 Proves the orchestration graph delegates HLD generation to the EXISTING
 SolutionArchitectService and user-story generation to the EXISTING
@@ -102,13 +104,17 @@ def test_topology_hld_subpath_is_intact(stub_ba_agent):
         ("__start__", "resolve_state"),
         ("resolve_state", "ensure_brd"),
         ("ensure_brd", "gate_brd"),
-        ("ensure_hld", "ensure_user_stories"),
+        # Phase 11B: both branches fan in to gate_hld (the old sequential
+        # ("ensure_hld", "ensure_user_stories") edge is gone).
+        ("ensure_hld", "gate_hld"),
         ("ensure_user_stories", "gate_hld"),
     } <= plain
+    assert ("ensure_hld", "ensure_user_stories") not in plain
     cond = {(e.source, e.target) for e in g.edges if e.conditional}
-    assert ("gate_brd", "__end__") in cond          # awaiting_approval
-    assert ("gate_brd", "ensure_hld") in cond        # complete -> HLD hop
-    assert ("gate_hld", "__end__") in cond           # HLD awaiting_approval -> END
+    assert ("gate_brd", "__end__") in cond               # awaiting_approval
+    assert ("gate_brd", "ensure_hld") in cond            # complete -> HLD branch
+    assert ("gate_brd", "ensure_user_stories") in cond   # complete -> US branch (fan-out)
+    assert ("gate_hld", "__end__") in cond               # HLD awaiting_approval -> END
 
 
 def test_route_after_gate_hld_maps_both_outcomes():
@@ -335,7 +341,7 @@ def test_graph_user_stories_match_direct_service(stub_ba_agent, stub_sa_agent, s
 
 # --- K. failure propagation --------------------------------
 
-def test_hld_agent_failure_propagates_and_us_does_not_run(stub_ba_agent, stub_us_agent, sow_file, sample_metadata):
+def test_hld_agent_failure_propagates(stub_ba_agent, stub_us_agent, sow_file, sample_metadata):
     class _BoomSA:
         def generate_hld(self, brd_text, metadata):
             raise SolutionArchitectAgentError("HLD Gemini exploded")
@@ -347,9 +353,12 @@ def test_hld_agent_failure_propagates_and_us_does_not_run(stub_ba_agent, stub_us
     with pytest.raises(SolutionArchitectAgentError):
         _run(PID, ba, sa, us, sow_file, sample_metadata)
 
+    # HLD failed -> nothing persisted for HLD. Phase 11B: `ensure_user_stories`
+    # runs CONCURRENTLY, so it MAY have persisted its v1 before the HLD error
+    # surfaced — that is not asserted here (it is timing-dependent). The
+    # recoverable-partial-state behaviour is covered by
+    # test_sdlc_graph_11b.py::test_parallel_branch_failure_is_recoverable.
     assert sa.get_all_versions() == []
-    assert us.get_all_versions() == []                 # ensure_user_stories never executed
-    assert stub_us_agent.generate_calls == []
 
 
 def test_user_story_agent_failure_propagates(stub_ba_agent, stub_sa_agent, sow_file, sample_metadata):
@@ -364,7 +373,10 @@ def test_user_story_agent_failure_propagates(stub_ba_agent, stub_sa_agent, sow_f
     with pytest.raises(InitialUserStoryAgentError):
         _run(PID, ba, sa, us, sow_file, sample_metadata)
 
-    assert [v.version for v in sa.get_all_versions()] == [1]  # HLD succeeded first
+    # US failed -> nothing persisted for user stories. Phase 11B: `ensure_hld`
+    # runs CONCURRENTLY with the failing branch, so the HLD may or may not have
+    # committed its v1 before the US error surfaced (timing-dependent).
+    assert [v.version for v in sa.get_all_versions()] in ([], [1])
     assert us.get_all_versions() == []
 
 

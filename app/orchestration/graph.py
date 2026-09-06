@@ -1,14 +1,14 @@
 """
-Full-SDLC LangGraph — Phase 8B-7 (adds the Closure Report hop + approval gate).
+Full-SDLC LangGraph — Phase 8B-7 (Closure Report hop) + Phase 11B (HLD ∥ US fan-out).
 
     START
       -> resolve_state
       -> ensure_brd
       -> gate_brd
            |-- awaiting_approval --> END        (awaiting = "brd_final")
-           '-- complete          --> ensure_hld
-                                       -> ensure_user_stories
-                                       -> gate_hld
+           '-- complete          --> [ ensure_hld , ensure_user_stories ]   (Phase 11B: concurrent fan-out)
+                                          \\           /
+                                           '--> gate_hld                    (fan-in: runs once, after BOTH)
                                             |-- awaiting_approval --> END   (awaiting = "hld_final")
                                             '-- complete          --> ensure_lld
                                                                         -> gate_lld
@@ -30,9 +30,14 @@ report — `gate_closure_report` only reports whether a human has approved one, 
 the run stops there until they do. Re-invoking `run_step` after a closure report
 already exists regenerates nothing (the `closure_latest_version` guard).
 
-The HLD, Initial-User-Story, LLD and QA/Test-Case hops run *sequentially* (not a
-true parallel fan-out): LangGraph 1.2.11 raises InvalidUpdateError if two
-concurrent branch nodes write the same state key (`produced`) in one super-step.
+Phase 11B: `ensure_hld` and `ensure_user_stories` now fan out CONCURRENTLY from
+`gate_brd` (both are independent branches off the finalized BRD, write disjoint
+`produced` keys "hld"/"us", and persist to isolated version streams). They
+fan back in at `gate_hld`, which — via its two incoming plain edges — LangGraph
+runs exactly once, after BOTH branches complete (no explicit join node). The
+`produced` key carries a reducer (`SDLCState._merge_produced`) so the two
+same-step writes merge instead of raising InvalidUpdateError. The LLD and
+QA/Test-Case hops remain sequential. Approval gates are unchanged.
 
 QA/Test-Case integration (8B-4) delegates DIRECTLY to the existing
 `TestCaseService.generate()` — the SAME public method the UI calls. It does NOT
@@ -90,6 +95,10 @@ _AWAITING_LLD_FINAL = "lld_final"
 _AWAITING_TC_FINAL = "tc_final"
 _AWAITING_CLOSURE_FINAL = "closure_final"
 _REQUEST_ENSURE_BRD = "ensure_brd"
+
+# Phase 11B: the two independent branches off the finalized BRD. `gate_brd` on
+# `complete` fans out to BOTH concurrently; both fan back in at `gate_hld`.
+_HLD_US_FANOUT = ["ensure_hld", "ensure_user_stories"]
 
 
 # --- nodes (thin delegators to the existing services) ----------------------
@@ -191,17 +200,26 @@ def _gate_brd_node(state: SDLCState) -> dict[str, Any]:
     return {"status": _STATUS_COMPLETE, "awaiting": None}
 
 
-def _route_after_gate_brd(state: SDLCState) -> str:
-    """Conditional edge out of gate_brd:
-    awaiting_approval -> END; complete -> the HLD hop (ensure_hld)."""
-    return state.get("status", _STATUS_AWAITING_APPROVAL)
+def _route_after_gate_brd(state: SDLCState):
+    """Conditional edge out of gate_brd. Phase 11B:
+    awaiting_approval -> END (BRD approval gate, unchanged);
+    complete          -> FAN OUT to BOTH `ensure_hld` and `ensure_user_stories`
+                         (they run concurrently and fan back in at gate_hld).
+    Returns a list of node names for the fan-out — LangGraph 1.2.11 does not
+    accept a list *value* inside a path_map dict, so the router itself returns
+    the list and the path_map arg is the flat set of possible destinations."""
+    if state.get("status") == _STATUS_COMPLETE:
+        return list(_HLD_US_FANOUT)
+    return END
 
 
 def _make_ensure_hld_node(sa_service: "SolutionArchitectService"):
     """gate_brd(complete) -> ensure_hld: generate HLD v1 only when none exists yet.
 
-    Reached only after a final BRD exists (gate_brd routes here). Delegates to the
-    existing SolutionArchitectService; never finalizes.
+    Reached only after a final BRD exists (gate_brd routes here). Phase 11B: runs
+    CONCURRENTLY with `ensure_user_stories` (independent branch off the finalized
+    BRD, own `hld` stream). Delegates to the existing SolutionArchitectService;
+    never finalizes.
     """
 
     def ensure_hld(state: SDLCState) -> dict[str, Any]:
@@ -209,16 +227,18 @@ def _make_ensure_hld_node(sa_service: "SolutionArchitectService"):
             return {}  # an HLD version already exists -> do nothing
 
         version = sa_service.generate_initial_hld()
-        produced = dict(state.get("produced") or {})
-        produced["hld"] = version.version
-        return {"produced": produced, "hld_latest_version": version.version}
+        # Delta-only update (Phase 11B): the `produced` reducer merges this with
+        # the concurrent `ensure_user_stories` write in the same super-step.
+        return {"produced": {"hld": version.version}, "hld_latest_version": version.version}
 
     return ensure_hld
 
 
 def _make_ensure_user_stories_node(us_service: "InitialUserStoryService"):
-    """ensure_hld -> ensure_user_stories: generate draft user stories v1 only when
-    none exist yet. Soft downstream context — NO approval gate. Never finalizes.
+    """gate_brd(complete) -> ensure_user_stories: generate draft user stories v1
+    only when none exist yet. Phase 11B: runs CONCURRENTLY with `ensure_hld`
+    (independent branch off the finalized BRD, own `user_stories` stream). Soft
+    downstream context — NO approval gate. Never finalizes.
     """
 
     def ensure_user_stories(state: SDLCState) -> dict[str, Any]:
@@ -226,15 +246,18 @@ def _make_ensure_user_stories_node(us_service: "InitialUserStoryService"):
             return {}  # a user-story version already exists -> do nothing
 
         version = us_service.generate_initial_stories()
-        produced = dict(state.get("produced") or {})
-        produced["us"] = version.version
-        return {"produced": produced, "us_latest_version": version.version}
+        # Delta-only update (Phase 11B): the `produced` reducer merges this with
+        # the concurrent `ensure_hld` write in the same super-step.
+        return {"produced": {"us": version.version}, "us_latest_version": version.version}
 
     return ensure_user_stories
 
 
 def _gate_hld_node(state: SDLCState) -> dict[str, Any]:
-    """ensure_user_stories -> gate_hld: read-only. Reports whether a final HLD exists.
+    """[ensure_hld, ensure_user_stories] -> gate_hld: read-only fan-in. Reports
+    whether a final HLD exists. Its two incoming plain edges make LangGraph run
+    this node ONCE, after BOTH branches complete (Phase 11B — no explicit join
+    node). Only the HLD is gated (User Stories have no approval gate).
 
     MUST NOT call choose_final_hld / mark_final / unlock_final / touch persistence.
     """
@@ -430,12 +453,18 @@ def build_sdlc_graph(
     graph.add_edge(START, "resolve_state")
     graph.add_edge("resolve_state", "ensure_brd")
     graph.add_edge("ensure_brd", "gate_brd")
+    # Phase 11B: gate_brd(complete) fans out to BOTH branches concurrently.
+    # `_route_after_gate_brd` returns the list of node names (LangGraph 1.2.11
+    # rejects a list *value* in a path_map dict); the path_map arg here is the
+    # flat set of possible destinations.
     graph.add_conditional_edges(
         "gate_brd",
         _route_after_gate_brd,
-        {_STATUS_AWAITING_APPROVAL: END, _STATUS_COMPLETE: "ensure_hld"},
+        [*_HLD_US_FANOUT, END],
     )
-    graph.add_edge("ensure_hld", "ensure_user_stories")
+    # Fan-in: both branches feed gate_hld, which LangGraph runs once after BOTH
+    # complete (no explicit join node).
+    graph.add_edge("ensure_hld", "gate_hld")
     graph.add_edge("ensure_user_stories", "gate_hld")
     graph.add_conditional_edges(
         "gate_hld",

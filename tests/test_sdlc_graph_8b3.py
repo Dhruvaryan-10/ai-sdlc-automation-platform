@@ -109,13 +109,16 @@ def test_topology_lld_subpath_is_intact(stub_ba_agent):
         ("__start__", "resolve_state"),
         ("resolve_state", "ensure_brd"),
         ("ensure_brd", "gate_brd"),
-        ("ensure_hld", "ensure_user_stories"),
+        # Phase 11B: HLD ∥ US fan-in at gate_hld.
+        ("ensure_hld", "gate_hld"),
         ("ensure_user_stories", "gate_hld"),
         ("ensure_lld", "gate_lld"),
     } <= plain
+    assert ("ensure_hld", "ensure_user_stories") not in plain
     cond = {(e.source, e.target) for e in g.edges if e.conditional}
     assert ("gate_brd", "__end__") in cond
     assert ("gate_brd", "ensure_hld") in cond
+    assert ("gate_brd", "ensure_user_stories") in cond   # Phase 11B fan-out
     assert ("gate_hld", "__end__") in cond          # awaiting_approval -> END
     assert ("gate_hld", "ensure_lld") in cond        # complete -> LLD hop
     assert ("gate_lld", "__end__") in cond           # LLD awaiting_approval -> END

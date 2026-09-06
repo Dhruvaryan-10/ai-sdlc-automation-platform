@@ -9,20 +9,32 @@ every invocation, so the state is safe to rebuild from scratch each run.
 
 from __future__ import annotations
 
-from typing import TypedDict
+from typing import Annotated, TypedDict
 
 from app.agents.business_analyst.agent import ProjectMetadata
+
+
+def _merge_produced(a: dict, b: dict) -> dict:
+    """Reducer for `SDLCState.produced` (Phase 11B).
+
+    Shallow-merges the two branch updates. `ensure_hld` and `ensure_user_stories`
+    now run as a concurrent fan-out from `gate_brd` and each writes a DISJOINT
+    key ("hld" / "us"), so the merge is order-independent. None-safe.
+    """
+    return {**(a or {}), **(b or {})}
 
 
 class SDLCState(TypedDict, total=False):
     """Orchestration state threaded through the SDLC graph.
 
-    Each key is written by exactly one node per super-step, so no reducers are
-    needed. `total=False`: every key is optional and populated as the run
-    progresses. The 8B-2 HLD/User-Story hops run *sequentially* (not as a true
-    parallel fan-out) precisely so `produced` is only ever written by one node
-    per step — concurrent writes to the same key raise InvalidUpdateError in
-    LangGraph 1.2.11.
+    `total=False`: every key is optional and populated as the run progresses.
+    Every key is written by exactly one node per super-step and uses default
+    (last-value) channel semantics — EXCEPT `produced`. Since Phase 11B the HLD
+    and Initial User Story hops fan out concurrently from `gate_brd`, so TWO
+    nodes write `produced` in the same super-step; it is therefore the one
+    reducer-enabled field (`_merge_produced`), a shallow merge of the two
+    branches' disjoint "hld" / "us" keys. Without the reducer LangGraph 1.2.11
+    raises InvalidUpdateError ("can receive only one value per step").
     """
 
     # --- identity / inputs ---
@@ -55,6 +67,8 @@ class SDLCState(TypedDict, total=False):
     closure_final_version: int | None
 
     # --- results of THIS invocation ---
-    produced: dict[str, int]        # {"brd": 1, "hld": 1, "us": 1, "lld": 1, "tc": 1, "closure": 1} — artifacts created this run
+    # Reducer-enabled (Phase 11B): the concurrent HLD / Initial-US fan-out both
+    # write this key in one super-step. `_merge_produced` shallow-merges them.
+    produced: Annotated[dict[str, int], _merge_produced]  # e.g. {"hld": 1, "us": 1} — artifacts created this run
     status: str                     # "awaiting_approval" | "complete"
     awaiting: str | None            # blocking gate id, e.g. "brd_final" / "hld_final" / "lld_final" / "tc_final" / "closure_final", or None

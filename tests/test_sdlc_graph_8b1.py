@@ -25,7 +25,10 @@ from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
 from app.agents.test_case.service import TestCaseService
+from langgraph.graph import END
+
 from app.orchestration.graph import (
+    _HLD_US_FANOUT,
     _gate_brd_node,
     _make_ensure_brd_node,
     _make_resolve_state_node,
@@ -82,9 +85,12 @@ def test_graph_topology_brd_subpath_is_intact():
 
 
 def test_route_after_gate_brd_maps_both_outcomes():
-    assert _route_after_gate_brd({"status": "complete"}) == "complete"
-    assert _route_after_gate_brd({"status": "awaiting_approval"}) == "awaiting_approval"
-    assert _route_after_gate_brd({}) == "awaiting_approval"  # safe default
+    # Phase 11B: on `complete` the router FANS OUT to both branch nodes;
+    # anything else (incl. the safe default) routes to END (BRD approval gate).
+    assert _route_after_gate_brd({"status": "complete"}) == _HLD_US_FANOUT
+    assert _route_after_gate_brd({"status": "complete"}) == ["ensure_hld", "ensure_user_stories"]
+    assert _route_after_gate_brd({"status": "awaiting_approval"}) == END
+    assert _route_after_gate_brd({}) == END  # safe default
 
 
 def test_sdlc_state_fields():
