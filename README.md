@@ -1,4 +1,4 @@
-# SDLC Agent — BRD · HLD · User Stories · LLD · Story Refinement · Test Cases
+# SDLC Agent — BRD · HLD · User Stories · LLD · Story Refinement · Test Cases · Closure Report
 
 The AI-powered SDLC platform, built one agent at a time:
 
@@ -32,12 +32,28 @@ The AI-powered SDLC platform, built one agent at a time:
   a used artifact whose authoritative version later changes flags the test
   cases stale (never auto-regenerated); a previously-absent optional artifact
   appearing later does **not**.
+- **Phase 7 — Closure Report Agent:** the final evidence-based **project
+  closure assessment**. It is *not* the Project Quality Report — it **consumes**
+  it (plus the Traceability report). The **only hard prerequisite is a final
+  BRD**; every other missing or unfinished artifact (no final HLD/LLD, no user
+  stories, no test cases, test cases not finalized, uncovered requirements or
+  stories, ungrounded/orphan references) is reported as a **finding**, not a
+  failure. Deterministic code computes every fact — artifact
+  exists/latest/final/status, coverage, quality findings, blockers — by reusing
+  the existing Traceability and Quality reports verbatim; Gemini writes the
+  **narrative prose only** and never decides a number or the status. The
+  **closure status is deterministic**: `READY_FOR_CLOSURE`,
+  `CLOSURE_WITH_OPEN_ITEMS`, or `NOT_READY_FOR_CLOSURE` — no score, no "production
+  ready". Stored as Markdown in its own append-only `closure_report` stream.
+  `Generate` / `Regenerate` create new versions; the agent **never finalizes** —
+  approval stays a separate human action.
 
 Every stage shares the same lifecycle: manual editing, AI-assisted refinement,
 full version history, final-version locking/unlocking, and Word export. The BRD,
-HLD, user-story, LLD, and test-case version streams are each independent; Phase
-3 and Phase 5 both write to the one user-story stream, and the QA agent only
-ever writes the test-case stream.
+HLD, user-story, LLD, test-case, and closure-report version streams are each
+independent; Phase 3 and Phase 5 both write to the one user-story stream, the QA
+agent only ever writes the test-case stream, and the Closure Report agent only
+ever writes the closure-report stream.
 
 No databases, no LangGraph, no RAG — plain JSON persistence, done properly.
 
@@ -246,6 +262,27 @@ To stop the app, go back to the terminal and press `Ctrl + C`.
      artifact appearing later is not stale. Everything is independently
      versioned under `outputs/<project_id>/test_cases/versions.json`.
 
+8. **Tab 8 — Closure Report** (Phase 7, Closure Report Agent)
+   - Available once a BRD has been marked **Final** (a final BRD is the only
+     hard prerequisite). Everything else missing or unfinished is reported as a
+     finding, not a blocker.
+   - Click **Generate Closure Report** to produce **Closure Report Version 1**.
+     Deterministic code reads the existing Traceability and Project Quality
+     reports plus the persisted artifacts and computes the artifact summary,
+     coverage, quality findings, blockers, outstanding items, and the
+     **closure status** (`READY_FOR_CLOSURE` / `CLOSURE_WITH_OPEN_ITEMS` /
+     `NOT_READY_FOR_CLOSURE`); Gemini writes only the narrative. The report has
+     nine sections and always distinguishes a *final* artifact version from a
+     newer *draft*.
+   - **Regenerate from Project Evidence** rebuilds a new version from the
+     current evidence (the previous one stays in History). There is no
+     feedback-refine. **Choose Final** / **Unlock** and **Download
+     ClosureReport.docx** work like the other workspaces — generation never
+     finalizes.
+   - The **SDLC Pipeline** panel at the top of the page also advances to the
+     closure report and stops at its approval gate. Everything is versioned
+     under `outputs/<project_id>/closure_report/versions.json`.
+
 ---
 
 ## 5. Project Structure
@@ -290,6 +327,15 @@ sdlc-ba-agent/
         prompts/
           generate_test_cases.txt
           refine_test_cases.txt
+      closure_report/        <- Phase 7: final BRD (only hard gate) + Traceability + Quality Report -> project closure assessment
+        agent.py             <- Gemini/LangChain wrapper (synthesize_narrative; ClosureNarrative structured output, prose only)
+        service.py           <- BRD gate + reuses app.quality.* for every fact; deterministic closure status; renders Markdown; own "closure_report" stream
+        schema.py            <- ClosureNarrative (six str fields; transient)
+        prompts/
+          closure_report.txt
+    orchestration/           <- Phase 8B: one sequential LangGraph over all seven agents (ensure_* / gate_* nodes; never finalizes)
+      graph.py  state.py  status.py
+    quality/                 <- Phase 9A: read-only deterministic Traceability + Project Quality reports (no Gemini)
     parsers/
       detector.py            <- detects .docx / .pdf / .txt
       docx_parser.py
@@ -297,7 +343,7 @@ sdlc-ba-agent/
       text_parser.py
       text_cleaner.py        <- preprocessing (removes headers/footers/page numbers)
     document_generator/
-      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx / _lld_docx / _test_cases_docx)
+      brd_generator.py       <- markdown -> .docx (generate_brd_docx / _hld_docx / _user_stories_docx / _lld_docx / _test_cases_docx / _closure_report_docx)
     services/
       version_service.py     <- version history (JSON file per project/stream, no DB yet)
       version_text.py        <- shared "**Version:** N" stamping helper (all document streams)
@@ -308,7 +354,7 @@ sdlc-ba-agent/
       streamlit_app.py       <- the UI, calls the service layer only
   tests/                     <- deterministic pytest suite (stub agents, no Gemini calls)
   uploads/                   <- uploaded SOW files land here
-  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + <id>/lld/ + <id>/test_cases/ + .docx exports
+  outputs/                   <- <id>/versions.json (BRD) + <id>/hld/ + <id>/user_stories/ + <id>/lld/ + <id>/test_cases/ + <id>/closure_report/ + .docx exports
   logs/                      <- app.log (rotating)
   requirements.txt
   pytest.ini
@@ -338,16 +384,18 @@ pytest
 
 ---
 
-## 7. What's Deliberately NOT in Phases 1–6
+## 7. What's Deliberately NOT in Phases 1–7
 
-Phases 1–6 deliver: Business Analyst (SOW → BRD), Solution Architect
+Phases 1–7 deliver: Business Analyst (SOW → BRD), Solution Architect
 (BRD → HLD), Initial User Story (BRD → draft stories), Low-Level Design
-(HLD → LLD), User Story Refinement (BRD + HLD + LLD reconcile the stories), and
-QA / Test Case (BRD + optional HLD/LLD/User Stories → test cases).
-Still **not** included, by scope: a Documentation Agent, a Project Closure /
-Report Agent, Project Memory, LangGraph / multi-agent orchestration, RAG, a
+(HLD → LLD), User Story Refinement (BRD + HLD + LLD reconcile the stories),
+QA / Test Case (BRD + optional HLD/LLD/User Stories → test cases), and Closure
+Report (final BRD + Traceability + Quality Report → project closure assessment),
+plus a read-only Traceability + Project Quality reporting layer and one
+sequential LangGraph that orchestrates the seven agents.
+Still **not** included, by scope: a Documentation Agent, Project Memory, RAG, a
 real database, load/perf/security-penetration test generation, and
 authentication / multi-user support. Persistence is still plain JSON files; the
 database decision is deferred to the Project Memory phase. The known
-`_extract_text` / `_invoke` / metadata-helper duplication across the six agent
-packages is a deliberately deferred cleanup.
+`_extract_text` / `_invoke` / metadata-helper / structured-retry duplication
+across the seven agent packages is a deliberately deferred cleanup.

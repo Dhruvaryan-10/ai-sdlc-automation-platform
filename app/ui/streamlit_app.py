@@ -72,10 +72,19 @@ from app.agents.test_case.service import (
 from app.agents.test_case.service import (
     NoFinalBRDError as NoFinalBRDErrorForQA,
 )
+from app.agents.closure_report.agent import ClosureReportAgentError
+from app.agents.closure_report.service import (
+    ClosureReportLockedError,
+    ClosureReportService,
+)
+from app.agents.closure_report.service import (
+    NoFinalBRDError as NoFinalBRDErrorForClosure,
+)
 from app.orchestration.graph import run_step
 from app.orchestration.status import sdlc_status
 from app.document_generator.brd_generator import (
     generate_brd_docx,
+    generate_closure_report_docx,
     generate_hld_docx,
     generate_lld_docx,
     generate_test_cases_docx,
@@ -231,15 +240,16 @@ def friendly_error(exc: Exception) -> str:
                 "please upload a text-based version instead.")
     if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError,
                         InitialUserStoryAgentError, LLDAgentError,
-                        UserStoryRefinementAgentError, TestCaseAgentError)):
+                        UserStoryRefinementAgentError, TestCaseAgentError,
+                        ClosureReportAgentError)):
         return ("Unable to reach the Gemini API. Please check your API key and network "
                 "connection, then try again.")
     if isinstance(exc, (NoFinalBRDError, NoFinalBRDErrorForStories, NoFinalHLDError,
                         NoFinalBRDErrorForRefinement, NoInitialUserStoriesError,
-                        NoFinalBRDErrorForQA)):
+                        NoFinalBRDErrorForQA, NoFinalBRDErrorForClosure)):
         return str(exc)
     if isinstance(exc, (BRDLockedError, HLDLockedError, UserStoryLockedError, LLDLockedError,
-                        RefinementLockedError, TestCaseLockedError)):
+                        RefinementLockedError, TestCaseLockedError, ClosureReportLockedError)):
         return str(exc)
     if isinstance(exc, ValueError):
         return str(exc)
@@ -266,6 +276,8 @@ _NEXT_STEP_LABELS = {
     "approve_lld": "Next: Review and approve the LLD in Step 5",
     "generate_test_cases": "Next: Generate Test Cases in Step 7",
     "approve_test_cases": "Next: Review and approve Test Cases in Step 7",
+    "generate_closure_report": "Next: Generate the Closure Report in Step 8",
+    "approve_closure_report": "Next: Review and approve the Closure Report in Step 8",
     None: "SDLC pipeline complete — no further orchestrated action is required.",
 }
 
@@ -276,7 +288,101 @@ _AWAITING_APPROVAL_MESSAGES = {
     "approve_test_cases": (
         "Waiting for Test Case approval — review and choose the final Test Cases in Step 7."
     ),
+    "approve_closure_report": (
+        "Waiting for Closure Report approval — review and choose the final Closure "
+        "Report in Step 8."
+    ),
 }
+
+# --- SDLC step rail (Phase 8B-8, UI-only) -----------------------------------------
+#
+# A horizontally-scrollable progress rail for the eight SDLC steps, rendered in the
+# SDLC Pipeline panel in place of the old truncated caption row. It is a display
+# component only: no navigation/routing, no backend calls. State per step is
+# derived entirely from `sdlc_status()` (see `_pipeline_steps`). All CSS is scoped
+# under `.sdlc-steprail-wrap` so it cannot affect the sidebar, tabs, buttons,
+# artifact cards, or any other component.
+
+_RAIL_STEPS = (
+    (1, "SOW → BRD"),
+    (2, "BRD Workspace"),
+    (3, "HLD Workspace"),
+    (4, "User Story Workspace"),
+    (5, "LLD Workspace"),
+    (6, "Test Case Workspace"),
+    (7, "Traceability & Quality"),
+    (8, "Closure Report"),
+)
+
+# Which rail step the pipeline's current `next_step` points at (generate/approve
+# for one artifact map to the same rail card).
+_NEXT_STEP_TO_RAIL = {
+    "generate_brd": 1, "approve_brd": 2,
+    "generate_hld": 3, "approve_hld": 3,
+    "generate_lld": 5, "approve_lld": 5,
+    "generate_test_cases": 6, "approve_test_cases": 6,
+    "generate_closure_report": 8, "approve_closure_report": 8,
+}
+
+_STEP_RAIL_CSS = """
+<style>
+.sdlc-steprail-wrap { margin: 0.25rem 0 0.35rem 0; }
+.sdlc-steprail-wrap .sdlc-steprail {
+    display: flex; flex-direction: row; flex-wrap: nowrap;
+    gap: 0.55rem; align-items: flex-start;
+    padding: 0.85rem 0.9rem 0.7rem 0.9rem;
+    border: 1px solid rgba(250, 250, 250, 0.14);
+    border-radius: 12px;
+    background: rgba(250, 250, 250, 0.02);
+    overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(250, 250, 250, 0.32) rgba(250, 250, 250, 0.06);
+}
+.sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar { height: 8px; }
+.sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar-track {
+    background: rgba(250, 250, 250, 0.06); border-radius: 8px;
+}
+.sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar-thumb {
+    background: rgba(250, 250, 250, 0.28); border-radius: 8px;
+}
+.sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar-thumb:hover {
+    background: rgba(250, 250, 250, 0.42);
+}
+.sdlc-steprail-wrap .sdlc-step {
+    flex: 0 0 auto; min-width: 128px; max-width: 168px;
+    display: flex; flex-direction: column; align-items: center;
+    text-align: center; gap: 0.3rem;
+}
+.sdlc-steprail-wrap .sdlc-step-num {
+    width: 32px; height: 32px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 0.85rem; line-height: 1;
+    border: 2px solid transparent;
+}
+.sdlc-steprail-wrap .sdlc-step-name {
+    font-size: 0.78rem; font-weight: 600; line-height: 1.2;
+    color: rgba(250, 250, 250, 0.90);
+}
+.sdlc-steprail-wrap .sdlc-step-status { font-size: 0.7rem; line-height: 1.15; }
+.sdlc-steprail-wrap .sdlc-step--done .sdlc-step-num { background: #15803d; color: #ffffff; }
+.sdlc-steprail-wrap .sdlc-step--done .sdlc-step-status { color: #4ade80; }
+.sdlc-steprail-wrap .sdlc-step--done .sdlc-step-status::before { content: "\\2713\\00a0"; }
+.sdlc-steprail-wrap .sdlc-step--current .sdlc-step-num {
+    background: #2563eb; color: #ffffff; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.30);
+}
+.sdlc-steprail-wrap .sdlc-step--current .sdlc-step-status { color: #60a5fa; font-weight: 600; }
+.sdlc-steprail-wrap .sdlc-step--todo .sdlc-step-num {
+    background: rgba(250, 250, 250, 0.08); color: rgba(250, 250, 250, 0.60);
+    border-color: rgba(250, 250, 250, 0.18);
+}
+.sdlc-steprail-wrap .sdlc-step--todo .sdlc-step-status { color: rgba(250, 250, 250, 0.45); }
+.sdlc-steprail-wrap .sdlc-step--readonly .sdlc-step-num {
+    background: rgba(250, 250, 250, 0.08); color: rgba(250, 250, 250, 0.72);
+    border-color: rgba(250, 250, 250, 0.18);
+}
+.sdlc-steprail-wrap .sdlc-step--readonly .sdlc-step-status { color: rgba(250, 250, 250, 0.55); }
+</style>
+"""
 
 
 def _next_step_label(status: dict) -> str:
@@ -327,10 +433,80 @@ def _pipeline_summary(status: dict) -> list[str]:
               status["lld_final_version"], status["awaiting_lld_approval"]),
         _line("Test Cases", status["tc_exists"], status["tc_latest_version"],
               status["tc_final_version"], status["awaiting_test_cases_approval"]),
+        _line("Closure Report", status["closure_exists"], status["closure_latest_version"],
+              status["closure_final_version"], status["awaiting_closure_approval"]),
     ]
 
 
-def run_pipeline_step(project_id: str, ba_service, sa_service, us_service, lld_service, tc_service):
+def _pipeline_steps(status: dict) -> list[dict]:
+    """Pure: `sdlc_status()` -> the 8 SDLC step-rail descriptors.
+
+    Each entry is `{"n": int, "name": str, "state": str, "status": str}` where
+    `state` is one of "done" / "current" / "todo" / "readonly". No Streamlit
+    calls, no invented fields — every decision comes from `sdlc_status()`'s keys.
+
+      * done      — the step's artifact is finalized (or, for the no-gate
+                    User-Story step, generated).
+      * current   — the step the pipeline's `next_step` currently points at
+                    (a `generate_*` or `approve_*` action). The existing amber
+                    "Waiting for … approval" banner still conveys the
+                    approve-vs-generate distinction below the rail.
+      * readonly  — Step 7 (Traceability & Quality) has no generation/approval
+                    lifecycle; shown neutral once a BRD exists.
+      * todo      — not started.
+    """
+    current_n = _NEXT_STEP_TO_RAIL.get(status.get("next_step"), 0)
+    done = {
+        1: status["brd_exists"],
+        2: status["brd_final_version"] is not None,
+        3: status["hld_final_version"] is not None,
+        4: status["us_exists"],
+        5: status["lld_final_version"] is not None,
+        6: status["tc_final_version"] is not None,
+        7: False,  # read-only report — no completion state
+        8: status["closure_final_version"] is not None,
+    }
+    steps: list[dict] = []
+    for n, name in _RAIL_STEPS:
+        if done[n]:
+            state, text = "done", "Completed"
+        elif n == current_n:
+            state, text = "current", "Current"
+        elif n == 7:
+            state, text = (("readonly", "Read-only") if status["brd_exists"]
+                           else ("todo", "Not started"))
+        else:
+            state, text = "todo", "Not started"
+        steps.append({"n": n, "name": name, "state": state, "status": text})
+    return steps
+
+
+def _render_step_rail(status: dict) -> str:
+    """Pure: build the scoped HTML for the horizontal SDLC step rail.
+
+    Content is built only from `_RAIL_STEPS` (static labels) + `_pipeline_steps`
+    (fixed status words) + integer step numbers — no user/project text is
+    interpolated, so no escaping is required. No Streamlit calls.
+    """
+    cells = "".join(
+        f'<div class="sdlc-step sdlc-step--{s["state"]}">'
+        f'<div class="sdlc-step-num">{s["n"]}</div>'
+        f'<div class="sdlc-step-name">{s["name"]}</div>'
+        f'<div class="sdlc-step-status">{s["status"]}</div>'
+        f'</div>'
+        for s in _pipeline_steps(status)
+    )
+    return (
+        '<div class="sdlc-steprail-wrap">'
+        '<div class="sdlc-steprail" role="list" aria-label="SDLC pipeline steps">'
+        f'{cells}</div></div>'
+    )
+
+
+def run_pipeline_step(
+    project_id: str, ba_service, sa_service, us_service, lld_service, tc_service,
+    closure_service=None,
+):
     """Thin, testable wrapper around `run_step()` for the pipeline panel's button.
 
     Exists ONLY so tests can monkeypatch/spy on `run_step` without importing and
@@ -347,6 +523,7 @@ def run_pipeline_step(project_id: str, ba_service, sa_service, us_service, lld_s
         us_service=us_service,
         lld_service=lld_service,
         tc_service=tc_service,
+        closure_service=closure_service,
     )
 
 
@@ -426,6 +603,17 @@ if "qa_service" not in st.session_state:
 
 qa_service: TestCaseService = st.session_state.qa_service
 
+if "closure_service" not in st.session_state:
+    try:
+        st.session_state.closure_service = ClosureReportService(
+            project_id=st.session_state.project_id
+        )
+    except Exception as exc:
+        st.error(friendly_error(exc))
+        st.stop()
+
+closure_service: ClosureReportService = st.session_state.closure_service
+
 
 def refresh_versions() -> None:
     try:
@@ -467,6 +655,14 @@ def refresh_qa_versions() -> None:
         st.error(friendly_error(exc))
 
 
+def refresh_closure_versions() -> None:
+    try:
+        st.session_state.closure_versions = closure_service.get_all_versions()
+    except Exception as exc:
+        st.session_state.closure_versions = []
+        st.error(friendly_error(exc))
+
+
 if "versions" not in st.session_state:
     refresh_versions()
 
@@ -481,6 +677,9 @@ if "lld_versions" not in st.session_state:
 
 if "qa_versions" not in st.session_state:
     refresh_qa_versions()
+
+if "closure_versions" not in st.session_state:
+    refresh_closure_versions()
 
 versions = st.session_state.versions
 latest_version = versions[-1] if versions else None
@@ -515,6 +714,11 @@ qa_versions = st.session_state.qa_versions
 qa_latest = qa_versions[-1] if qa_versions else None
 qa_final = next((v for v in qa_versions if v.is_final), None)
 qa_is_locked = bool(qa_final and qa_final.is_locked)
+
+closure_versions = st.session_state.closure_versions
+closure_latest = closure_versions[-1] if closure_versions else None
+closure_final = next((v for v in closure_versions if v.is_final), None)
+closure_is_locked = bool(closure_final and closure_final.is_locked)
 
 # --- Phase 6 test-case provenance / per-source staleness (own test_cases stream) ---
 try:
@@ -727,15 +931,19 @@ with st.container():
             us_service=us_service,
             lld_service=lld_service,
             tc_service=qa_service,
+            closure_service=closure_service,
         )
     except Exception as exc:
         pipeline_status = None
         st.error(friendly_error(exc))
 
     if pipeline_status is not None:
-        summary_cols = st.columns(5)
-        for col, line in zip(summary_cols, _pipeline_summary(pipeline_status)):
-            col.caption(line)
+        # Horizontally-scrollable rail of all eight SDLC steps. Replaces the old
+        # 5-column caption row (which silently dropped the 6th line / Closure
+        # Report). Display only — state is derived from `sdlc_status()`; the
+        # `_pipeline_summary()` text helper is retained for API/test stability.
+        st.markdown(_STEP_RAIL_CSS, unsafe_allow_html=True)
+        st.markdown(_render_step_rail(pipeline_status), unsafe_allow_html=True)
 
         st.write(f"**{_next_step_label(pipeline_status)}**")
 
@@ -760,12 +968,14 @@ with st.container():
                     run_pipeline_step(
                         st.session_state.project_id,
                         service, sa_service, us_service, lld_service, qa_service,
+                        closure_service,
                     )
                     refresh_versions()
                     refresh_hld_versions()
                     refresh_us_versions()
                     refresh_lld_versions()
                     refresh_qa_versions()
+                    refresh_closure_versions()
                     st.success(
                         "SDLC orchestration completed. The pipeline stopped at "
                         "the next required human action."
@@ -777,10 +987,11 @@ with st.container():
 st.divider()
 
 (tab_generate, tab_workspace, tab_hld, tab_stories,
- tab_lld, tab_usr, tab_qa) = st.tabs(
+ tab_lld, tab_usr, tab_qa, tab_closure) = st.tabs(
     ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace",
      "Step 4: User Story Workspace", "Step 5: LLD Workspace",
-     "Step 6: User Story Refinement", "Step 7: QA / Test Case Workspace"]
+     "Step 6: User Story Refinement", "Step 7: QA / Test Case Workspace",
+     "Step 8: Closure Report"]
 )
 
 
@@ -2229,6 +2440,205 @@ with tab_qa:
                                 mime=("application/vnd.openxmlformats-officedocument"
                                       ".wordprocessingml.document"),
                                 key="qa_download_btn",
+                            )
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+
+# --- STEP 8: Closure Report -----------------------------------------------------------
+#
+# Phase 7. Additive, mirrors the other artifact tabs. The Closure Report is the
+# final evidence-based synthesis of the SDLC; it CONSUMES the Traceability and
+# Project Quality reports (read-only) plus the persisted artifacts. Only a final
+# BRD is a hard prerequisite; every other missing/incomplete artifact is
+# represented inside the report. Generation NEVER finalizes — "Choose Final" is a
+# separate, human-only action, exactly like every other stage.
+
+with tab_closure:
+    st.caption("Phase 7: the final project closure assessment. Deterministic facts "
+               "(artifact status, coverage, findings, closure status) are computed "
+               "from the existing Traceability and Project Quality reports; Gemini "
+               "writes only the narrative. Own version stream; nothing is "
+               "regenerated automatically; the platform never finalizes it.")
+
+    if final_version is None:
+        st.warning("Closure Report generation is unavailable: no accepted BRD.")
+        st.caption("Accept a BRD in the BRD Workspace first. A final BRD is the only "
+                   "hard prerequisite — a missing HLD / LLD / User Stories / Test "
+                   "Cases is reported as a finding, not a blocker.")
+    else:
+        closure_viewing_number = st.session_state.get(
+            "closure_viewing_version", closure_latest.version if closure_latest else 0
+        )
+        closure_viewing = None
+        if closure_latest is not None:
+            try:
+                closure_viewing = (
+                    closure_service.get_version(closure_viewing_number) or closure_latest
+                )
+            except Exception as exc:
+                st.error(friendly_error(exc))
+                closure_viewing = closure_latest
+
+        if closure_latest is None:
+            st.divider()
+            st.subheader("Generate Closure Report")
+            st.caption("Builds the closure report from the current project evidence "
+                       "(BRD, HLD, User Stories, LLD, Test Cases, Traceability, "
+                       "Project Quality Report). Creates Closure Report Version 1.")
+            if st.button("Generate Closure Report", type="primary",
+                         key="closure_generate_btn"):
+                with st.spinner("Assembling project evidence and drafting the closure "
+                                "report..."):
+                    try:
+                        start = time.time()
+                        cr_v = closure_service.generate()
+                        elapsed = time.time() - start
+                        logger.info(f"Closure report v{cr_v.version} generated in "
+                                    f"{elapsed:.1f}s")
+                        refresh_closure_versions()
+                        st.session_state.closure_viewing_version = cr_v.version
+                        st.success(f"Closure Report Version {cr_v.version} generated in "
+                                   f"{elapsed:.1f}s.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+        else:
+            closure_is_current = (
+                closure_viewing is not None
+                and closure_viewing.version == closure_latest.version
+            )
+
+            cr_status_cols = st.columns([2, 2, 2])
+            with cr_status_cols[0]:
+                st.metric("Viewing", f"v{closure_viewing.version}")
+            with cr_status_cols[1]:
+                st.metric("Type", SOURCE_LABELS.get(closure_viewing.source,
+                                                    closure_viewing.source))
+            with cr_status_cols[2]:
+                st.metric("Status", "Accepted" if closure_viewing.is_final else "Draft")
+
+            st.info(f"Current version **v{closure_latest.version}** — {closure_latest.note}")
+
+            if closure_is_locked:
+                if closure_viewing.is_final:
+                    st.success(f"This is the Final Closure Report (v{closure_viewing.version}) "
+                               "and it is locked against further changes.")
+                else:
+                    st.warning(f"The Final Closure Report (v{closure_final.version}) is "
+                               "locked. Unlock it below to regenerate.")
+            elif not closure_is_current:
+                st.info(f"You are viewing an older version (v{closure_viewing.version}). "
+                        f"The current version is v{closure_latest.version}.")
+
+            st.divider()
+
+            cr_tab_preview, cr_tab_history = st.tabs(["Preview", "History"])
+            with cr_tab_preview:
+                render_artifact_markdown(closure_viewing.content)
+            with cr_tab_history:
+                for v in reversed(closure_versions):
+                    cols = st.columns([3, 2, 2])
+                    cols[0].write(f"**v{v.version}** — {SOURCE_LABELS.get(v.source, v.source)}")
+                    cols[1].write("Accepted" if v.is_final else "Draft")
+                    if cols[2].button(f"View v{v.version}", key=f"closure_hist_view_{v.version}"):
+                        st.session_state.closure_viewing_version = v.version
+                        st.rerun()
+
+            st.divider()
+
+            st.subheader("Regenerate")
+            st.caption("Rebuild the closure report from the CURRENT project evidence. "
+                       "Creates a new version; the previous one stays in History.")
+            if st.button("Regenerate from Project Evidence", disabled=closure_is_locked,
+                         key="closure_regen_btn"):
+                with st.spinner("Rebuilding the closure report from current evidence..."):
+                    try:
+                        start = time.time()
+                        new_cr = closure_service.regenerate()
+                        elapsed = time.time() - start
+                        logger.info(f"Closure report regenerated to v{new_cr.version} in "
+                                    f"{elapsed:.1f}s")
+                        refresh_closure_versions()
+                        st.session_state.closure_viewing_version = new_cr.version
+                        st.success(f"Created Closure Report Version {new_cr.version} in "
+                                   f"{elapsed:.1f}s.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(friendly_error(exc))
+
+            st.divider()
+
+            st.subheader("Final Closure Report")
+            cr_final_cols = st.columns([2, 2, 2])
+
+            with cr_final_cols[0]:
+                if not closure_viewing.is_final:
+                    if st.button(f"Choose v{closure_viewing.version} as Final Closure Report",
+                                 key="closure_choose_final"):
+                        try:
+                            closure_service.choose_final(closure_viewing.version)
+                            refresh_closure_versions()
+                            st.success(f"Closure Report Version {closure_viewing.version} "
+                                       "is now Final.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+                else:
+                    st.caption("This version is the Final Closure Report.")
+
+            with cr_final_cols[1]:
+                if closure_is_locked:
+                    if st.session_state.get("closure_confirm_unlock"):
+                        st.warning("Unlock the Final Closure Report? It stays in history "
+                                   "unchanged; regenerating creates a new version.")
+                        yes_col, no_col = st.columns(2)
+                        if yes_col.button("Yes, unlock", key="closure_unlock_yes"):
+                            try:
+                                closure_service.unlock_final()
+                                st.session_state.closure_confirm_unlock = False
+                                refresh_closure_versions()
+                                st.success("Final Closure Report unlocked.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(friendly_error(exc))
+                        if no_col.button("Cancel", key="closure_unlock_cancel"):
+                            st.session_state.closure_confirm_unlock = False
+                            st.rerun()
+                    else:
+                        if st.button("Unlock Final Closure Report", key="closure_unlock_btn"):
+                            st.session_state.closure_confirm_unlock = True
+                            st.rerun()
+
+            with cr_final_cols[2]:
+                if st.button("Prepare .docx for download", key="closure_prepare_docx"):
+                    with st.spinner("Formatting Word document..."):
+                        try:
+                            cr_docx_path = (Path(settings.resolved_output_dir())
+                                            / st.session_state.project_id
+                                            / "closure_report"
+                                            / f"ClosureReport_v{closure_viewing.version}.docx")
+                            generate_closure_report_docx(closure_viewing.content, cr_docx_path)
+                            st.session_state.closure_docx_ready_path = str(cr_docx_path)
+                            st.session_state.closure_docx_ready_version = closure_viewing.version
+                            logger.info(f"Closure report DOCX exported for "
+                                        f"v{closure_viewing.version}")
+                        except Exception as exc:
+                            st.error(friendly_error(exc))
+
+                cr_ready_path = st.session_state.get("closure_docx_ready_path")
+                cr_ready_version = st.session_state.get("closure_docx_ready_version")
+                if (cr_ready_path and Path(cr_ready_path).exists()
+                        and cr_ready_version == closure_viewing.version):
+                    try:
+                        with open(cr_ready_path, "rb") as f:
+                            st.download_button(
+                                f"Download ClosureReport v{closure_viewing.version}.docx",
+                                data=f.read(),
+                                file_name=f"ClosureReport_v{closure_viewing.version}.docx",
+                                mime=("application/vnd.openxmlformats-officedocument"
+                                      ".wordprocessingml.document"),
+                                key="closure_download_btn",
                             )
                     except Exception as exc:
                         st.error(friendly_error(exc))

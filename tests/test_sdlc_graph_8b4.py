@@ -20,6 +20,7 @@ import json
 import pytest
 
 from app.agents.business_analyst.service import BusinessAnalystService
+from app.agents.closure_report.service import ClosureReportService
 from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
@@ -37,6 +38,7 @@ from app.orchestration.status import (
     NEXT_APPROVE_LLD,
     NEXT_APPROVE_TEST_CASES,
     NEXT_GENERATE_BRD,
+    NEXT_GENERATE_CLOSURE_REPORT,
     NEXT_GENERATE_LLD,
     NEXT_GENERATE_TEST_CASES,
     NEXT_NONE,
@@ -45,11 +47,18 @@ from app.orchestration.status import (
 from app.services.version_service import BRDVersion, VersionService
 from tests.conftest import (
     StubBAAgent,
+    StubClosureReportAgent,
     StubLLDAgent,
     StubSAAgent,
     StubTestCaseAgent,
     StubUserStoryAgent,
 )
+
+
+def _stub_closure(pid):
+    """A stub-backed ClosureReportService so 8B-4's post-tc-final runs don't hit
+    the real Closure Report Gemini call added in 8B-7."""
+    return ClosureReportService(project_id=pid, agent=StubClosureReportAgent())
 
 PID = "sdlc8b4"
 
@@ -87,22 +96,28 @@ def _to_final_lld(ba, sa, us, lld, tc, sow_file, sample_metadata):
     lld.choose_final_lld(1)
 
 
-# --- A. exact topology (full end-to-end shape, incl. the QA hop) ---------
+# --- A. topology (QA sub-path intact; exact full shape lives in test_sdlc_graph_8b7.py) ---
 
 def test_topology_is_the_8b4_shape(stub_ba_agent):
+    """The QA hop (8B-4 invariant) must survive later graph extensions.
+
+    Exact end-to-end topology (incl. the 8B-7 Closure Report hop) is asserted in
+    test_sdlc_graph_8b7.py; here we only pin that the BRD -> HLD/US -> LLD -> QA
+    sub-path and its gates are unchanged.
+    """
     ba, sa, us, lld, tc = _svcs(ba_agent=stub_ba_agent)
     g = build_sdlc_graph(
         ba, sa_service=sa, us_service=us, lld_service=lld, tc_service=tc
     ).get_graph()
 
-    assert set(g.nodes) == {
+    assert {
         "__start__", "resolve_state", "ensure_brd", "gate_brd",
         "ensure_hld", "ensure_user_stories", "gate_hld",
         "ensure_lld", "gate_lld",
         "ensure_test_cases", "gate_test_cases", "__end__",
-    }
+    } <= set(g.nodes)
     plain = {(e.source, e.target) for e in g.edges if not e.conditional}
-    assert plain == {
+    assert {
         ("__start__", "resolve_state"),
         ("resolve_state", "ensure_brd"),
         ("ensure_brd", "gate_brd"),
@@ -110,7 +125,7 @@ def test_topology_is_the_8b4_shape(stub_ba_agent):
         ("ensure_user_stories", "gate_hld"),
         ("ensure_lld", "gate_lld"),
         ("ensure_test_cases", "gate_test_cases"),
-    }
+    } <= plain
     cond = {(e.source, e.target) for e in g.edges if e.conditional}
     assert ("gate_brd", "__end__") in cond
     assert ("gate_brd", "ensure_hld") in cond
@@ -118,7 +133,7 @@ def test_topology_is_the_8b4_shape(stub_ba_agent):
     assert ("gate_hld", "ensure_lld") in cond              # complete -> LLD hop
     assert ("gate_lld", "__end__") in cond                 # awaiting_approval -> END
     assert ("gate_lld", "ensure_test_cases") in cond       # complete -> QA hop (8B-4)
-    assert ("gate_test_cases", "__end__") in cond          # both QA-gate routes end 8B-4
+    assert ("gate_test_cases", "__end__") in cond          # QA awaiting_approval -> END
     assert type(
         build_sdlc_graph(ba, sa_service=sa, us_service=us, lld_service=lld, tc_service=tc)
     ).__name__ == "CompiledStateGraph"
@@ -294,6 +309,7 @@ def test_graph_never_finalizes_when_test_cases_already_final(
         ba_agent=stub_ba_agent, sa_agent=stub_sa_agent, us_agent=stub_us_agent,
         lld_agent=stub_lld_agent, tc_agent=stub_tc_agent,
     )
+    closure = _stub_closure(PID)
     _to_final_lld(ba, sa, us, lld, tc, sow_file, sample_metadata)
     _run(PID, ba, sa, us, lld, tc, sow_file, sample_metadata)   # test cases v1
     tc.choose_final(1)                                           # human finalization, before patching
@@ -302,9 +318,15 @@ def test_graph_never_finalizes_when_test_cases_already_final(
     monkeypatch.setattr(VersionService, "mark_final", lambda self, n: calls.append(("mark_final", n)))
     monkeypatch.setattr(VersionService, "unlock_final", lambda self: calls.append("unlock_final"))
 
-    s = _run(PID, ba, sa, us, lld, tc, sow_file, sample_metadata)
-    assert s["status"] == "complete" and s["awaiting"] is None
-    assert s["produced"] == {}
+    # 8B-7: past final test cases the graph advances to the closure-report hop and
+    # stops at the closure approval gate — it still finalizes NOTHING.
+    s = run_step(
+        PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata,
+        ba_service=ba, sa_service=sa, us_service=us, lld_service=lld,
+        tc_service=tc, closure_service=closure,
+    )
+    assert s["status"] == "awaiting_approval" and s["awaiting"] == "closure_final"
+    assert s["produced"] == {"closure": 1}
     assert calls == []
 
 
@@ -324,24 +346,37 @@ def test_final_lld_non_final_tc_awaits_tc_final(
     assert s["awaiting"] == "tc_final"
 
 
-# --- J. final test cases -> complete, no regeneration -----------------------
+# --- J. final test cases + final closure report -> complete, no regeneration ---
 
-def test_final_test_cases_outside_graph_then_run_is_complete(
+def test_final_test_cases_and_closure_outside_graph_then_run_is_complete(
     stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, stub_tc_agent, sow_file, sample_metadata
 ):
     ba, sa, us, lld, tc = _svcs(
         ba_agent=stub_ba_agent, sa_agent=stub_sa_agent, us_agent=stub_us_agent,
         lld_agent=stub_lld_agent, tc_agent=stub_tc_agent,
     )
+    closure = _stub_closure(PID)
     _to_final_lld(ba, sa, us, lld, tc, sow_file, sample_metadata)
     _run(PID, ba, sa, us, lld, tc, sow_file, sample_metadata)  # test cases v1
     tc.choose_final(1)                                          # OUTSIDE the graph
 
-    s = _run(PID, ba, sa, us, lld, tc, sow_file, sample_metadata)
-    assert s["status"] == "complete"
-    assert s["awaiting"] is None
-    assert s["produced"] == {}
+    def _step():
+        return run_step(
+            PID, "ensure_brd", sow_path=str(sow_file), metadata=sample_metadata,
+            ba_service=ba, sa_service=sa, us_service=us, lld_service=lld,
+            tc_service=tc, closure_service=closure,
+        )
+
+    s1 = _step()                       # 8B-7: advances to the closure hop
+    assert s1["produced"] == {"closure": 1} and s1["awaiting"] == "closure_final"
+    closure.choose_final(1)            # OUTSIDE the graph
+
+    s2 = _step()
+    assert s2["status"] == "complete"
+    assert s2["awaiting"] is None
+    assert s2["produced"] == {}
     assert len(stub_tc_agent.generate_calls) == 1
+    assert [v.version for v in closure.get_all_versions()] == [1]  # no regeneration
 
 
 # --- K. persistence parity: graph == direct TestCaseService.generate() ----
@@ -512,7 +547,9 @@ def test_status_test_cases_final(stub_ba_agent, stub_sa_agent, stub_us_agent, st
     st = _status(PID, ba, sa, us, lld, tc)
     assert st["tc_final_version"] == 1
     assert st["awaiting_test_cases_approval"] is False
-    assert st["next_step"] is NEXT_NONE
+    # 8B-7: final test cases are no longer the terminal step — the closure report follows.
+    assert st["next_step"] == NEXT_GENERATE_CLOSURE_REPORT
+    assert NEXT_NONE is None
 
 
 def test_status_lld_not_final_next_step_is_approve_lld(stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, stub_tc_agent, sow_file, sample_metadata):

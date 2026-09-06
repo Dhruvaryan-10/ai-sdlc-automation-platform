@@ -18,7 +18,9 @@ import app.ui.streamlit_app as streamlit_app
 from app.ui.streamlit_app import (
     _awaiting_approval_message,
     _next_step_label,
+    _pipeline_steps,
     _pipeline_summary,
+    _render_step_rail,
     run_pipeline_step,
 )
 
@@ -40,6 +42,8 @@ def _empty_status(**overrides) -> dict:
         "awaiting_lld_approval": False,
         "tc_exists": False, "tc_latest_version": None, "tc_final_version": None,
         "awaiting_test_cases_approval": False,
+        "closure_exists": False, "closure_latest_version": None,
+        "closure_final_version": None, "awaiting_closure_approval": False,
         "next_step": "generate_brd",
     }
     base.update(overrides)
@@ -69,6 +73,8 @@ def test_next_step_label_covers_every_known_value():
         "approve_lld": "Next: Review and approve the LLD in Step 5",
         "generate_test_cases": "Next: Generate Test Cases in Step 7",
         "approve_test_cases": "Next: Review and approve Test Cases in Step 7",
+        "generate_closure_report": "Next: Generate the Closure Report in Step 8",
+        "approve_closure_report": "Next: Review and approve the Closure Report in Step 8",
         None: "SDLC pipeline complete — no further orchestrated action is required.",
     }
     for next_step, label in expected.items():
@@ -87,6 +93,9 @@ def test_awaiting_approval_message_only_set_for_approve_states():
     assert "HLD approval" in _awaiting_approval_message(_empty_status(next_step="approve_hld"))
     assert "LLD approval" in _awaiting_approval_message(_empty_status(next_step="approve_lld"))
     assert "Test Case approval" in _awaiting_approval_message(_empty_status(next_step="approve_test_cases"))
+    assert "Closure Report approval" in _awaiting_approval_message(
+        _empty_status(next_step="approve_closure_report")
+    )
 
 
 # --- C/D/E. _pipeline_summary() for fresh / approval-gate / completed states --
@@ -99,6 +108,7 @@ def test_pipeline_summary_handles_a_fresh_project():
         "User Stories: not generated",
         "LLD: not generated",
         "Test Cases: not generated",
+        "Closure Report: not generated",
     ]
 
 
@@ -125,6 +135,7 @@ def test_pipeline_summary_handles_a_completed_pipeline():
         us_exists=True, us_latest_version=1,
         lld_exists=True, lld_latest_version=1, lld_final_version=1,
         tc_exists=True, tc_latest_version=1, tc_final_version=1,
+        closure_exists=True, closure_latest_version=1, closure_final_version=1,
         next_step=None,
     )
     lines = _pipeline_summary(status)
@@ -134,6 +145,7 @@ def test_pipeline_summary_handles_a_completed_pipeline():
         "User Stories: v1",
         "LLD: v1 (final: v1)",
         "Test Cases: v1 (final: v1)",
+        "Closure Report: v1 (final: v1)",
     ]
     assert _next_step_label(status) == (
         "SDLC pipeline complete — no further orchestrated action is required."
@@ -298,5 +310,87 @@ def test_step6_still_calls_refine_directly_and_panel_never_imports_refine_step()
 # --- pipeline summary is a pure function: no `st.` calls inside it ----------
 
 def test_pure_helpers_contain_no_streamlit_calls():
-    for fn in (_next_step_label, _awaiting_approval_message, _pipeline_summary):
+    for fn in (_next_step_label, _awaiting_approval_message, _pipeline_summary,
+               _pipeline_steps, _render_step_rail):
         assert "st." not in inspect.getsource(fn)
+
+
+# --- SDLC step rail (all 8 steps, state derived from sdlc_status()) ---------
+
+def test_pipeline_steps_returns_all_eight_steps_in_order():
+    steps = _pipeline_steps(_empty_status(next_step="generate_brd"))
+    assert [s["n"] for s in steps] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert [s["name"] for s in steps] == [
+        "SOW → BRD", "BRD Workspace", "HLD Workspace", "User Story Workspace",
+        "LLD Workspace", "Test Case Workspace", "Traceability & Quality",
+        "Closure Report",
+    ]
+
+
+def test_pipeline_steps_fresh_project_marks_step_one_current():
+    steps = _pipeline_steps(_empty_status(next_step="generate_brd"))
+    assert steps[0]["state"] == "current"
+    assert all(s["state"] == "todo" for s in steps[1:])
+
+
+def test_pipeline_steps_derives_done_current_readonly_from_status():
+    # BRD..Test Cases final, User Stories generated, closure drafted + awaiting.
+    status = _empty_status(
+        brd_exists=True, brd_final_version=1,
+        hld_exists=True, hld_final_version=1,
+        us_exists=True, us_latest_version=2,
+        lld_exists=True, lld_final_version=1,
+        tc_exists=True, tc_final_version=2,
+        closure_exists=True, closure_final_version=None,
+        awaiting_closure_approval=True, next_step="approve_closure_report",
+    )
+    states = [s["state"] for s in _pipeline_steps(status)]
+    assert states == ["done", "done", "done", "done", "done", "done",
+                      "readonly", "current"]
+    assert _pipeline_steps(status)[7]["status"] == "Current"
+
+
+def test_pipeline_steps_all_final_marks_every_step_done_or_readonly():
+    status = _empty_status(
+        brd_exists=True, brd_final_version=1,
+        hld_exists=True, hld_final_version=1,
+        us_exists=True, us_latest_version=1,
+        lld_exists=True, lld_final_version=1,
+        tc_exists=True, tc_final_version=1,
+        closure_exists=True, closure_final_version=1,
+        next_step=None,
+    )
+    states = [s["state"] for s in _pipeline_steps(status)]
+    assert states == ["done"] * 6 + ["readonly", "done"]
+
+
+def test_pipeline_steps_step_seven_is_todo_before_any_brd():
+    assert _pipeline_steps(_empty_status(next_step="generate_brd"))[6]["state"] == "todo"
+
+
+def test_render_step_rail_is_scoped_html_with_all_eight_steps():
+    html = _render_step_rail(_empty_status(next_step="generate_brd"))
+    assert html.startswith('<div class="sdlc-steprail-wrap">')
+    assert 'class="sdlc-steprail"' in html
+    assert html.count('class="sdlc-step ') == 8            # one card per step
+    for _n, name in streamlit_app._RAIL_STEPS:
+        assert name in html
+    assert "<script" not in html.lower()
+
+
+def test_step_rail_css_is_fully_scoped_and_has_no_script():
+    css = streamlit_app._STEP_RAIL_CSS
+    assert "<script" not in css.lower()
+    for line in css.splitlines():
+        line = line.strip()
+        if line.endswith("{"):
+            assert "sdlc-steprail-wrap" in line, f"unscoped CSS rule: {line}"
+
+
+def test_pipeline_panel_renders_the_step_rail_not_the_old_caption_columns():
+    start = _SOURCE_TEXT.index("# --- SDLC Pipeline panel (Phase 8B-6)")
+    end = _SOURCE_TEXT.index("st.divider()", start)
+    panel_block = _SOURCE_TEXT[start:end]
+    assert "_render_step_rail(pipeline_status)" in panel_block
+    assert "_STEP_RAIL_CSS" in panel_block
+    assert "st.columns(5)" not in panel_block  # old truncating caption row is gone

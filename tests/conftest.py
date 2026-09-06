@@ -255,6 +255,53 @@ class StubUserStoryRefinementAgent:
         return current_stories.rstrip() + f"\n\n{STUB_REFINEMENT_MARKER}\n"
 
 
+# Canned narrative the stub Closure Report agent returns (the real contract is a
+# JSON string of the six ClosureNarrative fields - prose only, no facts).
+STUB_CLOSURE_NARRATIVE = {
+    "executive_summary": (
+        "The project artifacts were reviewed for closure readiness based on the "
+        "evidence available to the platform. The SDLC produced a BRD, HLD, user "
+        "stories, LLD and test cases. The platform has assigned the closure "
+        "status recorded in this report."
+    ),
+    "scope_summary": (
+        "The scope, as reflected in the accepted BRD, covers the system described "
+        "in the project artifacts."
+    ),
+    "findings_summary": (
+        "Traceability and quality findings were taken directly from the project "
+        "Traceability and Quality reports; no figures were recomputed."
+    ),
+    "outstanding_items_summary": (
+        "Any blockers and outstanding items listed in this report are drawn from "
+        "objective project evidence and should be resolved before closure."
+    ),
+    "closure_summary": (
+        "This assessment reflects the artifacts currently available to the "
+        "platform and the deterministic closure status assigned to them."
+    ),
+    "limitations": (
+        "This report is limited to the SDLC artifacts available to the platform "
+        "and does not verify runtime behaviour; a human reviewer should confirm it."
+    ),
+}
+
+
+class StubClosureReportAgent:
+    """Stands in for ClosureReportAgent. Returns canned narrative JSON.
+
+    The real agent returns a JSON string of the six ClosureNarrative prose
+    fields; it never produces facts, counts, versions, or the closure status.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def synthesize_narrative(self, evidence_json: str, closure_status: str, metadata):
+        self.calls.append((evidence_json, closure_status, metadata))
+        return json.dumps(STUB_CLOSURE_NARRATIVE)
+
+
 class StubTestCaseAgent:
     """Stands in for TestCaseAgent. Returns canned JSON (the real contract is JSON-only).
 
@@ -327,6 +374,11 @@ def stub_usr_agent():
 @pytest.fixture
 def stub_tc_agent():
     return StubTestCaseAgent()
+
+
+@pytest.fixture
+def stub_closure_agent():
+    return StubClosureReportAgent()
 
 
 @pytest.fixture

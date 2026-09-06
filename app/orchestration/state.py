@@ -50,7 +50,11 @@ class SDLCState(TypedDict, total=False):
     tc_latest_version: int | None
     tc_final_version: int | None
 
+    # --- Closure Report pointers (8B-7; populated by `resolve_state` / `ensure_closure_report`) ---
+    closure_latest_version: int | None
+    closure_final_version: int | None
+
     # --- results of THIS invocation ---
-    produced: dict[str, int]        # {"brd": 1, "hld": 1, "us": 1, "lld": 1, "tc": 1} — artifacts created this run
+    produced: dict[str, int]        # {"brd": 1, "hld": 1, "us": 1, "lld": 1, "tc": 1, "closure": 1} — artifacts created this run
     status: str                     # "awaiting_approval" | "complete"
-    awaiting: str | None            # blocking gate id, e.g. "brd_final" / "hld_final" / "lld_final" / "tc_final", or None
+    awaiting: str | None            # blocking gate id, e.g. "brd_final" / "hld_final" / "lld_final" / "tc_final" / "closure_final", or None

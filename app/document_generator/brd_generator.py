@@ -199,3 +199,15 @@ def generate_test_cases_docx(test_cases_markdown: str, output_path: str | Path) 
     point for call-site clarity.
     """
     return generate_brd_docx(test_cases_markdown, output_path)
+
+
+def generate_closure_report_docx(closure_report_markdown: str, output_path: str | Path) -> Path:
+    """Convert a markdown-flavored Project Closure Report into a formatted .docx file.
+
+    The Closure Report Service renders a Markdown document that follows the same
+    conventions as the other artifacts (# / ## / ### headings, **Key:** metadata
+    lines incl. **Version:** / **Source:** / **Built From:** / **Closure
+    Status:**, - bullet lists, | pipe tables for the artifact summary), so this
+    reuses the BRD converter. Separate named entry point for call-site clarity.
+    """
+    return generate_brd_docx(closure_report_markdown, output_path)

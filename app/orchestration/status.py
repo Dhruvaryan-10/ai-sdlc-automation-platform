@@ -1,15 +1,17 @@
 """
 `sdlc_status(project_id)` — a PURE read-only snapshot of the SDLC pipeline.
 
-Phase 8B-4: the BRD hop, the HLD + Initial-User-Story hop, the LLD hop, and the
-QA/Test-Case hop are modelled. This function never writes, never generates,
-never finalizes, and never invokes the graph. It exists so the UI / callers can
-decide what the next runnable step is without side effects.
+Phase 8B-7: the BRD hop, the HLD + Initial-User-Story hop, the LLD hop, the
+QA/Test-Case hop, and the Closure Report hop are modelled. This function never
+writes, never generates, never finalizes, and never invokes the graph. It exists
+so the UI / callers can decide what the next runnable step is without side
+effects.
 """
 
 from __future__ import annotations
 
 from app.agents.business_analyst.service import BusinessAnalystService
+from app.agents.closure_report.service import ClosureReportService
 from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
@@ -24,7 +26,9 @@ NEXT_GENERATE_LLD = "generate_lld"                 # final HLD, but no LLD versi
 NEXT_APPROVE_LLD = "approve_lld"                   # an LLD exists but none is final
 NEXT_GENERATE_TEST_CASES = "generate_test_cases"   # final LLD, but no test-case version yet
 NEXT_APPROVE_TEST_CASES = "approve_test_cases"     # test cases exist but none is final
-NEXT_NONE = None                                   # test cases are final; no further graph steps
+NEXT_GENERATE_CLOSURE_REPORT = "generate_closure_report"  # final test cases, but no closure report yet
+NEXT_APPROVE_CLOSURE_REPORT = "approve_closure_report"    # a closure report exists but none is final
+NEXT_NONE = None                                   # closure report is final; no further graph steps
 
 
 def sdlc_status(
@@ -35,15 +39,16 @@ def sdlc_status(
     us_service: InitialUserStoryService | None = None,
     lld_service: LowLevelDesignService | None = None,
     tc_service: TestCaseService | None = None,
+    closure_service: ClosureReportService | None = None,
 ) -> dict:
-    """Return a plain dict describing BRD / HLD / User-Story / LLD / Test-Case
-    state and the next runnable step.
+    """Return a plain dict describing BRD / HLD / User-Story / LLD / Test-Case /
+    Closure-Report state and the next runnable step.
 
     `*_service` are optional injection points for deterministic tests; when
     omitted, real services are constructed for `project_id` (sharing one
     `BusinessAnalystService` / `SolutionArchitectService` as their upstream
-    source; `TestCaseService` takes no such upstream dependency — see
-    `app/agents/test_case/service.py`). All getters used here are read-only and
+    source; `TestCaseService` / `ClosureReportService` take no such upstream
+    dependency — see their `__init__`). All getters used here are read-only and
     make no Gemini call.
     """
     ba = ba_service or BusinessAnalystService(project_id=project_id)
@@ -53,6 +58,7 @@ def sdlc_status(
         project_id=project_id, sa_service=sa, ba_service=ba
     )
     tc = tc_service or TestCaseService(project_id=project_id)
+    closure = closure_service or ClosureReportService(project_id=project_id)
 
     brd_versions = ba.get_all_versions()
     brd_final = ba.get_final_brd()
@@ -63,6 +69,8 @@ def sdlc_status(
     lld_final = lld.get_final_lld()
     tc_versions = tc.get_all_versions()
     tc_final = tc.get_final()
+    closure_versions = closure.get_all_versions()
+    closure_final = closure.get_final()
 
     brd_latest_version = brd_versions[-1].version if brd_versions else None
     brd_final_version = brd_final.version if brd_final else None
@@ -73,12 +81,15 @@ def sdlc_status(
     lld_final_version = lld_final.version if lld_final else None
     tc_latest_version = tc_versions[-1].version if tc_versions else None
     tc_final_version = tc_final.version if tc_final else None
+    closure_latest_version = closure_versions[-1].version if closure_versions else None
+    closure_final_version = closure_final.version if closure_final else None
 
     brd_exists = brd_latest_version is not None
     hld_exists = hld_latest_version is not None
     us_exists = us_latest_version is not None
     lld_exists = lld_latest_version is not None
     tc_exists = tc_latest_version is not None
+    closure_exists = closure_latest_version is not None
     awaiting_brd_approval = brd_exists and brd_final_version is None
     awaiting_hld_approval = (
         brd_final_version is not None and hld_exists and hld_final_version is None
@@ -88,6 +99,9 @@ def sdlc_status(
     )
     awaiting_test_cases_approval = (
         lld_final_version is not None and tc_exists and tc_final_version is None
+    )
+    awaiting_closure_approval = (
+        tc_final_version is not None and closure_exists and closure_final_version is None
     )
 
     if not brd_exists:
@@ -106,6 +120,10 @@ def sdlc_status(
         next_step = NEXT_GENERATE_TEST_CASES
     elif tc_final_version is None:
         next_step = NEXT_APPROVE_TEST_CASES
+    elif not closure_exists:
+        next_step = NEXT_GENERATE_CLOSURE_REPORT
+    elif closure_final_version is None:
+        next_step = NEXT_APPROVE_CLOSURE_REPORT
     else:
         next_step = NEXT_NONE
 
@@ -129,5 +147,9 @@ def sdlc_status(
         "tc_latest_version": tc_latest_version,
         "tc_final_version": tc_final_version,
         "awaiting_test_cases_approval": awaiting_test_cases_approval,
+        "closure_exists": closure_exists,
+        "closure_latest_version": closure_latest_version,
+        "closure_final_version": closure_final_version,
+        "awaiting_closure_approval": awaiting_closure_approval,
         "next_step": next_step,
     }

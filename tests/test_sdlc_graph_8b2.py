@@ -141,6 +141,7 @@ def test_resolve_state_reads_brd_hld_us_pointers(stub_ba_agent, stub_sa_agent, s
         "us_latest_version": 1,
         "lld_latest_version": None, "lld_final_version": None,
         "tc_latest_version": None, "tc_final_version": None,
+        "closure_latest_version": None, "closure_final_version": None,
     }
 
 
@@ -402,6 +403,8 @@ def test_status_empty_project(stub_ba_agent, stub_sa_agent, stub_us_agent):
         "awaiting_lld_approval": False,
         "tc_exists": False, "tc_latest_version": None, "tc_final_version": None,
         "awaiting_test_cases_approval": False,
+        "closure_exists": False, "closure_latest_version": None,
+        "closure_final_version": None, "awaiting_closure_approval": False,
         "next_step": NEXT_GENERATE_BRD,
     }
 

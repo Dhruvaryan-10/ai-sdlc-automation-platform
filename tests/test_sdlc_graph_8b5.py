@@ -332,11 +332,14 @@ def test_build_sdlc_graph_topology_is_unchanged_by_8b5(stub_ba_agent):
     ba = BusinessAnalystService(project_id=PID, agent=stub_ba_agent)
     g = build_sdlc_graph(ba).get_graph()
 
-    assert set(g.nodes) == {
+    # The 8B-5 invariant: user-story refinement added NO graph node. Later phases
+    # (8B-7 Closure Report) do add nodes; the exact full shape lives in
+    # test_sdlc_graph_8b7.py.
+    assert {
         "__start__", "resolve_state", "ensure_brd", "gate_brd",
         "ensure_hld", "ensure_user_stories", "gate_hld",
         "ensure_lld", "gate_lld",
         "ensure_test_cases", "gate_test_cases", "__end__",
-    }
+    } <= set(g.nodes)
     # No refinement-related node was added to the compiled graph.
     assert not any("refine" in n for n in g.nodes)

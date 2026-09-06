@@ -94,6 +94,7 @@ def test_sdlc_state_fields():
         "hld_latest_version", "hld_final_version", "us_latest_version",  # 8B-2
         "lld_latest_version", "lld_final_version",                       # 8B-3
         "tc_latest_version", "tc_final_version",                        # 8B-4
+        "closure_latest_version", "closure_final_version",             # 8B-7
         "produced", "status", "awaiting",
     }
 
@@ -119,6 +120,7 @@ def test_resolve_state_empty_project(stub_ba_agent):
         "hld_latest_version": None, "hld_final_version": None, "us_latest_version": None,
         "lld_latest_version": None, "lld_final_version": None,
         "tc_latest_version": None, "tc_final_version": None,
+        "closure_latest_version": None, "closure_final_version": None,
     }
 
 
@@ -370,6 +372,10 @@ def test_sdlc_status_empty_project(stub_ba_agent):
         "tc_latest_version": None,
         "tc_final_version": None,
         "awaiting_test_cases_approval": False,
+        "closure_exists": False,
+        "closure_latest_version": None,
+        "closure_final_version": None,
+        "awaiting_closure_approval": False,
         "next_step": NEXT_GENERATE_BRD,
     }
 

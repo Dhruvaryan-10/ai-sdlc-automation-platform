@@ -1,5 +1,5 @@
 """
-Full-SDLC LangGraph — Phase 8B-5.
+Full-SDLC LangGraph — Phase 8B-7 (adds the Closure Report hop + approval gate).
 
     START
       -> resolve_state
@@ -16,7 +16,19 @@ Full-SDLC LangGraph — Phase 8B-5.
                                                                              '-- complete          --> ensure_test_cases
                                                                                                           -> gate_test_cases
                                                                                                                |-- awaiting_approval --> END  (awaiting = "tc_final")
-                                                                                                               '-- complete          --> END
+                                                                                                               '-- complete          --> ensure_closure_report
+                                                                                                                                            -> gate_closure_report
+                                                                                                                                                 |-- awaiting_approval --> END  (awaiting = "closure_final")
+                                                                                                                                                 '-- complete          --> END
+
+The Closure Report hop (8B-7) delegates DIRECTLY to `ClosureReportService.generate()`
+— the same public method the UI calls. That service consumes the existing
+Traceability and Project Quality reports (read-only `app.quality.*`) plus the
+persisted artifacts; those reports are NOT graph nodes (they are pure functions,
+not generators with an approval lifecycle). The graph never finalizes the closure
+report — `gate_closure_report` only reports whether a human has approved one, and
+the run stops there until they do. Re-invoking `run_step` after a closure report
+already exists regenerates nothing (the `closure_latest_version` guard).
 
 The HLD, Initial-User-Story, LLD and QA/Test-Case hops run *sequentially* (not a
 true parallel fan-out): LangGraph 1.2.11 raises InvalidUpdateError if two
@@ -55,6 +67,7 @@ from typing import TYPE_CHECKING, Any
 from langgraph.graph import END, START, StateGraph
 
 from app.agents.business_analyst.service import BusinessAnalystService
+from app.agents.closure_report.service import ClosureReportService
 from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
@@ -75,6 +88,7 @@ _AWAITING_BRD_FINAL = "brd_final"
 _AWAITING_HLD_FINAL = "hld_final"
 _AWAITING_LLD_FINAL = "lld_final"
 _AWAITING_TC_FINAL = "tc_final"
+_AWAITING_CLOSURE_FINAL = "closure_final"
 _REQUEST_ENSURE_BRD = "ensure_brd"
 
 
@@ -86,14 +100,16 @@ def _make_resolve_state_node(
     us_service: "InitialUserStoryService | None" = None,
     lld_service: "LowLevelDesignService | None" = None,
     tc_service: "TestCaseService | None" = None,
+    closure_service: "ClosureReportService | None" = None,
 ):
-    """START -> resolve_state: read-only; derive BRD/HLD/US/LLD/TC pointers from persistence.
+    """START -> resolve_state: read-only; derive BRD/HLD/US/LLD/TC/Closure pointers.
 
     `sa_service` / `us_service` / `lld_service` default to real services for the
     same project, wired to the SAME `ba_service` (and `sa_service`) — so
     `_make_resolve_state_node(ba_service)` works standalone in tests.
-    `tc_service` defaults to a plain `TestCaseService(project_id=...)` — it takes
-    no other service as a constructor dependency (see `TestCaseService.__init__`).
+    `tc_service` / `closure_service` default to plain
+    `TestCaseService(project_id=...)` / `ClosureReportService(project_id=...)` —
+    neither takes another service as a constructor dependency.
     """
     sa_service = sa_service or SolutionArchitectService(
         project_id=ba_service.project_id, ba_service=ba_service
@@ -105,6 +121,9 @@ def _make_resolve_state_node(
         project_id=ba_service.project_id, sa_service=sa_service, ba_service=ba_service
     )
     tc_service = tc_service or TestCaseService(project_id=ba_service.project_id)
+    closure_service = closure_service or ClosureReportService(
+        project_id=ba_service.project_id
+    )
 
     def resolve_state(state: SDLCState) -> dict[str, Any]:
         brd_versions = ba_service.get_all_versions()
@@ -116,6 +135,8 @@ def _make_resolve_state_node(
         lld_final = lld_service.get_final_lld()
         tc_versions = tc_service.get_all_versions()
         tc_final = tc_service.get_final()
+        closure_versions = closure_service.get_all_versions()
+        closure_final = closure_service.get_final()
         return {
             "brd_latest_version": brd_versions[-1].version if brd_versions else None,
             "brd_final_version": brd_final.version if brd_final else None,
@@ -126,6 +147,10 @@ def _make_resolve_state_node(
             "lld_final_version": lld_final.version if lld_final else None,
             "tc_latest_version": tc_versions[-1].version if tc_versions else None,
             "tc_final_version": tc_final.version if tc_final else None,
+            "closure_latest_version": (
+                closure_versions[-1].version if closure_versions else None
+            ),
+            "closure_final_version": closure_final.version if closure_final else None,
         }
 
     return resolve_state
@@ -302,8 +327,52 @@ def _gate_test_cases_node(state: SDLCState) -> dict[str, Any]:
 
 
 def _route_after_gate_test_cases(state: SDLCState) -> str:
-    """Conditional edge out of gate_test_cases. Both routes end the run — test
-    cases are the last artifact in the current pipeline."""
+    """Conditional edge out of gate_test_cases:
+    awaiting_approval -> END; complete -> the Closure Report hop (ensure_closure_report)."""
+    return state.get("status", _STATUS_AWAITING_APPROVAL)
+
+
+def _make_ensure_closure_report_node(closure_service: "ClosureReportService"):
+    """gate_test_cases(complete) -> ensure_closure_report: generate the closure
+    report only when none exists yet.
+
+    Reached only after a final (approved) test-case version exists
+    (gate_test_cases routes here) — so `ClosureReportService`'s own hard
+    prerequisite (a final BRD) is always already satisfied and its
+    `NoFinalBRDError` cannot fire on this path. Delegates to the EXISTING
+    `ClosureReportService.generate()` — the same public method the UI calls.
+    Never finalizes. `generate()` is NOT itself idempotent, so the
+    `closure_latest_version` guard here is required (same shape as
+    `_make_ensure_test_cases_node`).
+    """
+
+    def ensure_closure_report(state: SDLCState) -> dict[str, Any]:
+        if state.get("closure_latest_version") is not None:
+            return {}  # a closure-report version already exists -> do nothing
+
+        version = closure_service.generate()
+        produced = dict(state.get("produced") or {})
+        produced["closure"] = version.version
+        return {"produced": produced, "closure_latest_version": version.version}
+
+    return ensure_closure_report
+
+
+def _gate_closure_report_node(state: SDLCState) -> dict[str, Any]:
+    """ensure_closure_report -> gate_closure_report: read-only. Reports whether a
+    final (approved) closure-report version exists.
+
+    MUST NOT call choose_final / mark_final / unlock_final / touch persistence.
+    """
+    if state.get("closure_final_version") is None:
+        return {"status": _STATUS_AWAITING_APPROVAL, "awaiting": _AWAITING_CLOSURE_FINAL}
+    return {"status": _STATUS_COMPLETE, "awaiting": None}
+
+
+def _route_after_gate_closure_report(state: SDLCState) -> str:
+    """Conditional edge out of gate_closure_report. Both routes end the run — the
+    closure report is the last artifact in the pipeline, and the graph never
+    finalizes it (closure approval stays a human action)."""
     return state.get("status", _STATUS_AWAITING_APPROVAL)
 
 
@@ -316,17 +385,18 @@ def build_sdlc_graph(
     us_service: "InitialUserStoryService | None" = None,
     lld_service: "LowLevelDesignService | None" = None,
     tc_service: "TestCaseService | None" = None,
+    closure_service: "ClosureReportService | None" = None,
 ):
-    """Compile the 8B-4 SDLC graph.
+    """Compile the full SDLC graph (8B-7: BRD -> HLD/US -> LLD -> Test Cases -> Closure Report).
 
-    `sa_service` / `us_service` / `lld_service` / `tc_service` are optional
-    injection points (mirrors `ba_service` on `run_step`). When omitted they are
-    constructed for the same project; `sa`/`us`/`lld` are wired to the SAME
-    `ba_service` (and `sa_service`) instances so every hop shares one BRD/HLD
-    source. `TestCaseService` takes no other service as a constructor dependency
-    (it reads BRD/HLD/LLD/User-Story context via its own `VersionService`
-    instances — see `app/agents/test_case/service.py`), so `tc` is constructed
-    from `project_id` alone. Cheap to build; not cached.
+    `sa_service` / `us_service` / `lld_service` / `tc_service` / `closure_service`
+    are optional injection points (mirrors `ba_service` on `run_step`). When
+    omitted they are constructed for the same project; `sa`/`us`/`lld` are wired
+    to the SAME `ba_service` (and `sa_service`) instances so every hop shares one
+    BRD/HLD source. `TestCaseService` and `ClosureReportService` take no other
+    service as a constructor dependency (each reads the other streams via its own
+    `VersionService` / `app.quality.*`), so `tc` / `closure` are constructed from
+    `project_id` alone. Cheap to build; not cached.
     """
     sa = sa_service or SolutionArchitectService(
         project_id=ba_service.project_id, ba_service=ba_service
@@ -338,9 +408,13 @@ def build_sdlc_graph(
         project_id=ba_service.project_id, sa_service=sa, ba_service=ba_service
     )
     tc = tc_service or TestCaseService(project_id=ba_service.project_id)
+    closure = closure_service or ClosureReportService(project_id=ba_service.project_id)
 
     graph = StateGraph(SDLCState)
-    graph.add_node("resolve_state", _make_resolve_state_node(ba_service, sa, us, lld, tc))
+    graph.add_node(
+        "resolve_state",
+        _make_resolve_state_node(ba_service, sa, us, lld, tc, closure),
+    )
     graph.add_node("ensure_brd", _make_ensure_brd_node(ba_service))
     graph.add_node("gate_brd", _gate_brd_node)
     graph.add_node("ensure_hld", _make_ensure_hld_node(sa))
@@ -350,6 +424,8 @@ def build_sdlc_graph(
     graph.add_node("gate_lld", _gate_lld_node)
     graph.add_node("ensure_test_cases", _make_ensure_test_cases_node(tc))
     graph.add_node("gate_test_cases", _gate_test_cases_node)
+    graph.add_node("ensure_closure_report", _make_ensure_closure_report_node(closure))
+    graph.add_node("gate_closure_report", _gate_closure_report_node)
 
     graph.add_edge(START, "resolve_state")
     graph.add_edge("resolve_state", "ensure_brd")
@@ -376,6 +452,12 @@ def build_sdlc_graph(
     graph.add_conditional_edges(
         "gate_test_cases",
         _route_after_gate_test_cases,
+        {_STATUS_AWAITING_APPROVAL: END, _STATUS_COMPLETE: "ensure_closure_report"},
+    )
+    graph.add_edge("ensure_closure_report", "gate_closure_report")
+    graph.add_conditional_edges(
+        "gate_closure_report",
+        _route_after_gate_closure_report,
         {_STATUS_AWAITING_APPROVAL: END, _STATUS_COMPLETE: END},
     )
     return graph.compile()
@@ -392,13 +474,14 @@ def run_step(
     us_service: "InitialUserStoryService | None" = None,
     lld_service: "LowLevelDesignService | None" = None,
     tc_service: "TestCaseService | None" = None,
+    closure_service: "ClosureReportService | None" = None,
 ) -> SDLCState:
     """Build the SDLC graph and run a single step. Returns the final SDLCState.
 
-    `ba_service` / `sa_service` / `us_service` / `lld_service` / `tc_service` are
-    optional injection points (mirrors the Phase 8A pattern of passing the
-    service explicitly); when omitted, real services are constructed for
-    `project_id`, sharing one `BusinessAnalystService` (and
+    `ba_service` / `sa_service` / `us_service` / `lld_service` / `tc_service` /
+    `closure_service` are optional injection points (mirrors the Phase 8A pattern
+    of passing the service explicitly); when omitted, real services are
+    constructed for `project_id`, sharing one `BusinessAnalystService` (and
     `SolutionArchitectService`) as their upstream source.
     """
     service = ba_service or BusinessAnalystService(project_id=project_id)
@@ -408,6 +491,7 @@ def run_step(
         us_service=us_service,
         lld_service=lld_service,
         tc_service=tc_service,
+        closure_service=closure_service,
     )
 
     initial: SDLCState = {
