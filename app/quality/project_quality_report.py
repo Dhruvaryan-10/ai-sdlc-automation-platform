@@ -231,6 +231,7 @@ def build_project_quality_report_for_project(
     us_service: "InitialUserStoryService | None" = None,
     lld_service: "LowLevelDesignService | None" = None,
     tc_service: "TestCaseService | None" = None,
+    traceability_report: dict | None = None,
 ) -> dict:
     """Build the Project Quality Report for a real, persisted project.
 
@@ -246,6 +247,15 @@ def build_project_quality_report_for_project(
     `project_id`, sharing one `BusinessAnalystService` (and
     `SolutionArchitectService`) as their upstream source, exactly like every
     other Phase 9A/9A-2 entry point.
+
+    `traceability_report` (Phase 11A): a caller that has ALREADY built the
+    Phase 9A traceability report for the same project + same version state may
+    pass it here to skip recomputing it. When omitted, it is computed
+    internally exactly as before. Report values are identical either way -
+    only `ungrounded_references` is consumed from it, and that value is a pure
+    function of the same persisted artifacts. See
+    `build_project_reports_for_project()` for the combined single-pass entry
+    point.
 
     The quality report consumes whatever is ALREADY persisted - it never
     generates a missing artifact.
@@ -289,13 +299,68 @@ def build_project_quality_report_for_project(
     # ungrounded_references - never re-implementing `is_reference_grounded()`
     # / `TestCaseService._reference_is_grounded()` here. Passing the SAME
     # already-constructed services avoids building a second, redundant set of
-    # (never-invoked) Gemini-backed agents.
-    traceability_report = build_project_traceability_report(
-        project_id,
-        ba_service=ba, sa_service=sa, us_service=us, lld_service=lld, tc_service=tc,
-    )
+    # (never-invoked) Gemini-backed agents. Phase 11A: a caller that already
+    # has this report for the same version state can hand it in and skip the
+    # recompute entirely.
+    trace_report = traceability_report
+    if trace_report is None:
+        trace_report = build_project_traceability_report(
+            project_id,
+            ba_service=ba, sa_service=sa, us_service=us, lld_service=lld, tc_service=tc,
+        )
 
     return build_project_quality_report(
         requirements, stories, test_cases, artifact_status,
-        ungrounded_references=traceability_report["ungrounded_references"],
+        ungrounded_references=trace_report["ungrounded_references"],
     )
+
+
+def build_project_reports_for_project(
+    project_id: str,
+    *,
+    ba_service: "BusinessAnalystService | None" = None,
+    sa_service: "SolutionArchitectService | None" = None,
+    us_service: "InitialUserStoryService | None" = None,
+    lld_service: "LowLevelDesignService | None" = None,
+    tc_service: "TestCaseService | None" = None,
+) -> dict:
+    """Build BOTH the Phase 9A traceability report and the Project Quality
+    Report in ONE pass, over ONE shared set of services and ONE traceability
+    computation.
+
+    Returns ``{"traceability": <build_project_traceability_report(...)>,
+              "quality": <build_project_quality_report_for_project(...)>}``.
+
+    Semantics and every reported value are byte-for-byte identical to calling
+    the two builders separately - the quality builder already consumed the
+    traceability report's ``ungrounded_references`` internally; this just stops
+    the traceability matrix + extraction from being computed a second time (and,
+    when no services are injected, stops a second/third set of never-invoked
+    Gemini agents from being constructed).
+
+    Read-only. Never generates / refines / finalizes / persists / calls Gemini.
+    `*_service` are the same optional injection points the two underlying
+    builders accept.
+    """
+    from app.agents.business_analyst.service import BusinessAnalystService
+    from app.agents.initial_user_story.service import InitialUserStoryService
+    from app.agents.low_level_design.service import LowLevelDesignService
+    from app.agents.solution_architect.service import SolutionArchitectService
+    from app.agents.test_case.service import TestCaseService
+
+    ba = ba_service or BusinessAnalystService(project_id=project_id)
+    sa = sa_service or SolutionArchitectService(project_id=project_id, ba_service=ba)
+    us = us_service or InitialUserStoryService(project_id=project_id, ba_service=ba)
+    lld = lld_service or LowLevelDesignService(project_id=project_id, sa_service=sa, ba_service=ba)
+    tc = tc_service or TestCaseService(project_id=project_id)
+
+    traceability = build_project_traceability_report(
+        project_id,
+        ba_service=ba, sa_service=sa, us_service=us, lld_service=lld, tc_service=tc,
+    )
+    quality = build_project_quality_report_for_project(
+        project_id,
+        ba_service=ba, sa_service=sa, us_service=us, lld_service=lld, tc_service=tc,
+        traceability_report=traceability,
+    )
+    return {"traceability": traceability, "quality": quality}

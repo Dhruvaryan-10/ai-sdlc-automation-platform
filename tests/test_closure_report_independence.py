@@ -70,8 +70,16 @@ def test_closure_report_package_imports_no_other_agent_implementation():
 
 def test_closure_report_reads_evidence_only_through_quality_layer():
     service_mods = _imported_modules(_PKG / "service.py")
+    # Phase 11A: closure now assembles its evidence via the SINGLE combined
+    # entry point `build_project_reports_for_project` (from
+    # app.quality.project_quality_report), which internally composes the
+    # traceability report. It no longer imports app.quality.traceability
+    # directly - the coupling to the quality layer is narrower, not wider.
     assert "app.quality.project_quality_report" in service_mods
-    assert "app.quality.traceability" in service_mods
+    assert "app.quality.traceability" not in service_mods
+    # still reads EVERYTHING through app.quality.* - no re-implementation
+    quality_mods = [m for m in service_mods if m.startswith("app.quality")]
+    assert quality_mods == ["app.quality.project_quality_report"]
     # never constructs the upstream agent services itself
     assert not any(m.startswith(_FORBIDDEN_MODULE_PREFIXES) for m in service_mods)
 

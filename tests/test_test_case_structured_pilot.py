@@ -73,14 +73,21 @@ def test_invoke_structured_rejects_empty_test_cases():
 def test_testcaseagent_defaults_to_structured_true():
     agent = TestCaseAgent()
     assert agent._structured is True
-    assert agent._structured_llm is not None
+    # Phase 11A: the base client AND the structured wrapper are built lazily on
+    # first use — constructing the agent must not build a Gemini client.
+    assert agent._llm is None
+    assert agent._structured_llm is None
+    # ...but the wrapper does build on demand and is a real, non-None object.
+    assert agent._ensure_structured_llm() is not None
 
 
 def test_testcaseservice_builds_a_structured_agent_by_default():
     svc = TestCaseService(project_id=PID)
     assert isinstance(svc._agent, TestCaseAgent)
     assert svc._agent._structured is True
-    assert svc._agent._structured_llm is not None
+    # Phase 11A: lazy — nothing is constructed until the first generate/refine.
+    assert svc._agent._structured_llm is None
+    assert svc._agent._ensure_structured_llm() is not None
 
 
 # --- R6.6: non-ASCII survives the structured -> JSON string hop ------------

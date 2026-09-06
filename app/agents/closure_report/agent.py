@@ -26,13 +26,12 @@ import random
 import time
 from pathlib import Path
 
-from langchain_google_genai import ChatGoogleGenerativeAI
 from pydantic import ValidationError
 
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.business_analyst.prompt_manager import PromptManager
 from app.agents.closure_report.schema import ClosureNarrative
-from app.utils.config import settings
+from app.utils.llm import build_chat_llm
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -59,6 +58,13 @@ _TRANSIENT_MARKERS = (
     "temporarily", "deadline exceeded", "timed out", "timeout",
     "rate limit", "ratelimit", "resource exhausted",
     "resource has been exhausted", "service unavailable", "internal error",
+    # Phase 11A — transient transport-level failures observed in the Phase 11
+    # benchmark (a mid-response server disconnect during closure narrative
+    # synthesis aborted the whole pipeline because it was NOT retryable).
+    "remoteprotocolerror", "remote protocol", "server disconnected",
+    "connection reset", "connectionreseterror",
+    "connection aborted", "connectionabortederror",
+    "incomplete read", "incompleteread",
 )
 
 
@@ -107,19 +113,36 @@ class ClosureReportAgent:
         structured: bool = True,
     ):
         self._prompt_manager = prompt_manager or PromptManager(prompts_dir=_PROMPTS_DIR)
-        self._llm = ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            temperature=settings.gemini_temperature,
-            google_api_key=settings.google_api_key,
-        )
         # Structured output is the default path: Gemini is asked (via LangChain)
         # to return a value conforming to ClosureNarrative, so schema violations
         # are rejected at the LLM boundary. `structured=False` falls back to the
         # free-form `_invoke()` string path unchanged.
         self._structured = structured
-        self._structured_llm = (
-            self._llm.with_structured_output(ClosureNarrative) if structured else None
-        )
+        # Phase 11A: base client AND structured wrapper are built lazily on the
+        # first real synthesize call — see `app/utils/llm.py`. A test may inject
+        # a fake by assigning `agent._structured_llm` (or `agent._llm`) first.
+        self._llm = None
+        self._structured_llm = None
+
+    def _ensure_llm(self):
+        """Build the base Gemini client on first use, then reuse it."""
+        if self._llm is None:
+            self._llm = build_chat_llm()
+        return self._llm
+
+    def _ensure_structured_llm(self):
+        """The structured-output wrapper, or None when `structured=False`.
+
+        Built lazily; a pre-assigned `self._structured_llm` (tests inject one)
+        is used as-is.
+        """
+        if not self._structured:
+            return None
+        if self._structured_llm is None:
+            self._structured_llm = self._ensure_llm().with_structured_output(
+                ClosureNarrative
+            )
+        return self._structured_llm
 
     @staticmethod
     def _extract_text(content) -> str:
@@ -152,7 +175,7 @@ class ClosureReportAgent:
 
     def _invoke(self, prompt: str) -> str:
         try:
-            response = self._llm.invoke(prompt)
+            response = self._ensure_llm().invoke(prompt)
         except Exception as exc:
             logger.error(f"Gemini API call failed: {exc}")
             raise ClosureReportAgentError(f"Gemini API call failed: {exc}") from exc
@@ -175,10 +198,11 @@ class ClosureReportAgent:
         retried. On final failure - and for the post-response checks below (no
         result) - the same `ClosureReportAgentError` contract is preserved.
         """
+        structured_llm = self._ensure_structured_llm()
         result = None
         for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
             try:
-                result = self._structured_llm.invoke(prompt)
+                result = structured_llm.invoke(prompt)
                 break
             except Exception as exc:
                 if attempt < _RETRY_MAX_ATTEMPTS and _is_transient_llm_error(exc):

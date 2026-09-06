@@ -82,8 +82,7 @@ from app.agents.closure_report.service import (
 )
 from app.orchestration.graph import run_step
 from app.orchestration.status import sdlc_status
-from app.quality.project_quality_report import build_project_quality_report_for_project
-from app.quality.traceability import build_project_traceability_report
+from app.quality.project_quality_report import build_project_reports_for_project
 from app.document_generator.brd_generator import (
     generate_brd_docx,
     generate_closure_report_docx,
@@ -686,6 +685,92 @@ def refresh_closure_versions() -> None:
         st.error(friendly_error(exc))
 
 
+# --- Phase 11A: deterministic, version-keyed caches for the read-only
+# Traceability / Quality computations -------------------------------------------
+#
+# Reconnaissance found these recomputed on EVERY Streamlit rerun (every
+# keystroke): the Step 8 report (traceability matrix built twice per rerun) and
+# the top-of-page Phase 5 / Phase 6 staleness block. All are pure, deterministic
+# functions of the persisted artifact streams. The cache key is a fingerprint of
+# every stream's (count, latest version, final version); any generate / edit /
+# refine / finalize / unlock changes it (the refresh_*_versions() helpers keep
+# session_state current before this code runs), so a cache hit can NEVER show a
+# value that is stale relative to what the rest of the page shows.
+
+def _stream_sig(vlist) -> tuple[int, int, int]:
+    """(count, latest version, final version-or-0) for one artifact stream."""
+    if not vlist:
+        return (0, 0, 0)
+    return (
+        len(vlist),
+        vlist[-1].version,
+        next((v.version for v in vlist if v.is_final), 0),
+    )
+
+
+def _artifact_fingerprint() -> tuple:
+    """Cache key: a fingerprint of all six artifact streams' version state."""
+    return (
+        _stream_sig(st.session_state.get("versions")),
+        _stream_sig(st.session_state.get("hld_versions")),
+        _stream_sig(st.session_state.get("us_versions")),
+        _stream_sig(st.session_state.get("lld_versions")),
+        _stream_sig(st.session_state.get("qa_versions")),
+        _stream_sig(st.session_state.get("closure_versions")),
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_project_reports(project_id: str, fingerprint: tuple) -> dict:
+    """Traceability + Quality reports, memoized on the artifact-version
+    fingerprint. Recomputed only when some stream actually changes. Read-only,
+    no Gemini (see `build_project_reports_for_project`)."""
+    return build_project_reports_for_project(project_id)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_closure_staleness(project_id: str, fingerprint: tuple) -> dict:
+    """Closure-report provenance / staleness (Step 9 banner), memoized on the
+    same fingerprint. `stale_sources()` / `recorded_source_versions()` /
+    `current_source_versions()` are pure functions of the persisted streams."""
+    cr = ClosureReportService(project_id=project_id)
+    try:
+        stale = cr.stale_sources()
+        recorded = cr.recorded_source_versions() or {}
+        current = cr.current_source_versions()
+    except Exception:
+        stale, recorded, current = [], {}, {}
+    return {"stale_sources": stale, "recorded": recorded, "current": current}
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def _cached_staleness(project_id: str, fingerprint: tuple) -> dict:
+    """Phase 5 (refinement) + Phase 6 (test-case) provenance / staleness for the
+    top-of-page state block, memoized on the same fingerprint. Every value is a
+    pure function of the persisted BRD / HLD / LLD / User-Story / Test-Case
+    streams, so it is invalidated exactly when any of them changes."""
+    usr = UserStoryRefinementService(project_id=project_id)
+    qa = TestCaseService(project_id=project_id)
+    try:
+        usr_recorded = usr.recorded_source_versions()
+        usr_stale_sources = usr.stale_sources()
+    except Exception:
+        usr_recorded, usr_stale_sources = None, []
+    try:
+        qa_recorded = qa.recorded_source_versions()
+        qa_current = qa.current_source_versions()
+        qa_stale_sources = qa.stale_sources()
+    except Exception:
+        qa_recorded, qa_current, qa_stale_sources = None, {}, []
+    return {
+        "usr_recorded": usr_recorded,
+        "usr_stale_sources": usr_stale_sources,
+        "qa_recorded": qa_recorded,
+        "qa_current": qa_current,
+        "qa_stale_sources": qa_stale_sources,
+    }
+
+
 if "versions" not in st.session_state:
     refresh_versions()
 
@@ -724,12 +809,15 @@ lld_latest = lld_versions[-1] if lld_versions else None
 lld_final = next((v for v in lld_versions if v.is_final), None)
 lld_is_locked = bool(lld_final and lld_final.is_locked)
 
+# --- Phase 11A: one artifact-version fingerprint drives both cached read-only
+# views (the Phase 5/6 staleness block below and the Step 8 report). Cheap;
+# invalidates the caches the instant any stream changes.
+_artifact_fp = _artifact_fingerprint()
+_staleness = _cached_staleness(st.session_state.project_id, _artifact_fp)
+
 # --- Phase 5 refinement state (reads the SAME user_stories stream, no second store) ---
-try:
-    usr_recorded = usr_service.recorded_source_versions()
-    usr_stale_sources = usr_service.stale_sources()
-except Exception:
-    usr_recorded, usr_stale_sources = None, []
+usr_recorded = _staleness["usr_recorded"]
+usr_stale_sources = _staleness["usr_stale_sources"]
 usr_is_refined = usr_recorded is not None      # latest user-story version came from artifact refinement
 usr_stale = bool(usr_stale_sources)            # a recorded source artifact changed since that refinement
 
@@ -744,12 +832,9 @@ closure_final = next((v for v in closure_versions if v.is_final), None)
 closure_is_locked = bool(closure_final and closure_final.is_locked)
 
 # --- Phase 6 test-case provenance / per-source staleness (own test_cases stream) ---
-try:
-    qa_recorded = qa_service.recorded_source_versions()
-    qa_current = qa_service.current_source_versions()
-    qa_stale_sources = qa_service.stale_sources()
-except Exception:
-    qa_recorded, qa_current, qa_stale_sources = None, {}, []
+qa_recorded = _staleness["qa_recorded"]
+qa_current = _staleness["qa_current"]
+qa_stale_sources = _staleness["qa_stale_sources"]
 qa_stale = bool(qa_stale_sources)
 
 
@@ -2460,13 +2545,14 @@ with tab_qa:
 
 # --- STEP 8: Traceability & Quality (READ-ONLY) ------------------------------------
 #
-# Phase 10B. A read-only window onto the existing deterministic reporting layer:
-# `build_project_quality_report_for_project()` (artifact status, requirement /
-# user-story coverage, test-case reference population, grounding & orphan
-# findings) and `build_project_traceability_report()` (the requirement ->
-# user-story -> test-case matrix). NOTHING here generates, edits, approves,
-# unlocks, or calls Gemini. Every number is taken straight from those functions —
-# no metric is recomputed in Streamlit.
+# Phase 10B. A read-only window onto the existing deterministic reporting layer.
+# Phase 11A: both reports come from one memoized call to
+# `build_project_reports_for_project()` (single shared service set + single
+# traceability computation), keyed on the artifact-version fingerprint — so the
+# matrix + extraction are NOT recomputed on every rerun, only when a stream
+# actually changes. NOTHING here generates, edits, approves, unlocks, or calls
+# Gemini. Every number is taken straight from those functions — no metric is
+# recomputed in Streamlit.
 
 with tab_traceability:
     st.caption("Read-only evidence view. Deterministic, computed locally from the "
@@ -2480,16 +2566,15 @@ with tab_traceability:
                 "trace.)")
     else:
         try:
-            _tq_quality = build_project_quality_report_for_project(
-                st.session_state.project_id,
-                ba_service=service, sa_service=sa_service, us_service=us_service,
-                lld_service=lld_service, tc_service=qa_service,
+            # Phase 11A: one combined, version-fingerprint-memoized call. Both
+            # reports come from `build_project_reports_for_project` (single
+            # shared service set + single traceability computation) and are only
+            # recomputed when an artifact stream changes — not on every rerun.
+            _tq_reports = _cached_project_reports(
+                st.session_state.project_id, _artifact_fp
             )
-            _tq_trace = build_project_traceability_report(
-                st.session_state.project_id,
-                ba_service=service, sa_service=sa_service, us_service=us_service,
-                lld_service=lld_service, tc_service=qa_service,
-            )
+            _tq_quality = _tq_reports["quality"]
+            _tq_trace = _tq_reports["traceability"]
         except Exception as exc:
             _tq_quality = _tq_trace = None
             st.error(friendly_error(exc))
@@ -2706,14 +2791,16 @@ with tab_closure:
 
             # Phase 10B: non-blocking staleness. The report is NEVER regenerated,
             # re-approved, unlocked, or replaced automatically — this only tells
-            # the human that the evidence has moved on.
-            try:
-                _cr_stale_sources = closure_service.stale_sources()
-            except Exception:
-                _cr_stale_sources = []
+            # the human that the evidence has moved on. (Phase 11A: memoized on
+            # the artifact-version fingerprint — recomputed only when a stream
+            # changes, not on every rerun.)
+            _cr_staleness = _cached_closure_staleness(
+                st.session_state.project_id, _artifact_fp
+            )
+            _cr_stale_sources = _cr_staleness["stale_sources"]
             if _cr_stale_sources:
-                _rec = closure_service.recorded_source_versions() or {}
-                _cur = closure_service.current_source_versions()
+                _rec = _cr_staleness["recorded"]
+                _cur = _cr_staleness["current"]
                 _keymap = {"BRD": "brd", "HLD": "hld", "LLD": "lld",
                            "User Stories": "us", "Test Cases": "tc"}
 

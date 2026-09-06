@@ -19,10 +19,8 @@ is what makes this testable in isolation.
 from dataclasses import dataclass
 from datetime import date
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-
 from app.agents.business_analyst.prompt_manager import PromptManager
-from app.utils.config import settings
+from app.utils.llm import build_chat_llm
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -54,11 +52,16 @@ class BusinessAnalystAgent:
 
     def __init__(self, prompt_manager: PromptManager | None = None):
         self._prompt_manager = prompt_manager or PromptManager()
-        self._llm = ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            temperature=settings.gemini_temperature,
-            google_api_key=settings.google_api_key,
-        )
+        # Phase 11A: the Gemini client is built lazily on the first real
+        # generate/refine call, not here — constructing this service for a
+        # read-only path must not pay the ~1.3 s client-construction cost.
+        self._llm = None
+
+    def _ensure_llm(self):
+        """Build the Gemini client on first use, then reuse it."""
+        if self._llm is None:
+            self._llm = build_chat_llm()
+        return self._llm
 
     @staticmethod
     def _extract_text(content) -> str:
@@ -91,7 +94,7 @@ class BusinessAnalystAgent:
 
     def _invoke(self, prompt: str) -> str:
         try:
-            response = self._llm.invoke(prompt)
+            response = self._ensure_llm().invoke(prompt)
         except Exception as exc:
             logger.error(f"Gemini API call failed: {exc}")
             raise BusinessAnalystAgentError(f"Gemini API call failed: {exc}") from exc

@@ -61,8 +61,7 @@ from datetime import date
 
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.closure_report.agent import ClosureReportAgent
-from app.quality.project_quality_report import build_project_quality_report_for_project
-from app.quality.traceability import build_project_traceability_report
+from app.quality.project_quality_report import build_project_reports_for_project
 from app.services.version_service import BRDVersion, VersionService
 from app.utils.logger import get_logger
 
@@ -186,18 +185,24 @@ class ClosureReportService:
     def _assemble_evidence(self) -> dict:
         """Compose ONE deterministic, JSON-serializable evidence bundle.
 
-        Reuses `app.quality.*` verbatim: `build_project_quality_report_for_project`
-        (artifact status + coverage + grounding + orphan findings) and
-        `build_project_traceability_report` (the requirement->story->test matrix).
-        No count, percentage, grounding check, or version selection is
-        re-implemented here - every figure is a pass-through of an
-        already-computed Phase 9A value. Read-only.
+        Reuses `app.quality.*` verbatim via `build_project_reports_for_project`
+        (Phase 11A): the Project Quality Report (artifact status + coverage +
+        grounding + orphan findings) and the Phase 9A traceability report (the
+        requirement->story->test matrix), built together in ONE pass over ONE
+        set of services and ONE traceability computation. No count, percentage,
+        grounding check, or version selection is re-implemented here - every
+        figure is a pass-through of an already-computed Phase 9A value.
+        Read-only.
         """
-        # Called with `project_id` only: each builder constructs its own
-        # read-only services internally (no Gemini, no writes). The small
-        # redundancy keeps this service free of any other-agent import.
-        quality = build_project_quality_report_for_project(self.project_id)
-        traceability = build_project_traceability_report(self.project_id)
+        # Phase 11A: one combined call builds both reports over a single shared
+        # service set + a single traceability computation. Previously this made
+        # two un-injected builder calls, which constructed ~2.5 fresh service
+        # sets (~10-15 never-used Gemini clients) and computed the traceability
+        # matrix twice - measured at ~10-15 s of pure avoidable overhead per
+        # closure generate/regenerate. Report values are unchanged.
+        reports = build_project_reports_for_project(self.project_id)
+        quality = reports["quality"]
+        traceability = reports["traceability"]
 
         art = quality["artifact_status"]
         req_cov = quality["requirement_coverage"]

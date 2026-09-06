@@ -171,6 +171,29 @@ def test_is_transient_true_for_capacity_errors(text):
     assert _is_transient_llm_error(Exception(text)) is True
 
 
+# --- Phase 11A: transport-level drops observed in the Phase 11 benchmark ---
+@pytest.mark.parametrize("text", [
+    "Server disconnected without sending a response.",
+    "httpx.RemoteProtocolError: Server disconnected without sending a response.",
+    "Connection reset by peer",
+    "[Errno 104] Connection reset by peer",
+    "Connection aborted.",
+    "http.client.IncompleteRead: IncompleteRead(0 bytes read)",
+    "peer closed connection without sending complete message body (incomplete read)",
+])
+def test_is_transient_true_for_transport_drops(text):
+    assert _is_transient_llm_error(Exception(text)) is True
+
+
+def test_is_transient_true_for_remote_protocol_error_type_name():
+    class RemoteProtocolError(Exception):
+        pass
+
+    # the classifier folds in `type(exc).__name__`, so the bare type name
+    # (no descriptive message) is still recognised as transient
+    assert _is_transient_llm_error(RemoteProtocolError()) is True
+
+
 @pytest.mark.parametrize("text", [
     "400 INVALID_ARGUMENT: bad request",
     "401 UNAUTHENTICATED: API key invalid",

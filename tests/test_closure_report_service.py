@@ -486,6 +486,62 @@ def test_retry_helpers_match_the_repo_convention():
         assert lo <= cr_agent._retry_backoff_seconds(attempt) <= lo * 2
 
 
+def test_transient_classification_covers_transport_drops_phase11a():
+    """Phase 11A: the mid-response server disconnect that aborted a full
+    pipeline run in the Phase 11 benchmark must now classify as transient."""
+    from app.agents.closure_report import agent as cr_agent
+
+    class _Boom(Exception):
+        pass
+
+    for text in (
+        "Server disconnected without sending a response.",
+        "httpx.RemoteProtocolError: Server disconnected",
+        "Connection reset by peer",
+        "Connection aborted.",
+        "IncompleteRead(0 bytes read)",
+        "peer closed connection without sending complete message body "
+        "(incomplete read)",
+    ):
+        assert cr_agent._is_transient_llm_error(_Boom(text)) is True, text
+
+    class RemoteProtocolError(Exception):
+        pass
+
+    assert cr_agent._is_transient_llm_error(RemoteProtocolError()) is True
+    # genuinely non-transient errors are still not retried
+    assert cr_agent._is_transient_llm_error(_Boom("401 UNAUTHENTICATED")) is False
+
+
+def test_closure_structured_retry_is_bounded_phase11a(monkeypatch):
+    """A persistently transient failure stops after `_RETRY_MAX_ATTEMPTS`
+    application-level attempts and raises — it never loops indefinitely."""
+    from app.agents.closure_report.agent import (
+        ClosureReportAgent,
+        ClosureReportAgentError,
+        _RETRY_MAX_ATTEMPTS,
+    )
+
+    monkeypatch.setattr("app.agents.closure_report.agent.time.sleep", lambda s: None)
+
+    class _AlwaysDisconnect:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, prompt):
+            self.calls += 1
+            raise RuntimeError("Server disconnected without sending a response.")
+
+    agent = ClosureReportAgent(structured=True)
+    fake = _AlwaysDisconnect()
+    agent._structured_llm = fake  # inject before first use (lazy path honours it)
+
+    with pytest.raises(ClosureReportAgentError):
+        agent._invoke_structured("prompt")
+
+    assert fake.calls == _RETRY_MAX_ATTEMPTS  # bounded, not infinite
+
+
 def test_report_content_and_evidence_are_json_safe(sow_file, sample_metadata):
     _pipeline("clr_jsonsafe", sow_file, sample_metadata)
     v = _svc("clr_jsonsafe").generate()

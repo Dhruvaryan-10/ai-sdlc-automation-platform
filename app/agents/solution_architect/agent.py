@@ -20,14 +20,12 @@ isolation.
 from datetime import date
 from pathlib import Path
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-
 # Reuse the BA agent's metadata container rather than defining a parallel one —
 # the fields (project name/client/type/industry/language/output format) are
 # exactly what the HLD prompt needs too.
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.business_analyst.prompt_manager import PromptManager
-from app.utils.config import settings
+from app.utils.llm import build_chat_llm
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -44,11 +42,14 @@ class SolutionArchitectAgent:
 
     def __init__(self, prompt_manager: PromptManager | None = None):
         self._prompt_manager = prompt_manager or PromptManager(prompts_dir=_PROMPTS_DIR)
-        self._llm = ChatGoogleGenerativeAI(
-            model=settings.gemini_model,
-            temperature=settings.gemini_temperature,
-            google_api_key=settings.google_api_key,
-        )
+        # Phase 11A: lazily built on first real generate/refine call.
+        self._llm = None
+
+    def _ensure_llm(self):
+        """Build the Gemini client on first use, then reuse it."""
+        if self._llm is None:
+            self._llm = build_chat_llm()
+        return self._llm
 
     @staticmethod
     def _extract_text(content) -> str:
@@ -81,7 +82,7 @@ class SolutionArchitectAgent:
 
     def _invoke(self, prompt: str) -> str:
         try:
-            response = self._llm.invoke(prompt)
+            response = self._ensure_llm().invoke(prompt)
         except Exception as exc:
             logger.error(f"Gemini API call failed: {exc}")
             raise SolutionArchitectAgentError(f"Gemini API call failed: {exc}") from exc

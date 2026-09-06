@@ -464,9 +464,18 @@ def _traceability_block() -> str:
 def test_step8_traceability_tab_exists_and_is_wired_to_the_existing_reports():
     block = _traceability_block()
     assert "with tab_traceability:" in block
-    # uses the EXISTING deterministic functions, not a re-implementation
-    assert "build_project_quality_report_for_project(" in block
-    assert "build_project_traceability_report(" in block
+    # Phase 11A: one memoized, version-fingerprint-keyed call into the EXISTING
+    # deterministic reporting layer (not a re-implementation, not recomputed
+    # every rerun).
+    assert "_cached_project_reports(" in block
+    # and that cache is a module-level @st.cache_data wrapper over the combined
+    # single-pass builder.
+    assert "@st.cache_data" in _SOURCE_TEXT
+    assert "def _cached_project_reports(" in _SOURCE_TEXT
+    assert "build_project_reports_for_project(" in _SOURCE_TEXT
+    # the cache key is the artifact-version fingerprint
+    assert "_artifact_fingerprint()" in _SOURCE_TEXT
+    assert "_artifact_fp" in block
 
 
 def test_step8_traceability_tab_is_strictly_read_only():
@@ -521,3 +530,65 @@ def test_step8_matrix_is_not_editable():
     block = _traceability_block()
     assert "st.data_editor" not in block          # never an editable grid
     assert "st.dataframe(" in block               # read-only table/dataframe
+
+
+# ============================================================
+# Phase 11A — deterministic, version-keyed caches for the read-only
+# Traceability / Quality computations (no recompute every rerun)
+# ============================================================
+
+def test_read_only_views_are_cache_decorated_and_fingerprint_keyed():
+    # All three read-only view caches are @st.cache_data and take the
+    # (project_id, fingerprint) key.
+    for name in ("_cached_project_reports", "_cached_staleness",
+                 "_cached_closure_staleness"):
+        assert hasattr(streamlit_app, name), f"missing cache helper {name}"
+    src = _SOURCE_TEXT
+    for name in ("_cached_project_reports", "_cached_staleness",
+                 "_cached_closure_staleness"):
+        decl = f"def {name}(project_id: str, fingerprint: tuple)"
+        assert decl in src, f"{name} must take (project_id, fingerprint)"
+        # the @st.cache_data decorator immediately precedes the def
+        idx = src.index(decl)
+        preceding = src[max(0, idx - 200):idx]
+        assert "@st.cache_data(show_spinner=False" in preceding, name
+
+
+def test_staleness_block_uses_the_cache_not_live_service_calls():
+    # The top-of-page Phase 5 / Phase 6 staleness block reads from the memoized
+    # _staleness dict, not from usr_service / qa_service on every rerun.
+    src = _SOURCE_TEXT
+    block_start = src.index("_staleness = _cached_staleness(")
+    block_end = src.index("# --- sidebar:", block_start)
+    block = src[block_start:block_end]
+    assert 'usr_recorded = _staleness["usr_recorded"]' in block
+    assert 'qa_stale_sources = _staleness["qa_stale_sources"]' in block
+    # the old per-rerun live calls are gone from this block
+    assert "usr_service.recorded_source_versions()" not in block
+    assert "qa_service.stale_sources()" not in block
+
+
+def test_stream_sig_is_a_pure_version_fingerprint():
+    sig = streamlit_app._stream_sig
+
+    class _V:
+        def __init__(self, version, is_final=False):
+            self.version = version
+            self.is_final = is_final
+
+    assert sig(None) == (0, 0, 0)
+    assert sig([]) == (0, 0, 0)
+    assert sig([_V(1), _V(2), _V(3)]) == (3, 3, 0)          # no final
+    assert sig([_V(1, True), _V(2), _V(3)]) == (3, 3, 1)    # final = v1
+    assert sig([_V(1), _V(2, True)]) == (2, 2, 2)           # final = v2
+    # fingerprint changes when a new version is appended ...
+    assert sig([_V(1)]) != sig([_V(1), _V(2)])
+    # ... and when the final marker moves
+    assert sig([_V(1, True), _V(2)]) != sig([_V(1), _V(2, True)])
+
+
+def test_artifact_fingerprint_covers_all_six_streams():
+    src = inspect.getsource(streamlit_app._artifact_fingerprint)
+    for key in ("versions", "hld_versions", "us_versions",
+                "lld_versions", "qa_versions", "closure_versions"):
+        assert f'"{key}"' in src, f"fingerprint must include the {key} stream"
