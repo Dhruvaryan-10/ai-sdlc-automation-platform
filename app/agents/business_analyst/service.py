@@ -78,11 +78,24 @@ class BusinessAnalystService:
     # --- step 3: generate BRD v1 -------------------------------------------------
 
     def generate_initial_brd(self, file_path: str | Path, metadata: ProjectMetadata) -> BRDVersion:
-        """Full pipeline: extract -> clean -> generate -> store as version 1."""
+        """Full pipeline: extract -> clean -> generate -> store as the next version.
+
+        Normally the first BRD version, but the service contract is now safe
+        against a direct repeat call: the in-document `**Version:**` line is
+        stamped with the ACTUAL next version number (never a hard-coded 1), and
+        generation through a locked final BRD is refused. Append-only history is
+        preserved; the orchestration graph still guards and no-ops when a BRD
+        already exists.
+        """
+        if self.is_locked():
+            raise BRDLockedError(
+                "The final BRD is locked. Unlock it before generating a new BRD version."
+            )
         raw_text = self.extract_text(file_path)
         clean_sow = self.preprocess(raw_text)
         brd_text = self._agent.generate_brd(clean_sow, metadata)
-        brd_text = stamp_version_number(brd_text, version_number=1)
+        n = self._next_version_number()
+        brd_text = stamp_version_number(brd_text, version_number=n)
         return self._version_service.add_version(
             content=brd_text, source="initial", note="Generated from SOW"
         )

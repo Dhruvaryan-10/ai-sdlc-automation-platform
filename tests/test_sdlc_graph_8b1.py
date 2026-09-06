@@ -376,6 +376,8 @@ def test_sdlc_status_empty_project(stub_ba_agent):
         "closure_latest_version": None,
         "closure_final_version": None,
         "awaiting_closure_approval": False,
+        "closure_report_stale": False,
+        "closure_report_stale_sources": [],
         "next_step": NEXT_GENERATE_BRD,
     }
 

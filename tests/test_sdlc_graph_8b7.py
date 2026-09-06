@@ -37,6 +37,7 @@ from app.orchestration.status import (
     NEXT_APPROVE_CLOSURE_REPORT,
     NEXT_GENERATE_CLOSURE_REPORT,
     NEXT_NONE,
+    NEXT_REVIEW_CLOSURE_REPORT,
     sdlc_status,
 )
 from app.services.version_service import BRDVersion, VersionService
@@ -458,7 +459,57 @@ def test_status_closure_final_is_terminal(
     st = _status(PID, ba, sa, us, lld, tc, closure)
     assert st["closure_final_version"] == 1
     assert st["awaiting_closure_approval"] is False
+    assert st["closure_report_stale"] is False          # evidence is current
     assert st["next_step"] is NEXT_NONE
+
+
+def test_final_but_stale_closure_report_is_not_terminal_and_requires_review(
+    stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, stub_tc_agent,
+    stub_closure_agent, sow_file, sample_metadata,
+):
+    """Phase 10B governance regression (final review).
+
+    A FINAL closure report whose upstream evidence has since changed must NOT
+    leave the pipeline in the terminal `next_step is None` / "complete" state.
+    `sdlc_status()` routes it back to an explicit human review
+    (`NEXT_REVIEW_CLOSURE_REPORT`) — while regenerating / re-approving / unlocking
+    NOTHING. This is a pure status-semantics test (no UI).
+    """
+    ba, sa, us, lld, tc, closure = _svcs(
+        ba_agent=stub_ba_agent, sa_agent=stub_sa_agent, us_agent=stub_us_agent,
+        lld_agent=stub_lld_agent, tc_agent=stub_tc_agent, closure_agent=stub_closure_agent,
+    )
+    _to_final_tc(ba, sa, us, lld, tc, closure, sow_file, sample_metadata)
+    _run(PID, ba, sa, us, lld, tc, closure, sow_file, sample_metadata)  # closure v1
+    closure.choose_final(1)
+
+    # Baseline: fully complete, nothing stale -> genuinely terminal.
+    st_ok = _status(PID, ba, sa, us, lld, tc, closure)
+    assert st_ok["closure_final_version"] == 1
+    assert st_ok["closure_report_stale"] is False
+    assert st_ok["next_step"] is NEXT_NONE
+
+    # An upstream artifact (the BRD) changes AFTER closure was finalized.
+    ba.unlock_final_brd()
+    ba.save_manual_edit(ba.get_version(1).content + "\n\nNew requirement.\n")
+    ba.choose_final_brd(2)
+
+    st_stale = _status(PID, ba, sa, us, lld, tc, closure)
+    # closure report itself is untouched: still final v1, still latest v1
+    assert st_stale["closure_final_version"] == 1
+    assert st_stale["closure_latest_version"] == 1
+    assert st_stale["awaiting_closure_approval"] is False   # a final one exists
+    # staleness is detected and named
+    assert st_stale["closure_report_stale"] is True
+    assert st_stale["closure_report_stale_sources"] == ["BRD"]
+    # ...and the pipeline is NO LONGER terminal — it requires closure review
+    assert st_stale["next_step"] == NEXT_REVIEW_CLOSURE_REPORT
+    assert st_stale["next_step"] is not NEXT_NONE
+    # nothing was auto-regenerated or auto-finalized
+    assert [v.version for v in closure.get_all_versions()] == [1]
+    assert closure.get_final().version == 1
+    assert closure.is_locked() is True                      # human lock intact
+    assert len(stub_closure_agent.calls) == 1
 
 
 def test_status_repeated_calls_are_side_effect_free(
@@ -481,3 +532,42 @@ def test_status_repeated_calls_are_side_effect_free(
 
     assert {p: p.read_bytes() for p in proj.rglob("versions.json")} == before
     assert len(stub_closure_agent.calls) == closure_calls
+
+
+# --- N. Phase 10B: closure-report staleness surfaced in sdlc_status() -------
+
+def test_sdlc_status_exposes_closure_staleness_additively(
+    stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, stub_tc_agent,
+    stub_closure_agent, sow_file, sample_metadata,
+):
+    ba, sa, us, lld, tc, closure = _svcs(
+        ba_agent=stub_ba_agent, sa_agent=stub_sa_agent, us_agent=stub_us_agent,
+        lld_agent=stub_lld_agent, tc_agent=stub_tc_agent, closure_agent=stub_closure_agent,
+    )
+
+    # no closure report yet -> not stale, keys present
+    st0 = _status(PID, ba, sa, us, lld, tc, closure)
+    assert st0["closure_report_stale"] is False
+    assert st0["closure_report_stale_sources"] == []
+
+    _to_final_tc(ba, sa, us, lld, tc, closure, sow_file, sample_metadata)
+    _run(PID, ba, sa, us, lld, tc, closure, sow_file, sample_metadata)  # closure v1
+
+    st1 = _status(PID, ba, sa, us, lld, tc, closure)
+    assert st1["closure_exists"] is True
+    assert st1["closure_report_stale"] is False
+    assert st1["next_step"] == NEXT_APPROVE_CLOSURE_REPORT   # unchanged semantics
+
+    # BRD changes underneath the closure report
+    ba.unlock_final_brd()
+    ba.save_manual_edit(ba.get_version(1).content + "\n\nNew requirement.\n")
+    ba.choose_final_brd(2)
+
+    st2 = _status(PID, ba, sa, us, lld, tc, closure)
+    assert st2["closure_report_stale"] is True
+    assert st2["closure_report_stale_sources"] == ["BRD"]
+    # next_step is NOT changed by staleness (no auto-regeneration / re-gate)
+    assert st2["next_step"] == NEXT_APPROVE_CLOSURE_REPORT
+    # and nothing was regenerated
+    assert [v.version for v in closure.get_all_versions()] == [1]
+    assert len(stub_closure_agent.calls) == 1

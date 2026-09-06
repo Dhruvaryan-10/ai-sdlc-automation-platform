@@ -29,6 +29,21 @@ from app.services.version_service import BRDVersion, VersionService
 from app.services.version_text import stamp_version_number
 from app.utils.logger import get_logger
 
+
+def _carry_forward_simple_source_ref(prev: BRDVersion | None) -> str | None:
+    """Phase 3 provenance to carry to a plain manual-edit / freeform-refine version.
+
+    Only the simple single-token form (e.g. "brd_v2") is carried forward. A
+    COMPOSITE `source_ref` (contains ";") belongs to a Phase 5 artifact
+    refinement written by `UserStoryRefinementService` — carrying it forward
+    onto a Phase 3 edit/refine would make the new version look like an artifact
+    refinement (`story_version_label` / `_parse_refinement_ref`), so it is
+    deliberately dropped (preserving the historic behaviour for that case).
+    """
+    if prev is None or not prev.source_ref or ";" in prev.source_ref:
+        return None
+    return prev.source_ref
+
 logger = get_logger(__name__)
 
 _TITLE_PATTERN = re.compile(r"^#\s+(.+?)\s+[—\-–]\s+Business Requirement Document", re.MULTILINE)
@@ -106,12 +121,26 @@ class InitialUserStoryService:
     # --- step 1: generate draft user stories v1 -------------------------------
 
     def generate_initial_stories(self) -> BRDVersion:
-        """Generate draft user stories version 1 from the accepted/final BRD."""
+        """Generate draft user stories from the accepted/final BRD.
+
+        Normally user-story version 1, but the service contract is now safe
+        against a direct repeat call: the in-document `**Version:**` line is
+        stamped with the ACTUAL next version number (never a hard-coded 1), and
+        generation through a locked final user-story version is refused.
+        Append-only history is preserved; the orchestration graph still guards
+        and no-ops when user stories already exist.
+        """
+        if self.is_locked():
+            raise UserStoryLockedError(
+                "The final user stories are locked. Unlock them before generating "
+                "a new user-story version."
+            )
         final_brd = self._require_final_brd()
         metadata = self._derive_metadata_from_brd(final_brd.content)
 
         stories_text = self._agent.generate_stories(final_brd.content, metadata)
-        stories_text = stamp_version_number(stories_text, version_number=1)
+        n = self._next_version_number()
+        stories_text = stamp_version_number(stories_text, version_number=n)
 
         return self._version_service.add_version(
             content=stories_text,
@@ -129,11 +158,17 @@ class InitialUserStoryService:
             )
         if not edited_content or not edited_content.strip():
             raise ValueError("Cannot save empty user stories")
+        latest = self._version_service.get_latest_version()
         edited_content = stamp_version_number(
             edited_content, version_number=self._next_version_number()
         )
         return self._version_service.add_version(
-            content=edited_content, source="manual_edit", note=note
+            content=edited_content,
+            source="manual_edit",
+            note=note,
+            # A hand edit does not change which BRD the stories are based on —
+            # carry the prior (simple) provenance forward (Phase 10B).
+            source_ref=_carry_forward_simple_source_ref(latest),
         )
 
     # --- step 2b: AI refine ------------------------------------------------------------
@@ -158,6 +193,10 @@ class InitialUserStoryService:
             content=stamp_version_number(refined_text, self._next_version_number()),
             source="ai_refine",
             note=user_feedback,
+            # A freeform refine reworks the SAME stories against the SAME BRD —
+            # carry the prior (simple) provenance forward (Phase 10B). A Phase 5
+            # composite source_ref is deliberately NOT carried (see the helper).
+            source_ref=_carry_forward_simple_source_ref(latest),
         )
 
     def _next_version_number(self) -> int:

@@ -132,20 +132,25 @@ def test_optional_artifacts_are_incorporated_as_context(
     assert "**Built From:** BRD v1, HLD v1, LLD v1, User Stories v1" in v1.content
 
 
-def test_user_stories_context_prefers_final_then_latest(
+def test_user_stories_context_always_uses_latest(
     stub_ba_agent, stub_us_agent, stub_tc_agent, sow_file, sample_metadata
 ):
+    """Phase 10B: user stories are NOT an independently finalized artifact in the
+    main lifecycle — the test-case generator always consumes the LATEST
+    user-story version, even when an older one carries an is_final flag. This is
+    a deliberate change from the pre-10B "final preferred over latest" behaviour
+    (finalizing an older version must not silently pull the pipeline backwards)."""
     ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
     us = _stories(ba, stub_us_agent)          # v1 draft only, not finalised
     us.save_manual_edit(us.get_version(1).content + "\nextra\n")  # v2 latest
 
     qa = _qa(stub_tc_agent)
     qa.generate()
-    assert qa.recorded_source_versions()["us"] == 2   # latest used when no final exists
+    assert qa.recorded_source_versions()["us"] == 2   # latest used
 
-    us.choose_final_stories(1)                # now v1 is final
+    us.choose_final_stories(1)                # an is_final flag on the OLDER v1
     qa.regenerate()
-    assert qa.recorded_source_versions()["us"] == 1   # final preferred over latest
+    assert qa.recorded_source_versions()["us"] == 2   # still the latest — not the finalized v1
 
 
 # --- TEST 11 + 13: manual edit -> new version, prior versions unchanged --

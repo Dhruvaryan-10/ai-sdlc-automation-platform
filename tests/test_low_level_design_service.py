@@ -8,17 +8,20 @@ agent) purely as test setup.
 """
 
 import ast
+import json
 from pathlib import Path
 
 import pytest
 
 from app.agents.business_analyst.service import BusinessAnalystService
+from app.agents.initial_user_story.service import InitialUserStoryService
 from app.agents.low_level_design.service import (
     LLDLockedError,
     LowLevelDesignService,
     NoFinalHLDError,
 )
 from app.agents.solution_architect.service import SolutionArchitectService
+from app.utils.config import settings
 
 
 def _final_brd(stub_ba_agent, sow_file, sample_metadata, project_id="proj"):
@@ -79,7 +82,9 @@ def test_final_hld_enables_lld_generation(
 
     assert v1.version == 1
     assert v1.source == "initial"
-    assert v1.source_ref == "hld_v1"
+    # Phase 10B: composite provenance — HLD (required) + BRD + User Stories
+    # (context). No user stories were generated in this test, so us_vnone.
+    assert v1.source_ref == "hld_v1;brd_v1;us_vnone"
     assert "**Version:** 1" in v1.content
     assert "**Version:** 0" not in v1.content
     hld_text_passed = stub_lld_agent.generate_calls[0][0]
@@ -315,3 +320,94 @@ def test_metadata_is_derived_from_hld(
     assert metadata.project_name == "Test Project"
     assert metadata.client_name == "Acme Corp"
     assert metadata.project_type == "Web Application"
+
+
+# ============================================================
+# Phase 10B — LLD composite provenance + staleness
+# ============================================================
+
+def _us(ba, stub_us_agent):
+    us = InitialUserStoryService(project_id="proj", ba_service=ba, agent=stub_us_agent)
+    us.generate_initial_stories()
+    return us
+
+
+def test_lld_records_composite_provenance_with_user_stories(
+    stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, sow_file, sample_metadata
+):
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    sa = _sa_with_hld(ba, stub_sa_agent, finalize=True)
+    _us(ba, stub_us_agent)                                  # US v1 present
+    lld = _lld(sa, ba, stub_lld_agent)
+    v1 = lld.generate_initial_lld()
+
+    assert v1.source_ref == "hld_v1;brd_v1;us_v1"
+    assert lld.recorded_source_versions() == {"hld": 1, "brd": 1, "us": 1}
+    assert lld.source_hld_version() == 1
+    assert lld.stale_sources() == []
+    assert lld.is_stale() is False
+
+
+def test_lld_legacy_hld_only_source_ref_is_parsed_and_never_flags_brd_or_us(
+    stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, sow_file, sample_metadata
+):
+    """A pre-10B project stored `source_ref="hld_v1"`. The parser must accept it,
+    and a later BRD / user-story change must NOT flag BRD/US stale (they were
+    never recorded), only an HLD change."""
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    sa = _sa_with_hld(ba, stub_sa_agent, finalize=True)
+    lld = _lld(sa, ba, stub_lld_agent)
+    lld.generate_initial_lld()
+
+    # simulate a legacy record: rewrite v1's source_ref to the old HLD-only form
+    vfile = Path(settings.resolved_output_dir()) / "proj" / "lld" / "versions.json"
+    data = json.loads(vfile.read_text(encoding="utf-8"))
+    data[0]["source_ref"] = "hld_v1"
+    vfile.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+    assert lld.recorded_source_versions() == {"hld": 1, "brd": None, "us": None}
+
+    # BRD changes + user stories added afterwards -> NOT stale (never recorded)
+    ba.unlock_final_brd()
+    ba.save_manual_edit(ba.get_version(1).content + "\n\nNew req.\n")
+    ba.choose_final_brd(2)
+    _us(ba, stub_us_agent)
+    assert lld.stale_sources() == []
+
+    # but an HLD change still flags HLD
+    sa.unlock_final_hld()
+    sa.save_manual_edit(sa.get_version(1).content + "\n\nNew component.\n")
+    sa.choose_final_hld(2)
+    assert lld.stale_sources() == ["HLD"]
+    assert lld.hld_changed_since_lld() is True
+
+
+def test_lld_staleness_flags_brd_hld_and_user_stories_when_recorded(
+    stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, sow_file, sample_metadata
+):
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    sa = _sa_with_hld(ba, stub_sa_agent, finalize=True)
+    us = _us(ba, stub_us_agent)
+    lld = _lld(sa, ba, stub_lld_agent)
+    lld.generate_initial_lld()
+    lld_before = [v.model_dump() for v in lld.get_all_versions()]
+    assert lld.stale_sources() == []
+
+    # user stories refined to v2 -> "User Stories" stale (LLD not mutated)
+    us.save_manual_edit(us.get_version(1).content + "\nextra\n")
+    assert lld.stale_sources() == ["User Stories"]
+
+    # BRD re-finalized -> BRD also stale
+    ba.unlock_final_brd()
+    ba.save_manual_edit(ba.get_version(1).content + "\n\nNew req.\n")
+    ba.choose_final_brd(2)
+    assert set(lld.stale_sources()) == {"BRD", "User Stories"}
+
+    # HLD re-finalized -> all three
+    sa.unlock_final_hld()
+    sa.save_manual_edit(sa.get_version(1).content + "\n\nNew component.\n")
+    sa.choose_final_hld(2)
+    assert set(lld.stale_sources()) == {"BRD", "HLD", "User Stories"}
+    assert lld.is_stale() is True
+    # nothing was regenerated or mutated
+    assert [v.model_dump() for v in lld.get_all_versions()] == lld_before

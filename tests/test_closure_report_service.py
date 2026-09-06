@@ -520,3 +520,89 @@ def test_deterministic_status_is_stable_across_repeated_assembly(sow_file, sampl
         for _ in range(3)
     }
     assert statuses == {STATUS_READY}
+
+
+# =====================================================================
+# Phase 10B — Closure Report staleness (non-blocking; no auto-regen)
+# =====================================================================
+
+def test_closure_staleness_none_before_generation_and_on_a_fresh_report(sow_file, sample_metadata):
+    _pipeline("clr_stale_fresh", sow_file, sample_metadata)
+    cr = _svc("clr_stale_fresh")
+
+    assert cr.recorded_source_versions() is None       # no closure version yet
+    assert cr.stale_sources() == []
+    assert cr.is_stale() is False
+
+    v1 = cr.generate()
+    assert cr.recorded_source_versions() == {"brd": 1, "hld": 1, "lld": 1, "us": 1, "tc": 1}
+    assert cr.current_source_versions() == {"brd": 1, "hld": 1, "lld": 1, "us": 1, "tc": 1}
+    assert cr.stale_sources() == []                    # SCENARIO 1: no false stale
+    assert cr.is_stale() is False
+
+
+def test_closure_is_marked_stale_after_brd_changes_but_never_regenerates(sow_file, sample_metadata):
+    """SCENARIO 2: BRD v1 -> HLD/LLD/TC/Closure v1; then BRD v2 final.
+    Closure v1 stays byte-identical, is reported stale, names BRD, and nothing
+    is regenerated, finalized, or unlocked."""
+    ba, sa, us, lld, tc = _pipeline("clr_stale_brd", sow_file, sample_metadata)
+    cr = _svc("clr_stale_brd")
+    v1 = cr.generate()
+    v1_dump = cr.get_version(1).model_dump()
+
+    ba.unlock_final_brd()
+    ba.save_manual_edit(ba.get_version(1).content + "\n\nNew requirement.\n")
+    ba.choose_final_brd(2)
+
+    assert cr.stale_sources() == ["BRD"]
+    assert cr.is_stale() is True
+    assert cr.recorded_source_versions()["brd"] == 1
+    assert cr.current_source_versions()["brd"] == 2
+    # closure report untouched — still 1 version, byte-identical, still not final
+    assert [v.version for v in cr.get_all_versions()] == [1]
+    assert cr.get_version(1).model_dump() == v1_dump
+    assert cr.get_final() is None
+
+    # an explicit regenerate clears staleness (new version; old one kept)
+    v2 = cr.regenerate()
+    assert v2.version == 2
+    assert cr.stale_sources() == []
+    assert [v.version for v in cr.get_all_versions()] == [1, 2]
+
+
+def test_closure_staleness_covers_all_five_sources_including_none_to_v_transition(
+    sow_file, sample_metadata
+):
+    # Generate the closure report from a project with NO HLD/LLD/TC.
+    ba, sa, us, lld, tc = _pipeline(
+        "clr_stale_all", sow_file, sample_metadata,
+        with_hld=False, with_us=True, with_lld=False, with_tc=False,
+    )
+    cr = _svc("clr_stale_all")
+    cr.generate()
+    assert cr.recorded_source_versions() == {"brd": 1, "hld": None, "lld": None,
+                                             "us": 1, "tc": None}
+    assert cr.stale_sources() == []
+
+    # user stories refined -> latest changes -> "User Stories" stale
+    us.save_manual_edit(us.get_version(1).content + "\nextra\n")
+    assert cr.stale_sources() == ["User Stories"]
+
+    # a final HLD now appears (None -> v1) -> "HLD" also stale (materially changes
+    # the closure report's artifact summary + status, unlike Test Cases context)
+    sa.generate_initial_hld()
+    sa.choose_final_hld(1)
+    assert set(cr.stale_sources()) == {"HLD", "User Stories"}
+
+
+def test_closure_stale_sources_uses_latest_user_stories_not_a_finalized_older_one(
+    sow_file, sample_metadata
+):
+    ba, sa, us, lld, tc = _pipeline("clr_stale_us", sow_file, sample_metadata)
+    cr = _svc("clr_stale_us")
+    cr.generate()                                   # recorded us == 1
+    us.save_manual_edit(us.get_version(1).content + "\nv2\n")   # latest us == 2
+    us.choose_final_stories(1)                      # is_final flag on the OLDER v1
+
+    assert cr.current_source_versions()["us"] == 2  # latest, not the finalized v1
+    assert cr.stale_sources() == ["User Stories"]

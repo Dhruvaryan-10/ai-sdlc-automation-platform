@@ -44,6 +44,7 @@ def _empty_status(**overrides) -> dict:
         "awaiting_test_cases_approval": False,
         "closure_exists": False, "closure_latest_version": None,
         "closure_final_version": None, "awaiting_closure_approval": False,
+        "closure_report_stale": False, "closure_report_stale_sources": [],
         "next_step": "generate_brd",
     }
     base.update(overrides)
@@ -73,8 +74,12 @@ def test_next_step_label_covers_every_known_value():
         "approve_lld": "Next: Review and approve the LLD in Step 5",
         "generate_test_cases": "Next: Generate Test Cases in Step 7",
         "approve_test_cases": "Next: Review and approve Test Cases in Step 7",
-        "generate_closure_report": "Next: Generate the Closure Report in Step 8",
-        "approve_closure_report": "Next: Review and approve the Closure Report in Step 8",
+        "generate_closure_report": "Next: Generate the Closure Report in Step 9",
+        "approve_closure_report": "Next: Review and approve the Closure Report in Step 9",
+        "review_closure_report": (
+            "Next: Review the Closure Report in Step 9 — its evidence changed since it "
+            "was finalized"
+        ),
         None: "SDLC pipeline complete — no further orchestrated action is required.",
     }
     for next_step, label in expected.items():
@@ -89,6 +94,9 @@ def test_next_step_label_falls_back_for_an_unrecognized_value():
 def test_awaiting_approval_message_only_set_for_approve_states():
     assert _awaiting_approval_message(_empty_status(next_step="generate_brd")) is None
     assert _awaiting_approval_message(_empty_status(next_step=None)) is None
+    # a stale FINAL closure report routes to review, but has its OWN dedicated
+    # staleness banner — it must not also raise the amber "awaiting approval" one.
+    assert _awaiting_approval_message(_empty_status(next_step="review_closure_report")) is None
     assert "BRD approval" in _awaiting_approval_message(_empty_status(next_step="approve_brd"))
     assert "HLD approval" in _awaiting_approval_message(_empty_status(next_step="approve_hld"))
     assert "LLD approval" in _awaiting_approval_message(_empty_status(next_step="approve_lld"))
@@ -150,6 +158,18 @@ def test_pipeline_summary_handles_a_completed_pipeline():
     assert _next_step_label(status) == (
         "SDLC pipeline complete — no further orchestrated action is required."
     )
+
+
+def test_pipeline_summary_flags_stale_closure_evidence():
+    status = _empty_status(
+        brd_exists=True, brd_latest_version=2, brd_final_version=2,
+        closure_exists=True, closure_latest_version=1, closure_final_version=1,
+        closure_report_stale=True, closure_report_stale_sources=["BRD"],
+        next_step=None,
+    )
+    line = _pipeline_summary(status)[5]
+    assert line.startswith("Closure Report: v1 (final: v1)")
+    assert "evidence may be stale" in line
 
 
 def test_pipeline_summary_never_exposes_a_us_final_version_key():
@@ -315,16 +335,29 @@ def test_pure_helpers_contain_no_streamlit_calls():
         assert "st." not in inspect.getsource(fn)
 
 
-# --- SDLC step rail (all 8 steps, state derived from sdlc_status()) ---------
+# --- SDLC step rail (all 9 steps, state derived from sdlc_status()) ---------
 
-def test_pipeline_steps_returns_all_eight_steps_in_order():
+def test_pipeline_steps_returns_all_nine_steps_in_order():
     steps = _pipeline_steps(_empty_status(next_step="generate_brd"))
-    assert [s["n"] for s in steps] == [1, 2, 3, 4, 5, 6, 7, 8]
+    assert [s["n"] for s in steps] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     assert [s["name"] for s in steps] == [
         "SOW → BRD", "BRD Workspace", "HLD Workspace", "User Story Workspace",
-        "LLD Workspace", "Test Case Workspace", "Traceability & Quality",
-        "Closure Report",
+        "LLD Workspace", "User Story Refinement", "QA / Test Case Workspace",
+        "Traceability & Quality", "Closure Report",
     ]
+
+
+def test_rail_step_names_match_the_step_tab_labels():
+    # The nine rail steps line up 1:1 with the nine "Step N: <label>" tabs.
+    assert len(streamlit_app._RAIL_STEPS) == 9
+    for i in range(1, 10):
+        assert f'"Step {i}: ' in _SOURCE_TEXT, f"missing Step {i} tab label"
+    assert '"Step 6: User Story Refinement"' in _SOURCE_TEXT
+    assert '"Step 7: QA / Test Case Workspace"' in _SOURCE_TEXT
+    assert '"Step 8: Traceability & Quality"' in _SOURCE_TEXT
+    assert '"Step 9: Closure Report"' in _SOURCE_TEXT
+    # the old 8-step closure label must be gone
+    assert '"Step 8: Closure Report"' not in _SOURCE_TEXT
 
 
 def test_pipeline_steps_fresh_project_marks_step_one_current():
@@ -344,10 +377,29 @@ def test_pipeline_steps_derives_done_current_readonly_from_status():
         closure_exists=True, closure_final_version=None,
         awaiting_closure_approval=True, next_step="approve_closure_report",
     )
-    states = [s["state"] for s in _pipeline_steps(status)]
-    assert states == ["done", "done", "done", "done", "done", "done",
-                      "readonly", "current"]
-    assert _pipeline_steps(status)[7]["status"] == "Current"
+    steps = _pipeline_steps(status)
+    states = [s["state"] for s in steps]
+    #        1       2       3       4       5       6(refine)   7       8(t&q)     9(closure)
+    assert states == ["done", "done", "done", "done", "done", "readonly",
+                      "done", "readonly", "current"]
+    assert steps[8]["status"] == "Current"        # step 9, current (approve)
+
+
+def test_pipeline_steps_stale_closure_is_current_not_done():
+    status = _empty_status(
+        brd_exists=True, brd_final_version=2,
+        hld_exists=True, hld_final_version=1,
+        us_exists=True, us_latest_version=1,
+        lld_exists=True, lld_final_version=1,
+        tc_exists=True, tc_final_version=1,
+        closure_exists=True, closure_final_version=1,
+        closure_report_stale=True, closure_report_stale_sources=["BRD"],
+        next_step=None,
+    )
+    step9 = _pipeline_steps(status)[8]
+    assert step9["n"] == 9
+    assert step9["state"] == "current"            # NOT "done" while stale
+    assert "stale" in step9["status"].lower()
 
 
 def test_pipeline_steps_all_final_marks_every_step_done_or_readonly():
@@ -361,18 +413,21 @@ def test_pipeline_steps_all_final_marks_every_step_done_or_readonly():
         next_step=None,
     )
     states = [s["state"] for s in _pipeline_steps(status)]
-    assert states == ["done"] * 6 + ["readonly", "done"]
+    #        1..5 done, 6 readonly (US refinement optional), 7 done, 8 readonly, 9 done
+    assert states == ["done"] * 5 + ["readonly", "done", "readonly", "done"]
 
 
-def test_pipeline_steps_step_seven_is_todo_before_any_brd():
-    assert _pipeline_steps(_empty_status(next_step="generate_brd"))[6]["state"] == "todo"
+def test_pipeline_steps_traceability_step_is_todo_before_any_brd():
+    # Step 8 (index 7) = Traceability & Quality — read-only once a BRD exists,
+    # "todo" before that.
+    assert _pipeline_steps(_empty_status(next_step="generate_brd"))[7]["state"] == "todo"
 
 
-def test_render_step_rail_is_scoped_html_with_all_eight_steps():
+def test_render_step_rail_is_scoped_html_with_all_nine_steps():
     html = _render_step_rail(_empty_status(next_step="generate_brd"))
     assert html.startswith('<div class="sdlc-steprail-wrap">')
     assert 'class="sdlc-steprail"' in html
-    assert html.count('class="sdlc-step ') == 8            # one card per step
+    assert html.count('class="sdlc-step ') == 9            # one card per step
     for _n, name in streamlit_app._RAIL_STEPS:
         assert name in html
     assert "<script" not in html.lower()
@@ -394,3 +449,75 @@ def test_pipeline_panel_renders_the_step_rail_not_the_old_caption_columns():
     assert "_render_step_rail(pipeline_status)" in panel_block
     assert "_STEP_RAIL_CSS" in panel_block
     assert "st.columns(5)" not in panel_block  # old truncating caption row is gone
+
+
+# ============================================================
+# Phase 10B — Step 8 Traceability & Quality workspace (read-only)
+# ============================================================
+
+def _traceability_block() -> str:
+    start = _SOURCE_TEXT.index("# --- STEP 8: Traceability & Quality (READ-ONLY)")
+    end = _SOURCE_TEXT.index("# --- STEP 9: Closure Report", start)
+    return _SOURCE_TEXT[start:end]
+
+
+def test_step8_traceability_tab_exists_and_is_wired_to_the_existing_reports():
+    block = _traceability_block()
+    assert "with tab_traceability:" in block
+    # uses the EXISTING deterministic functions, not a re-implementation
+    assert "build_project_quality_report_for_project(" in block
+    assert "build_project_traceability_report(" in block
+
+
+def test_step8_traceability_tab_is_strictly_read_only():
+    block = _traceability_block()
+    code_lines = "\n".join(
+        line for line in block.splitlines() if not line.strip().startswith("#")
+    )
+    for forbidden in (
+        "choose_final", "mark_final", "unlock_final",
+        ".generate(", ".regenerate(", ".refine_with_ai(", ".save_manual_edit(",
+        "generate_initial_", ".refine()",
+        "ChatGoogleGenerativeAI", "import genai", "langchain",
+    ):
+        assert forbidden not in code_lines, f"read-only violation: {forbidden}"
+
+
+def test_step8_traceability_tab_renders_every_required_section():
+    block = _traceability_block()
+    for header in (
+        '"Artifact status"',
+        '"Requirement coverage"',
+        '"User story coverage"',
+        '"Test case reference population"',
+        '"Grounding findings"',
+        '"Orphan references"',
+        '"Traceability matrix"',
+    ):
+        assert f"st.subheader({header}" in block, f"missing section header {header}"
+    # matrix columns the brief mandates
+    for col in ("requirement_id", "requirement_kind", "requirement_title",
+                "user_story_ids", "test_case_ids", "test_case_ids_direct",
+                "test_case_ids_via_story", "has_user_stories", "has_test_cases",
+                "is_covered"):
+        assert col in block, f"matrix column {col} not surfaced"
+    # by-kind requirement breakdown
+    assert "Functional Requirements" in block
+    assert "Non-Functional Requirements" in block
+    assert "Business Requirements" in block
+
+
+def test_step8_traceability_tab_handles_empty_and_partial_projects():
+    block = _traceability_block()
+    # empty project (no BRD): a friendly info state, not a crash
+    assert "if latest_version is None:" in block
+    assert "st.info(" in block
+    # partial project note keyed off an existing artifact_status flag
+    assert 'artifact_status"]["test_cases"]["exists"]' in block or \
+           '_astat["test_cases"]["exists"]' in block
+
+
+def test_step8_matrix_is_not_editable():
+    block = _traceability_block()
+    assert "st.data_editor" not in block          # never an editable grid
+    assert "st.dataframe(" in block               # read-only table/dataframe

@@ -88,6 +88,11 @@ _NARRATIVE_FIELDS = (
     "limitations",
 )
 
+# Closure Report source_ref is the composite
+#   "brd_v{b};hld_v{h};lld_v{l};us_v{u};tc_v{t}"   (each token an int or "none")
+# — the exact form written by `_format_source_ref`. This parses it back.
+_REF_TOKEN_PATTERN = re.compile(r"(brd|hld|lld|us|tc)_v(\d+|none)")
+
 # Closure status vocabulary - deterministic, code-owned (never model-chosen).
 STATUS_READY = "READY_FOR_CLOSURE"
 STATUS_OPEN_ITEMS = "CLOSURE_WITH_OPEN_ITEMS"
@@ -150,6 +155,12 @@ class ClosureReportService:
         self._agent = agent or ClosureReportAgent()
         # Required source (BRD text + project metadata).
         self._brd = VersionService(project_id=project_id)
+        # Read-only views of the upstream streams — used ONLY for post-generation
+        # staleness introspection (Phase 10B); never written here.
+        self._hld = VersionService(project_id=project_id, subdir="hld")
+        self._lld = VersionService(project_id=project_id, subdir="lld")
+        self._us = VersionService(project_id=project_id, subdir="user_stories")
+        self._tc = VersionService(project_id=project_id, subdir="test_cases")
         # Own stream (read + write).
         self._cr = VersionService(project_id=project_id, subdir="closure_report")
 
@@ -846,3 +857,78 @@ class ClosureReportService:
     def is_locked(self) -> bool:
         final = self._cr.get_final_version()
         return bool(final and final.is_locked)
+
+    # --- provenance / staleness (Phase 10B; live, never stored, no auto-regen) ----
+
+    def recorded_source_versions(self) -> dict | None:
+        """The BRD/HLD/LLD/US/TC versions the LATEST closure report was built from.
+
+        Parsed from that version's composite `source_ref`
+        (`brd_v{b};hld_v{h};lld_v{l};us_v{u};tc_v{t}`). Returns e.g.
+        `{"brd": 1, "hld": 1, "lld": 1, "us": 2, "tc": 1}` — `None` for a token
+        means that artifact was absent (or not finalized, for BRD/HLD/LLD/TC)
+        when the report was generated. Returns `None` when there is no closure
+        report or its `source_ref` is not the composite form.
+        """
+        latest = self._cr.get_latest_version()
+        if latest is None or not latest.source_ref or ";" not in latest.source_ref:
+            return None
+        parsed: dict = {}
+        for key, raw in _REF_TOKEN_PATTERN.findall(latest.source_ref):
+            parsed[key] = None if raw == "none" else int(raw)
+        if "brd" not in parsed:
+            return None
+        for k in ("hld", "lld", "us", "tc"):
+            parsed.setdefault(k, None)
+        return parsed
+
+    def current_source_versions(self) -> dict:
+        """The versions the Closure Report's evidence WOULD select right now.
+
+        Uses the report's EXISTING evidence semantics (see `_selected_versions`):
+        the accepted/final version for BRD / HLD / LLD / Test Cases, and the
+        LATEST version for User Stories (which are not independently finalized).
+        `None` where that artifact is absent / not finalized.
+        """
+        brd = self._brd.get_final_version()
+        hld = self._hld.get_final_version()
+        lld = self._lld.get_final_version()
+        us = self._us.get_latest_version()
+        tc = self._tc.get_final_version()
+        return {
+            "brd": brd.version if brd else None,
+            "hld": hld.version if hld else None,
+            "lld": lld.version if lld else None,
+            "us": us.version if us else None,
+            "tc": tc.version if tc else None,
+        }
+
+    def stale_sources(self) -> list[str]:
+        """Which upstream artifacts changed since the latest closure report.
+
+        Compares `recorded_source_versions()` against `current_source_versions()`
+        (the report's own evidence-selection semantics). A change in ANY of the
+        five is reported — including a `None -> vN` transition, because the
+        closure report's artifact summary and deterministic status would
+        genuinely differ if regenerated now (unlike Test Cases, where HLD/LLD are
+        pure optional context). Traceability and the Project Quality Report are
+        never considered stale — they are recomputed live every time the report
+        is (re)generated.
+
+        Returns names from `["BRD", "HLD", "LLD", "User Stories", "Test Cases"]`.
+        Empty list when there is no closure report or nothing changed. This is a
+        non-blocking signal: it never regenerates, finalizes, or unlocks.
+        """
+        recorded = self.recorded_source_versions()
+        if recorded is None:
+            return []
+        current = self.current_source_versions()
+        labels = {
+            "brd": "BRD", "hld": "HLD", "lld": "LLD",
+            "us": "User Stories", "tc": "Test Cases",
+        }
+        return [labels[k] for k in ("brd", "hld", "lld", "us", "tc")
+                if recorded[k] != current[k]]
+
+    def is_stale(self) -> bool:
+        return bool(self.stale_sources())

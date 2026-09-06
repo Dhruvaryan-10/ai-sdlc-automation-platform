@@ -82,6 +82,8 @@ from app.agents.closure_report.service import (
 )
 from app.orchestration.graph import run_step
 from app.orchestration.status import sdlc_status
+from app.quality.project_quality_report import build_project_quality_report_for_project
+from app.quality.traceability import build_project_traceability_report
 from app.document_generator.brd_generator import (
     generate_brd_docx,
     generate_closure_report_docx,
@@ -276,8 +278,11 @@ _NEXT_STEP_LABELS = {
     "approve_lld": "Next: Review and approve the LLD in Step 5",
     "generate_test_cases": "Next: Generate Test Cases in Step 7",
     "approve_test_cases": "Next: Review and approve Test Cases in Step 7",
-    "generate_closure_report": "Next: Generate the Closure Report in Step 8",
-    "approve_closure_report": "Next: Review and approve the Closure Report in Step 8",
+    "generate_closure_report": "Next: Generate the Closure Report in Step 9",
+    "approve_closure_report": "Next: Review and approve the Closure Report in Step 9",
+    "review_closure_report": (
+        "Next: Review the Closure Report in Step 9 — its evidence changed since it was finalized"
+    ),
     None: "SDLC pipeline complete — no further orchestrated action is required.",
 }
 
@@ -290,18 +295,18 @@ _AWAITING_APPROVAL_MESSAGES = {
     ),
     "approve_closure_report": (
         "Waiting for Closure Report approval — review and choose the final Closure "
-        "Report in Step 8."
+        "Report in Step 9."
     ),
 }
 
-# --- SDLC step rail (Phase 8B-8, UI-only) -----------------------------------------
+# --- SDLC step rail (Phase 8B-8; renumbered to the 9-step lifecycle in 10B) -------
 #
-# A horizontally-scrollable progress rail for the eight SDLC steps, rendered in the
-# SDLC Pipeline panel in place of the old truncated caption row. It is a display
-# component only: no navigation/routing, no backend calls. State per step is
-# derived entirely from `sdlc_status()` (see `_pipeline_steps`). All CSS is scoped
-# under `.sdlc-steprail-wrap` so it cannot affect the sidebar, tabs, buttons,
-# artifact cards, or any other component.
+# A horizontally-scrollable progress rail for the nine SDLC steps, rendered in the
+# SDLC Pipeline panel. It is a display component only: no navigation/routing, no
+# backend calls. State per step is derived entirely from `sdlc_status()` (see
+# `_pipeline_steps`). The nine rail steps line up 1:1 with the nine Step tabs
+# below. All CSS is scoped under `.sdlc-steprail-wrap` so it cannot affect the
+# sidebar, tabs, buttons, artifact cards, or any other component.
 
 _RAIL_STEPS = (
     (1, "SOW → BRD"),
@@ -309,19 +314,22 @@ _RAIL_STEPS = (
     (3, "HLD Workspace"),
     (4, "User Story Workspace"),
     (5, "LLD Workspace"),
-    (6, "Test Case Workspace"),
-    (7, "Traceability & Quality"),
-    (8, "Closure Report"),
+    (6, "User Story Refinement"),
+    (7, "QA / Test Case Workspace"),
+    (8, "Traceability & Quality"),
+    (9, "Closure Report"),
 )
 
 # Which rail step the pipeline's current `next_step` points at (generate/approve
-# for one artifact map to the same rail card).
+# for one artifact map to the same rail card). Steps 6 (User Story Refinement)
+# and 8 (Traceability & Quality) are not orchestrated `next_step` targets.
 _NEXT_STEP_TO_RAIL = {
     "generate_brd": 1, "approve_brd": 2,
     "generate_hld": 3, "approve_hld": 3,
     "generate_lld": 5, "approve_lld": 5,
-    "generate_test_cases": 6, "approve_test_cases": 6,
-    "generate_closure_report": 8, "approve_closure_report": 8,
+    "generate_test_cases": 7, "approve_test_cases": 7,
+    "generate_closure_report": 9, "approve_closure_report": 9,
+    "review_closure_report": 9,
 }
 
 _STEP_RAIL_CSS = """
@@ -422,6 +430,13 @@ def _pipeline_summary(status: dict) -> list[str]:
                 text += " (draft)"
         return text
 
+    closure_line = _line(
+        "Closure Report", status["closure_exists"], status["closure_latest_version"],
+        status["closure_final_version"], status["awaiting_closure_approval"],
+    )
+    if status.get("closure_report_stale") and status["closure_exists"]:
+        closure_line += " — evidence may be stale"
+
     return [
         _line("BRD", status["brd_exists"], status["brd_latest_version"],
               status["brd_final_version"], status["awaiting_brd_approval"]),
@@ -433,46 +448,54 @@ def _pipeline_summary(status: dict) -> list[str]:
               status["lld_final_version"], status["awaiting_lld_approval"]),
         _line("Test Cases", status["tc_exists"], status["tc_latest_version"],
               status["tc_final_version"], status["awaiting_test_cases_approval"]),
-        _line("Closure Report", status["closure_exists"], status["closure_latest_version"],
-              status["closure_final_version"], status["awaiting_closure_approval"]),
+        closure_line,
     ]
 
 
 def _pipeline_steps(status: dict) -> list[dict]:
-    """Pure: `sdlc_status()` -> the 8 SDLC step-rail descriptors.
+    """Pure: `sdlc_status()` -> the 9 SDLC step-rail descriptors.
 
     Each entry is `{"n": int, "name": str, "state": str, "status": str}` where
     `state` is one of "done" / "current" / "todo" / "readonly". No Streamlit
     calls, no invented fields — every decision comes from `sdlc_status()`'s keys.
 
       * done      — the step's artifact is finalized (or, for the no-gate
-                    User-Story step, generated).
+                    User-Story step, generated). Step 9 (Closure Report) is
+                    "done" ONLY when it is final AND not stale.
       * current   — the step the pipeline's `next_step` currently points at
-                    (a `generate_*` or `approve_*` action). The existing amber
-                    "Waiting for … approval" banner still conveys the
-                    approve-vs-generate distinction below the rail.
-      * readonly  — Step 7 (Traceability & Quality) has no generation/approval
-                    lifecycle; shown neutral once a BRD exists.
+                    (a `generate_*` or `approve_*` action), OR Step 9 when a
+                    closure report exists but its evidence is stale (needs
+                    human review — never shown as an approval-complete state).
+      * readonly  — Step 6 (User Story Refinement, optional) and Step 8
+                    (Traceability & Quality, a live read-only view) have no
+                    generation/approval lifecycle.
       * todo      — not started.
     """
     current_n = _NEXT_STEP_TO_RAIL.get(status.get("next_step"), 0)
+    closure_stale = bool(status.get("closure_report_stale"))
     done = {
         1: status["brd_exists"],
         2: status["brd_final_version"] is not None,
         3: status["hld_final_version"] is not None,
         4: status["us_exists"],
         5: status["lld_final_version"] is not None,
-        6: status["tc_final_version"] is not None,
-        7: False,  # read-only report — no completion state
-        8: status["closure_final_version"] is not None,
+        6: False,  # optional reconciliation pass — no pipeline completion state
+        7: status["tc_final_version"] is not None,
+        8: False,  # live read-only report — no completion state
+        9: (status["closure_final_version"] is not None) and not closure_stale,
     }
     steps: list[dict] = []
     for n, name in _RAIL_STEPS:
         if done[n]:
             state, text = "done", "Completed"
+        elif n == 9 and status.get("closure_exists") and closure_stale:
+            state, text = "current", "Review — evidence may be stale"
         elif n == current_n:
             state, text = "current", "Current"
-        elif n == 7:
+        elif n == 6:
+            state, text = (("readonly", "Optional") if status["us_exists"]
+                           else ("todo", "Not started"))
+        elif n == 8:
             state, text = (("readonly", "Read-only") if status["brd_exists"]
                            else ("todo", "Not started"))
         else:
@@ -482,7 +505,7 @@ def _pipeline_steps(status: dict) -> list[dict]:
 
 
 def _render_step_rail(status: dict) -> str:
-    """Pure: build the scoped HTML for the horizontal SDLC step rail.
+    """Pure: build the scoped HTML for the horizontal 9-step SDLC rail.
 
     Content is built only from `_RAIL_STEPS` (static labels) + `_pipeline_steps`
     (fixed status words) + integer step numbers — no user/project text is
@@ -824,12 +847,9 @@ with st.sidebar:
     st.divider()
     st.subheader("User Stories")
     if us_latest:
-        st.metric("Current User Stories Version", f"v{us_latest.version}")
-        if us_final:
-            us_status = "Locked" if us_final.is_locked else "Unlocked"
-            st.success(f"Final User Stories: v{us_final.version}\n\nStatus: {us_status}")
-        else:
-            st.info("No final user stories selected yet.")
+        st.metric("Latest User Stories Version", f"v{us_latest.version}")
+        st.caption("User stories are not separately finalized — the latest version "
+                   "is always used downstream.")
     elif final_version:
         st.caption("Ready to generate. Open the User Story Workspace tab.")
     else:
@@ -951,6 +971,18 @@ with st.container():
         if awaiting_message:
             st.warning(awaiting_message)
 
+        # Phase 10B: non-blocking closure-report staleness. Informational only —
+        # the panel never regenerates, re-approves, or unlocks anything.
+        if pipeline_status.get("closure_report_stale"):
+            stale_srcs = ", ".join(pipeline_status.get("closure_report_stale_sources") or [])
+            st.warning(
+                f"A Closure Report exists, but its evidence may be **stale**: "
+                f"**{stale_srcs}** changed after it was generated. The pipeline "
+                f"does not treat this as fresh closure evidence. Review it in "
+                f"**Step 9** and regenerate there if appropriate — nothing is "
+                f"regenerated or re-approved automatically."
+            )
+
         pipeline_ready = latest_version is not None
         if not pipeline_ready:
             st.info(
@@ -987,11 +1019,11 @@ with st.container():
 st.divider()
 
 (tab_generate, tab_workspace, tab_hld, tab_stories,
- tab_lld, tab_usr, tab_qa, tab_closure) = st.tabs(
+ tab_lld, tab_usr, tab_qa, tab_traceability, tab_closure) = st.tabs(
     ["Step 1: Upload & Generate", "Step 2: BRD Workspace", "Step 3: HLD Workspace",
      "Step 4: User Story Workspace", "Step 5: LLD Workspace",
      "Step 6: User Story Refinement", "Step 7: QA / Test Case Workspace",
-     "Step 8: Closure Report"]
+     "Step 8: Traceability & Quality", "Step 9: Closure Report"]
 )
 
 
@@ -1561,15 +1593,19 @@ with tab_stories:
         with us_status_cols[1]:
             st.metric("Type", story_version_label(us_viewing))
         with us_status_cols[2]:
-            st.metric("Status", "Accepted" if us_viewing.is_final else "Draft")
+            st.metric("Status", "Latest" if us_is_current else "Older version")
 
         if us_is_locked:
-            if us_viewing.is_final:
-                st.success(f"This is the Final User Stories set (v{us_viewing.version}) and it "
-                           "is locked against further changes.")
-            else:
-                st.warning(f"The Final User Stories (v{us_final.version}) are locked. "
-                           "Unlock them below to make further changes.")
+            # Phase 10B: user stories are no longer a gated artifact and there is
+            # no unlock control anymore. A lock can only exist on legacy data.
+            st.warning(
+                f"A user-story version in this project carries a legacy \"locked\" "
+                f"flag (v{us_final.version}). User-story finalization was removed in "
+                f"this build, so this version can no longer be edited here. The "
+                f"latest version is still used by every downstream stage; create a "
+                f"fresh version via **Step 6: User Story Refinement** if you need "
+                f"to change the stories."
+            )
         elif not us_is_current:
             st.info(f"You are viewing an older user stories version (v{us_viewing.version}). "
                     f"Editing is only available on the current version (v{us_latest.version}).")
@@ -1586,7 +1622,8 @@ with tab_stories:
         with us_tab_edit:
             if not us_editable:
                 st.info("Editing is disabled for this version. "
-                        + ("Unlock the Final User Stories to continue." if us_is_locked
+                        + ("This version carries a legacy lock and can no longer be "
+                           "edited (see the banner above)." if us_is_locked
                            else "Switch to the current version to edit."))
                 st.text_area("User stories content (read-only)", value=us_viewing.content,
                              height=500, disabled=True, key=f"us_ro_{us_viewing.version}")
@@ -1619,7 +1656,8 @@ with tab_stories:
         with us_tab_refine:
             if not us_editable:
                 st.info("AI refinement is disabled for this version. "
-                        + ("Unlock the Final User Stories to continue." if us_is_locked
+                        + ("This version carries a legacy lock and can no longer be "
+                           "refined (see the banner above)." if us_is_locked
                            else "Switch to the current version to refine."))
             else:
                 st.caption("Describe your change in plain English. The AI receives the CURRENT "
@@ -1669,48 +1707,21 @@ with tab_stories:
 
         st.divider()
 
-        st.subheader("Final User Stories")
-        us_final_cols = st.columns([2, 2, 2])
+        # Phase 10B: User Stories are NOT an independently gated/finalized
+        # artifact in the main lifecycle. The "Choose Final" / "Unlock Final"
+        # controls have been removed — downstream stages (LLD, Test Cases,
+        # Refinement, Quality/Closure evidence) always consume the LATEST
+        # user-story version. History is append-only; a new version is created
+        # by editing / AI refine / Step 6 reconciliation.
+        if any(v.is_final for v in us_versions):
+            st.caption("Note: this project has a user-story version that was marked "
+                       "\"final\" under an earlier build. That flag is now ignored — "
+                       "the latest version is always used downstream. The historical "
+                       "flag is kept in history and is not removed.")
 
-        with us_final_cols[0]:
-            if not us_viewing.is_final:
-                if st.button(f"Choose v{us_viewing.version} as Final User Stories",
-                             key="us_choose_final"):
-                    try:
-                        us_service.choose_final_stories(us_viewing.version)
-                        refresh_us_versions()
-                        st.success(f"User Stories Version {us_viewing.version} is now Final.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(friendly_error(exc))
-            else:
-                st.caption("This version is the Final User Stories set.")
-
-        with us_final_cols[1]:
-            if us_is_locked:
-                if st.session_state.get("us_confirm_unlock"):
-                    st.warning("Unlock the Final User Stories? They stay in history unchanged; "
-                               "any new edit creates a new version.")
-                    yes_col, no_col = st.columns(2)
-                    if yes_col.button("Yes, unlock", key="us_unlock_yes"):
-                        try:
-                            us_service.unlock_final_stories()
-                            st.session_state.us_confirm_unlock = False
-                            refresh_us_versions()
-                            st.success("Final User Stories unlocked. Further edits will create "
-                                       "a new version.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(friendly_error(exc))
-                    if no_col.button("Cancel", key="us_unlock_cancel"):
-                        st.session_state.us_confirm_unlock = False
-                        st.rerun()
-                else:
-                    if st.button("Unlock Final User Stories", key="us_unlock_btn"):
-                        st.session_state.us_confirm_unlock = True
-                        st.rerun()
-
-        with us_final_cols[2]:
+        st.subheader("Export")
+        us_export_cols = st.columns([2, 4])
+        with us_export_cols[0]:
             # Export always uses the version being viewed, so what you see is what you download.
             if st.button("Prepare .docx for download", key="us_prepare_docx"):
                 with st.spinner("Formatting Word document..."):
@@ -2034,9 +2045,10 @@ with tab_usr:
             f"v{lld_final.version}" if lld_final is not None else "—",
             "Accepted (context)" if lld_final is not None else "none — optional",
         )
-        us_state = ("Locked" if us_is_locked else
-                    ("Accepted" if (us_final and us_final.version == us_latest.version) else "Draft"))
-        src_cols[3].metric("User Stories", f"v{us_latest.version}", us_state)
+        src_cols[3].metric(
+            "User Stories", f"v{us_latest.version}",
+            "Latest (legacy lock)" if us_is_locked else "Latest",
+        )
         st.caption("HLD and LLD are optional context — refinement proceeds without them "
                    "(the agent receives a sentinel). Only accepted/final versions are used.")
 
@@ -2065,8 +2077,11 @@ with tab_usr:
         st.divider()
         st.subheader("Artifact Refinement")
         if us_is_locked:
-            st.info("The Final User Stories are locked. Unlock them in Step 4 "
-                    "(User Story Workspace) before refining.")
+            st.warning("A user-story version in this project carries a legacy "
+                       "\"locked\" flag. User-story finalization was removed in this "
+                       "build, so refinement of a locked stream is blocked and "
+                       "there is no unlock control. This only affects projects "
+                       "created under an earlier build.")
         st.caption(f"Refinement starts from the current latest version "
                    f"(v{us_latest.version}), whatever its origin (initial, manual edit, or a "
                    "previous refinement). Existing US-NNN IDs and unaffected stories are "
@@ -2171,16 +2186,14 @@ with tab_qa:
             f"v{lld_final.version}" if lld_final is not None else "—",
             "Accepted / Context" if lld_final is not None else "none / optional",
         )
-        if us_final is not None:
-            us_label, us_state = f"v{us_final.version}", "Final / Context"
-        elif us_latest is not None:
+        if us_latest is not None:
             us_label, us_state = f"v{us_latest.version}", "Latest / Context"
         else:
             us_label, us_state = "—", "none / optional"
         qa_src_cols[3].metric("User Stories", us_label, us_state)
         st.caption("HLD, LLD and User Stories are optional context - their absence never "
-                   "blocks BRD-based generation. Only accepted/final versions are used "
-                   "(User Stories fall back to the latest available).")
+                   "blocks BRD-based generation. HLD/LLD use the accepted/final version; "
+                   "User Stories always use the latest version.")
 
         if qa_latest is None:
             # --- 3. First generation ----------------------------------------
@@ -2445,14 +2458,185 @@ with tab_qa:
                         st.error(friendly_error(exc))
 
 
-# --- STEP 8: Closure Report -----------------------------------------------------------
+# --- STEP 8: Traceability & Quality (READ-ONLY) ------------------------------------
 #
-# Phase 7. Additive, mirrors the other artifact tabs. The Closure Report is the
-# final evidence-based synthesis of the SDLC; it CONSUMES the Traceability and
-# Project Quality reports (read-only) plus the persisted artifacts. Only a final
-# BRD is a hard prerequisite; every other missing/incomplete artifact is
-# represented inside the report. Generation NEVER finalizes — "Choose Final" is a
-# separate, human-only action, exactly like every other stage.
+# Phase 10B. A read-only window onto the existing deterministic reporting layer:
+# `build_project_quality_report_for_project()` (artifact status, requirement /
+# user-story coverage, test-case reference population, grounding & orphan
+# findings) and `build_project_traceability_report()` (the requirement ->
+# user-story -> test-case matrix). NOTHING here generates, edits, approves,
+# unlocks, or calls Gemini. Every number is taken straight from those functions —
+# no metric is recomputed in Streamlit.
+
+with tab_traceability:
+    st.caption("Read-only evidence view. Deterministic, computed locally from the "
+               "persisted artifacts — no AI call, nothing is generated or approved "
+               "here. Numbers come straight from the Project Quality Report and "
+               "the Traceability matrix.")
+
+    if latest_version is None:
+        st.info("No BRD yet. Traceability & Quality evidence appears once a BRD "
+                "has been generated in Step 1. (An empty project has nothing to "
+                "trace.)")
+    else:
+        try:
+            _tq_quality = build_project_quality_report_for_project(
+                st.session_state.project_id,
+                ba_service=service, sa_service=sa_service, us_service=us_service,
+                lld_service=lld_service, tc_service=qa_service,
+            )
+            _tq_trace = build_project_traceability_report(
+                st.session_state.project_id,
+                ba_service=service, sa_service=sa_service, us_service=us_service,
+                lld_service=lld_service, tc_service=qa_service,
+            )
+        except Exception as exc:
+            _tq_quality = _tq_trace = None
+            st.error(friendly_error(exc))
+
+        if _tq_quality is not None:
+            _astat = _tq_quality["artifact_status"]
+            if not _astat["test_cases"]["exists"]:
+                st.info("This is a partial project — some artifacts have not been "
+                        "generated yet. The evidence below reflects only what "
+                        "currently exists; missing artifacts are shown as "
+                        "\"not generated\".")
+
+            # --- 1. Artifact status -------------------------------------------
+            st.subheader("Artifact status")
+            _astat_rows = []
+            for _key, _label in (("brd", "BRD"), ("hld", "HLD"),
+                                 ("user_stories", "User Stories"), ("lld", "LLD"),
+                                 ("test_cases", "Test Cases")):
+                _i = _astat[_key]
+                _fin = _i["final_version"]
+                _astat_rows.append({
+                    "Artifact": _label,
+                    "Exists": "Yes" if _i["exists"] else "No",
+                    "Latest version": f"v{_i['latest_version']}" if _i["latest_version"] else "—",
+                    "Final version": (
+                        "N/A (no finalization stage)" if _key == "user_stories"
+                        else (f"v{_fin}" if _fin is not None else ("None" if _i["exists"] else "—"))
+                    ),
+                })
+            st.dataframe(_astat_rows, use_container_width=True, hide_index=True)
+            st.caption("User Stories are not an independently finalized artifact in "
+                       "the main lifecycle — the latest version is always used "
+                       "downstream.")
+
+            # --- 2. Requirement coverage ------------------------------------
+            _rc = _tq_quality["requirement_coverage"]
+            st.subheader("Requirement coverage")
+            _rc_cols = st.columns(4)
+            _rc_cols[0].metric("Total requirements", _rc["total"])
+            _rc_cols[1].metric("Covered", _rc["covered"])
+            _rc_cols[2].metric("Uncovered", _rc["total"] - _rc["covered"])
+            _rc_cols[3].metric("Coverage", f"{_rc['coverage_pct']}%")
+            _by_kind = _rc.get("by_kind") or {}
+            if _by_kind:
+                _kind_labels = {"FR": "Functional Requirements",
+                                "NFR": "Non-Functional Requirements",
+                                "BR": "Business Requirements"}
+                _bk_rows = [{
+                    "Requirement kind": _kind_labels.get(_k, _k),
+                    "Total": _v["total"], "Covered": _v["covered"],
+                    "Coverage %": f"{_v['coverage_pct']}%",
+                } for _k, _v in _by_kind.items()]
+                st.dataframe(_bk_rows, use_container_width=True, hide_index=True)
+            if _rc["uncovered_ids"]:
+                with st.expander(f"Uncovered requirement IDs ({len(_rc['uncovered_ids'])})"):
+                    st.write(", ".join(map(str, _rc["uncovered_ids"])))
+            st.caption("\"Covered\" means the requirement has at least one linked "
+                       "user story AND at least one linked test case (direct or "
+                       "story-mediated) — the existing traceability-matrix "
+                       "definition.")
+
+            # --- 3. User story coverage -----------------------------------
+            _uc = _tq_quality["user_story_coverage"]
+            st.subheader("User story coverage")
+            _uc_cols = st.columns(4)
+            _uc_cols[0].metric("Total user stories", _uc["total"])
+            _uc_cols[1].metric("Covered by test cases", _uc["covered"])
+            _uc_cols[2].metric("Uncovered", _uc["total"] - _uc["covered"])
+            _uc_cols[3].metric("Coverage", f"{_uc['coverage_pct']}%")
+            if _uc["uncovered_ids"]:
+                with st.expander(f"Uncovered user story IDs ({len(_uc['uncovered_ids'])})"):
+                    st.write(", ".join(map(str, _uc["uncovered_ids"])))
+
+            # --- 4. Test case reference population -----------------------
+            st.subheader("Test case reference population")
+            st.caption("How many test cases populate each reference field. This is "
+                       "traceability *evidence*, not the same thing as full "
+                       "requirement coverage — a populated field only means a "
+                       "reference was written, not that it is grounded or covers a "
+                       "requirement end-to-end.")
+            _pop = _tq_quality["test_case_reference_population"]
+            _pop_rows = [{
+                "Reference field": _f.replace("_", " "),
+                "Populated": f"{_d['populated']} of {_d['total']}",
+                "Schema-required": "Yes" if _d["required"] else "No (optional context)",
+            } for _f, _d in _pop.items()]
+            st.dataframe(_pop_rows, use_container_width=True, hide_index=True)
+
+            # --- 5. Grounding findings ---------------------------------
+            _gf = _tq_quality["grounding_findings"]
+            st.subheader("Grounding findings")
+            st.metric("Ungrounded references", _gf["total"])
+            if _gf["entries"]:
+                st.caption("A cited reference that was not found in the artifact it "
+                           "points at. Diagnostic only.")
+                st.dataframe(_gf["entries"], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No ungrounded references. (Diagnostic — does not affect "
+                           "coverage numbers.)")
+
+            # --- 6. Orphan references --------------------------------
+            _orf = _tq_quality["orphan_references"]
+            st.subheader("Orphan references")
+            st.metric("Orphan references", _orf["total"])
+            if _orf["entries"]:
+                st.caption("A test-case reference that matches no known requirement "
+                           "or user story. Diagnostic only — orphans never change "
+                           "the coverage calculations above.")
+                st.dataframe(_orf["entries"], use_container_width=True, hide_index=True)
+            else:
+                st.caption("No orphan references. (Diagnostic — does not affect "
+                           "coverage numbers.)")
+
+            # --- 7. Traceability matrix -----------------------------
+            st.subheader("Traceability matrix")
+            _matrix = (_tq_trace or {}).get("traceability_matrix") or []
+            if not _matrix:
+                st.info("No requirements extracted from the BRD yet — the matrix is "
+                        "empty.")
+            else:
+                _mrows = [{
+                    "requirement_id": _r["requirement_id"],
+                    "requirement_kind": _r["requirement_kind"],
+                    "requirement_title": _r.get("requirement_title") or "",
+                    "user_story_ids": ", ".join(_r["user_story_ids"]),
+                    "test_case_ids": ", ".join(_r["test_case_ids"]),
+                    "test_case_ids_direct": ", ".join(_r["test_case_ids_direct"]),
+                    "test_case_ids_via_story": ", ".join(_r["test_case_ids_via_story"]),
+                    "has_user_stories": "Yes" if _r["has_user_stories"] else "No",
+                    "has_test_cases": "Yes" if _r["has_test_cases"] else "No",
+                    "is_covered": "Yes" if _r["is_covered"] else "No",
+                } for _r in _matrix]
+                st.dataframe(_mrows, use_container_width=True, hide_index=True)
+                st.caption("Read-only. `test_case_ids` is the de-duplicated union of "
+                           "`test_case_ids_direct` and `test_case_ids_via_story`.")
+
+
+# --- STEP 9: Closure Report -----------------------------------------------------------
+#
+# Phase 7 (renumbered to Step 9 in Phase 10B). Additive, mirrors the other
+# artifact tabs. The Closure Report is the final evidence-based synthesis of the
+# SDLC; it CONSUMES the Traceability and Project Quality reports (read-only) plus
+# the persisted artifacts. Only a final BRD is a hard prerequisite; every other
+# missing/incomplete artifact is represented inside the report. Generation NEVER
+# finalizes — "Choose Final" is a separate, human-only action, exactly like every
+# other stage. A non-blocking staleness banner (Phase 10B) tells the user when the
+# report's evidence is out of date; it never regenerates or re-approves anything.
 
 with tab_closure:
     st.caption("Phase 7: the final project closure assessment. Deterministic facts "
@@ -2519,6 +2703,36 @@ with tab_closure:
                 st.metric("Status", "Accepted" if closure_viewing.is_final else "Draft")
 
             st.info(f"Current version **v{closure_latest.version}** — {closure_latest.note}")
+
+            # Phase 10B: non-blocking staleness. The report is NEVER regenerated,
+            # re-approved, unlocked, or replaced automatically — this only tells
+            # the human that the evidence has moved on.
+            try:
+                _cr_stale_sources = closure_service.stale_sources()
+            except Exception:
+                _cr_stale_sources = []
+            if _cr_stale_sources:
+                _rec = closure_service.recorded_source_versions() or {}
+                _cur = closure_service.current_source_versions()
+                _keymap = {"BRD": "brd", "HLD": "hld", "LLD": "lld",
+                           "User Stories": "us", "Test Cases": "tc"}
+
+                def _vtxt(v):
+                    return f"v{v}" if v is not None else "—"
+
+                _parts = [
+                    f"{name} {_vtxt(_rec.get(_keymap[name]))} → {_vtxt(_cur.get(_keymap[name]))}"
+                    for name in _cr_stale_sources
+                ]
+                st.warning(
+                    "**This Closure Report's evidence may be stale.** The following "
+                    "changed after it was generated: **" + "; ".join(_parts) + "**. "
+                    "The report below is unchanged and still reflects the older "
+                    "evidence. Nothing is regenerated, re-approved, or unlocked "
+                    "automatically — use **Regenerate from Project Evidence** below "
+                    "if you want a report built from the current state, then review "
+                    "and finalize it yourself."
+                )
 
             if closure_is_locked:
                 if closure_viewing.is_final:

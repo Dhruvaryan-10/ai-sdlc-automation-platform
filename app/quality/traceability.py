@@ -516,6 +516,17 @@ def _select_version(service) -> tuple["BRDVersion | None", str | None]:
     return versions[-1], "latest"
 
 
+def _select_latest_version(service) -> tuple["BRDVersion | None", str | None]:
+    """Always the newest version (or (None, None)). Phase 10B: used for User
+    Stories, which are NOT an independently finalized artifact in the main
+    lifecycle, so an `is_final` flag on an older user-story version must not
+    override a newer one. Read-only; no writes."""
+    versions = service.get_all_versions()
+    if not versions:
+        return None, None
+    return versions[-1], "latest"
+
+
 def _artifact_summary(version, kind: str | None) -> dict:
     return {
         "exists": version is not None,
@@ -564,7 +575,7 @@ def build_project_traceability_report(
     tc = tc_service or TestCaseService(project_id=project_id)
 
     brd_v, brd_kind = _select_version(ba)
-    us_v, us_kind = _select_version(us)
+    us_v, us_kind = _select_latest_version(us)   # Phase 10B: latest, never an older is_final
     tc_v, tc_kind = _select_version(tc)
     hld_v, hld_kind = _select_version(sa)
     lld_v, lld_kind = _select_version(lld)

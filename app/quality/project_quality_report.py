@@ -178,7 +178,9 @@ def build_project_quality_report(
 
 # --- 3. artifact status (project-level only - needs real version history) --
 
-def _artifact_version_info(service) -> tuple[int | None, int | None, "BRDVersion | None"]:
+def _artifact_version_info(
+    service, *, prefer_final: bool = True
+) -> tuple[int | None, int | None, "BRDVersion | None"]:
     """(latest_version, final_version, selected_version) for one artifact.
 
     `selected_version` is final-preferred (else latest, else None) - the SAME
@@ -190,6 +192,13 @@ def _artifact_version_info(service) -> tuple[int | None, int | None, "BRDVersion
     collapse them into one chosen version) so a newer draft after
     finalization is visible rather than silently hidden - the exact facts
     `app/orchestration/status.py::sdlc_status()` already exposes.
+
+    `prefer_final=False` forces the LATEST version to be the `selected_version`
+    regardless of any `is_final` flag - used for User Stories, which Phase 10B
+    treats as NOT an independently finalized artifact in the main lifecycle (an
+    `is_final` flag on an older user-story version must not override a newer
+    one). `final_version` is still returned for callers that want it, but the
+    project-level `artifact_status.user_stories.final_version` stays `None`.
 
     Deliberately duplicates that same trivial "scan get_all_versions() for
     is_final, else use the newest" computation locally rather than importing
@@ -205,7 +214,10 @@ def _artifact_version_info(service) -> tuple[int | None, int | None, "BRDVersion
     latest_version = versions[-1].version
     final = next((v for v in versions if v.is_final), None)
     final_version = final.version if final is not None else None
-    selected = final if final is not None else versions[-1]
+    if prefer_final and final is not None:
+        selected = final
+    else:
+        selected = versions[-1]
     return latest_version, final_version, selected
 
 
@@ -255,7 +267,9 @@ def build_project_quality_report_for_project(
 
     brd_latest, brd_final, brd_v = _artifact_version_info(ba)
     hld_latest, hld_final, hld_v = _artifact_version_info(sa)
-    us_latest, _us_final_unused, us_v = _artifact_version_info(us)
+    # User Stories: analyze the LATEST version, never a (possibly older)
+    # `is_final` one — see `_artifact_version_info(prefer_final=...)` and Phase 10B.
+    us_latest, _us_final_unused, us_v = _artifact_version_info(us, prefer_final=False)
     lld_latest, lld_final, lld_v = _artifact_version_info(lld)
     tc_latest, tc_final, tc_v = _artifact_version_info(tc)
 

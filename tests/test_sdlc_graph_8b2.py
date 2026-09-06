@@ -405,6 +405,7 @@ def test_status_empty_project(stub_ba_agent, stub_sa_agent, stub_us_agent):
         "awaiting_test_cases_approval": False,
         "closure_exists": False, "closure_latest_version": None,
         "closure_final_version": None, "awaiting_closure_approval": False,
+        "closure_report_stale": False, "closure_report_stale_sources": [],
         "next_step": NEXT_GENERATE_BRD,
     }
 

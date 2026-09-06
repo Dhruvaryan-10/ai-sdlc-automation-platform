@@ -179,9 +179,11 @@ def test_lld_v1_generated_after_final_hld(stub_ba_agent, stub_sa_agent, stub_us_
     assert s["lld_latest_version"] == 1
     lld_v1 = lld.get_version(1)
     assert lld_v1.source == "initial"
-    assert lld_v1.source_ref == "hld_v1"
+    # Phase 10B: LLD provenance is now the composite of every upstream version
+    # consumed (HLD required; BRD + latest User Stories as recorded context).
+    assert lld_v1.source_ref == "hld_v1;brd_v1;us_v1"
     assert lld_v1.note.startswith("Generated from accepted HLD v1")
-    assert "(with draft user stories as context)" in lld_v1.note  # ensure_user_stories ran earlier
+    assert "User Stories v1 (context)" in lld_v1.note  # ensure_user_stories ran earlier
     assert len(stub_lld_agent.generate_calls) == 1
     assert stub_lld_agent.generate_calls[0][0]  # the final HLD content was passed
 
@@ -328,7 +330,9 @@ def test_graph_lld_matches_direct_service(stub_ba_agent, stub_sa_agent, stub_us_
 
     assert graphed.content == direct.content
     assert graphed.source == direct.source == "initial"
-    assert graphed.source_ref == direct.source_ref == "hld_v1"
+    # Phase 10B composite provenance — identical whether generated via the graph
+    # or the service directly (HLD v1 + BRD v1 + User Stories v1).
+    assert graphed.source_ref == direct.source_ref == "hld_v1;brd_v1;us_v1"
     assert graphed.note == direct.note
     assert graphed.version == direct.version == 1
 

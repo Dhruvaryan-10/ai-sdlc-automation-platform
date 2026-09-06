@@ -98,12 +98,24 @@ class SolutionArchitectService:
     # --- step 1: generate HLD v1 ------------------------------------------------
 
     def generate_initial_hld(self) -> BRDVersion:
-        """Generate HLD version 1 from the accepted/final BRD. Blocked if none exists."""
+        """Generate an HLD from the accepted/final BRD. Blocked if no final BRD exists.
+
+        Normally HLD version 1, but the service contract is now safe against a
+        direct repeat call: the in-document `**Version:**` line is stamped with
+        the ACTUAL next version number (never a hard-coded 1), and generation
+        through a locked final HLD is refused. Append-only history is preserved;
+        the orchestration graph still guards and no-ops when an HLD already exists.
+        """
+        if self.is_locked():
+            raise HLDLockedError(
+                "The final HLD is locked. Unlock it before generating a new HLD version."
+            )
         final_brd = self._require_final_brd()
         metadata = self._derive_metadata_from_brd(final_brd.content)
 
         hld_text = self._agent.generate_hld(final_brd.content, metadata)
-        hld_text = stamp_version_number(hld_text, version_number=1)
+        n = self._next_version_number()
+        hld_text = stamp_version_number(hld_text, version_number=n)
 
         return self._version_service.add_version(
             content=hld_text,
@@ -121,11 +133,17 @@ class SolutionArchitectService:
             )
         if not edited_content or not edited_content.strip():
             raise ValueError("Cannot save an empty HLD")
+        latest = self._version_service.get_latest_version()
         edited_content = stamp_version_number(
             edited_content, version_number=self._next_version_number()
         )
         return self._version_service.add_version(
-            content=edited_content, source="manual_edit", note=note
+            content=edited_content,
+            source="manual_edit",
+            note=note,
+            # A hand edit does not change which BRD the HLD is based on — carry
+            # the prior provenance forward (Phase 10B).
+            source_ref=latest.source_ref if latest else None,
         )
 
     # --- step 2b: AI refine ------------------------------------------------------------
@@ -148,6 +166,9 @@ class SolutionArchitectService:
             content=stamp_version_number(refined_text, self._next_version_number()),
             source="ai_refine",
             note=user_feedback,
+            # A freeform refine reworks the SAME HLD against the SAME BRD — carry
+            # the prior provenance forward (Phase 10B).
+            source_ref=latest.source_ref,
         )
 
     def _next_version_number(self) -> int:

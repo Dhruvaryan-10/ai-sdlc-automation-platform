@@ -28,7 +28,8 @@ NEXT_GENERATE_TEST_CASES = "generate_test_cases"   # final LLD, but no test-case
 NEXT_APPROVE_TEST_CASES = "approve_test_cases"     # test cases exist but none is final
 NEXT_GENERATE_CLOSURE_REPORT = "generate_closure_report"  # final test cases, but no closure report yet
 NEXT_APPROVE_CLOSURE_REPORT = "approve_closure_report"    # a closure report exists but none is final
-NEXT_NONE = None                                   # closure report is final; no further graph steps
+NEXT_REVIEW_CLOSURE_REPORT = "review_closure_report"      # a FINAL closure report exists but its upstream evidence changed
+NEXT_NONE = None                                   # closure report is final AND its evidence is current; no further graph steps
 
 
 def sdlc_status(
@@ -71,6 +72,14 @@ def sdlc_status(
     tc_final = tc.get_final()
     closure_versions = closure.get_all_versions()
     closure_final = closure.get_final()
+    # Phase 10B: non-blocking closure-report staleness (additive; never changes
+    # next_step, never regenerates). `stale_sources()` returns [] when there is
+    # no closure report or nothing changed.
+    try:
+        closure_report_stale_sources = closure.stale_sources()
+    except Exception:  # pragma: no cover - staleness is a hint, never fatal
+        closure_report_stale_sources = []
+    closure_report_stale = bool(closure_report_stale_sources)
 
     brd_latest_version = brd_versions[-1].version if brd_versions else None
     brd_final_version = brd_final.version if brd_final else None
@@ -124,6 +133,14 @@ def sdlc_status(
         next_step = NEXT_GENERATE_CLOSURE_REPORT
     elif closure_final_version is None:
         next_step = NEXT_APPROVE_CLOSURE_REPORT
+    elif closure_report_stale:
+        # Phase 10B governance: a FINAL closure report whose upstream evidence
+        # (BRD/HLD/LLD/User Stories/Test Cases) has since changed must NOT leave
+        # the pipeline in the terminal "complete" state. This routes the user
+        # back to an explicit human review/regeneration in Step 9. It does NOT
+        # regenerate, re-approve, or unlock anything — `stale_sources()` stays a
+        # pure read-only signal and the closure report keeps its final version.
+        next_step = NEXT_REVIEW_CLOSURE_REPORT
     else:
         next_step = NEXT_NONE
 
@@ -151,5 +168,7 @@ def sdlc_status(
         "closure_latest_version": closure_latest_version,
         "closure_final_version": closure_final_version,
         "awaiting_closure_approval": awaiting_closure_approval,
+        "closure_report_stale": closure_report_stale,
+        "closure_report_stale_sources": closure_report_stale_sources,
         "next_step": next_step,
     }

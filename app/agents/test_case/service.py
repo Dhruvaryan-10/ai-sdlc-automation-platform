@@ -134,10 +134,16 @@ class TestCaseService:
             )
 
     def _gather_optional(self):
-        """The authoritative optional-context versions, or None when unavailable."""
+        """The authoritative optional-context versions, or None when unavailable.
+
+        HLD / LLD use the accepted/final version. User Stories use the LATEST
+        version (Phase 10B: user stories are not an independently finalized
+        artifact in the main lifecycle, so an `is_final` flag on an older
+        version must NOT override a newer one).
+        """
         hld = self._hld.get_final_version()
         lld = self._lld.get_final_version()
-        us = self._us.get_final_version() or self._us.get_latest_version()
+        us = self._us.get_latest_version()
         return hld, lld, us
 
     # --- helpers -----------------------------------------------------------
@@ -527,11 +533,14 @@ class TestCaseService:
         return parsed
 
     def current_source_versions(self) -> dict:
-        """The current authoritative version numbers of every source (None if absent)."""
+        """The current authoritative version numbers of every source (None if absent).
+
+        User Stories: the LATEST version (Phase 10B — see `_gather_optional`).
+        """
         brd = self._brd.get_final_version()
         hld = self._hld.get_final_version()
         lld = self._lld.get_final_version()
-        us = self._us.get_final_version() or self._us.get_latest_version()
+        us = self._us.get_latest_version()
         return {
             "brd": brd.version if brd else None,
             "hld": hld.version if hld else None,
