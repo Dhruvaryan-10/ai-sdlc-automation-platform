@@ -302,3 +302,48 @@ def test_persisted_test_case_artifact_is_not_modified_by_preview():
     # ... but wrote nothing: the file on disk is byte-identical.
     assert versions_file.read_bytes() == before
     assert "- 1. " in stored  # the stored artifact still has the legacy shape
+
+
+# --- Phase 12B: friendly_error() now delegates to the error taxonomy ------
+
+from app.ui.streamlit_app import friendly_error  # noqa: E402
+from app.utils.errors import ErrorCategory, classify  # noqa: E402
+
+
+def test_friendly_error_delegates_to_classify_user_message():
+    exc = ValueError("Refinement feedback cannot be empty")
+    assert friendly_error(exc) == classify(exc).user_message
+
+
+def test_friendly_error_version_persistence_error_is_no_longer_the_generic_retry_message():
+    from app.services.version_service import VersionPersistenceError
+
+    msg = friendly_error(
+        VersionPersistenceError(
+            "Version history for 'proj/hld' is corrupt and could not be recovered from a backup."
+        )
+    )
+    assert msg != "Something went wrong while processing that request. Please try again."
+    assert classify(VersionPersistenceError("x")).category is ErrorCategory.PERSISTENCE_CORRUPT
+    assert ("restore" in msg.lower()) or ("backup" in msg.lower())
+    assert "Traceback" not in msg
+
+
+def test_friendly_error_preserves_prerequisite_and_lock_messages():
+    from app.agents.business_analyst.service import BRDLockedError
+    from app.agents.solution_architect.service import NoFinalBRDError
+
+    prereq_msg = "Accept a BRD before generating the HLD."
+    lock_msg = "The final BRD is locked. Unlock it before making further changes."
+    assert friendly_error(NoFinalBRDError(prereq_msg)) == prereq_msg
+    assert friendly_error(BRDLockedError(lock_msg)) == lock_msg
+
+
+def test_friendly_error_always_returns_a_nonempty_string_and_never_raises():
+    for exc in (
+        ValueError("x"), RuntimeError("y"), KeyError("z"), Exception("w"),
+        OSError("disk"), TypeError("t"),
+    ):
+        out = friendly_error(exc)
+        assert isinstance(out, str) and out.strip()
+        assert "Traceback" not in out

@@ -28,58 +28,18 @@ import streamlit as st
 # Allow running as `streamlit run app/ui/streamlit_app.py` from the project root.
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from app.agents.business_analyst.agent import BusinessAnalystAgentError, ProjectMetadata
-from app.agents.business_analyst.service import (
-    BRDLockedError,
-    BusinessAnalystService,
-    EmptyDocumentError,
-    UnsupportedFileTypeError,
-)
-from app.agents.solution_architect.agent import SolutionArchitectAgentError
-from app.agents.solution_architect.service import (
-    HLDLockedError,
-    NoFinalBRDError,
-    SolutionArchitectService,
-)
-from app.agents.initial_user_story.agent import InitialUserStoryAgentError
-from app.agents.initial_user_story.service import (
-    InitialUserStoryService,
-    UserStoryLockedError,
-)
-from app.agents.initial_user_story.service import (
-    NoFinalBRDError as NoFinalBRDErrorForStories,
-)
-from app.agents.low_level_design.agent import LLDAgentError
-from app.agents.low_level_design.service import (
-    LLDLockedError,
-    LowLevelDesignService,
-    NoFinalHLDError,
-)
-from app.agents.user_story_refinement.agent import UserStoryRefinementAgentError
-from app.agents.user_story_refinement.service import (
-    NoInitialUserStoriesError,
-    RefinementLockedError,
-    UserStoryRefinementService,
-)
-from app.agents.user_story_refinement.service import (
-    NoFinalBRDError as NoFinalBRDErrorForRefinement,
-)
-from app.agents.test_case.agent import TestCaseAgentError
-from app.agents.test_case.service import (
-    TestCaseLockedError,
-    TestCaseService,
-)
-from app.agents.test_case.service import (
-    NoFinalBRDError as NoFinalBRDErrorForQA,
-)
-from app.agents.closure_report.agent import ClosureReportAgentError
-from app.agents.closure_report.service import (
-    ClosureReportLockedError,
-    ClosureReportService,
-)
-from app.agents.closure_report.service import (
-    NoFinalBRDError as NoFinalBRDErrorForClosure,
-)
+# Phase 12B: exception-type imports that previously fed `friendly_error`'s
+# isinstance ladder now live in `app.utils.errors` (the classifier). The UI only
+# needs the service classes + ProjectMetadata; every error path goes through
+# `friendly_error` -> `app.utils.errors.classify`.
+from app.agents.business_analyst.agent import ProjectMetadata
+from app.agents.business_analyst.service import BusinessAnalystService
+from app.agents.solution_architect.service import SolutionArchitectService
+from app.agents.initial_user_story.service import InitialUserStoryService
+from app.agents.low_level_design.service import LowLevelDesignService
+from app.agents.user_story_refinement.service import UserStoryRefinementService
+from app.agents.test_case.service import TestCaseService
+from app.agents.closure_report.service import ClosureReportService
 from app.orchestration.graph import run_step
 from app.orchestration.status import sdlc_status
 from app.quality.project_quality_report import build_project_reports_for_project
@@ -93,6 +53,7 @@ from app.document_generator.brd_generator import (
 )
 from app.ui.project_registry import list_existing_projects, sanitize_project_id
 from app.utils.config import settings
+from app.utils.errors import classify, log_app_error
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -231,34 +192,14 @@ def story_version_label(v) -> str:
 
 
 def friendly_error(exc: Exception) -> str:
-    """Map an exception to a user-facing message. Technical detail goes to logs only."""
-    logger.error(f"{type(exc).__name__}: {exc}", exc_info=True)
-
-    if isinstance(exc, UnsupportedFileTypeError):
-        return "That file type isn't supported. Please upload a DOCX, PDF, or TXT file."
-    if isinstance(exc, EmptyDocumentError):
-        return ("No readable text was found in that document. If it's a scanned PDF, "
-                "please upload a text-based version instead.")
-    if isinstance(exc, (BusinessAnalystAgentError, SolutionArchitectAgentError,
-                        InitialUserStoryAgentError, LLDAgentError,
-                        UserStoryRefinementAgentError, TestCaseAgentError,
-                        ClosureReportAgentError)):
-        return ("Unable to reach the Gemini API. Please check your API key and network "
-                "connection, then try again.")
-    if isinstance(exc, (NoFinalBRDError, NoFinalBRDErrorForStories, NoFinalHLDError,
-                        NoFinalBRDErrorForRefinement, NoInitialUserStoriesError,
-                        NoFinalBRDErrorForQA, NoFinalBRDErrorForClosure)):
-        return str(exc)
-    if isinstance(exc, (BRDLockedError, HLDLockedError, UserStoryLockedError, LLDLockedError,
-                        RefinementLockedError, TestCaseLockedError, ClosureReportLockedError)):
-        return str(exc)
-    if isinstance(exc, ValueError):
-        return str(exc)
-    if isinstance(exc, PermissionError):
-        return "Could not write to disk. Please check folder permissions and try again."
-    if isinstance(exc, OSError):
-        return "A file system error occurred while saving. Please try again."
-    return "Something went wrong while processing that request. Please try again."
+    """Classify `exc` (`app.utils.errors.classify`) and return a safe user-facing
+    message. Technical detail is logged at the classification's level via
+    `log_app_error`; no traceback, provider text, `ValidationError` values, API
+    keys, or artifact content ever reaches the UI. Every existing caller —
+    `st.error(friendly_error(exc))` — is unchanged (Phase 12B)."""
+    classified = classify(exc)
+    log_app_error(logger, classified, exc)
+    return classified.user_message
 
 
 # --- Phase 8B-6: pure SDLC Pipeline panel formatting helpers -----------------------
