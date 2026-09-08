@@ -125,6 +125,19 @@ PyMuPDF (file parsing/export), and pydantic (config/validation).
    real API key you copied from Google AI Studio.
 3. Save the file. **Never commit `.env` to git** — it contains your secret key.
 
+Every setting in `.env` is checked once when the app starts. If a value is
+missing or out of range the app stops immediately with a plain-English message
+(the offending value is never printed). Valid values:
+
+| Setting | Rule |
+| --- | --- |
+| `GOOGLE_API_KEY` | Required; a real key (not empty, not the placeholder). |
+| `GEMINI_TEMPERATURE` | Number from `0.0` to `2.0` inclusive. |
+| `GEMINI_TIMEOUT_SECONDS` | Integer `1` or greater. |
+| `GEMINI_MAX_RETRIES` | Integer `0` or greater. |
+| `LOG_LEVEL` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (any case). |
+| `UPLOAD_DIR` / `OUTPUT_DIR` / `LOG_DIR` | Any path; relative paths resolve against the directory you launch from, so run the app from the repository root. The folders are created automatically. |
+
 ---
 
 ## 3. Running the App
@@ -134,6 +147,9 @@ With your virtual environment activated (prompt shows `(venv)`):
 ```bash
 streamlit run app/ui/streamlit_app.py
 ```
+
+Run this from the **repository root** so the `uploads/`, `outputs/`, and
+`logs/` folders resolve to the right place.
 
 Your browser should open automatically to `http://localhost:8501`. If not,
 open that URL manually.
@@ -373,6 +389,9 @@ pytest
 
 - **`ValidationError: google_api_key Field required`** — you haven't created
   `.env` yet, or it's missing `GOOGLE_API_KEY`. See Step 2.3.
+- **App stops at startup with "Configuration error"** — a value in `.env` is
+  out of range or misspelled. The message names which field to check; the
+  value itself is not shown. See the valid-values table in Step 2.3.
 - **`streamlit: command not found`** — your virtual environment isn't
   activated. Re-run the activation command from Step 2.1.
 - **Gemini errors about quota/rate limit** — the free tier has request

@@ -28,6 +28,32 @@ import streamlit as st
 # Allow running as `streamlit run app/ui/streamlit_app.py` from the project root.
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
+# --- Phase 13B: configuration boundary ---------------------------------------
+# `app/utils/config.py` runs `Settings()` at import time; the first `app.*`
+# import below triggers it transitively (agent -> llm -> config). Load and
+# validate it HERE, in isolation — `config.py` imports only `pathlib` +
+# `pydantic_settings` (no logger, no other `app` module, so no import cycle) —
+# so an invalid `.env` renders a clean message instead of an unhandled
+# traceback from deep in the import chain. ONLY a configuration
+# `ValidationError` is handled here; anything else propagates normally.
+from pydantic import ValidationError as _ConfigValidationError
+
+try:
+    from app.utils.config import settings
+except _ConfigValidationError:
+    st.error(
+        "**Configuration error — the application cannot start.**\n\n"
+        "One or more settings in your `.env` file are missing or invalid. Check that:\n\n"
+        "- `GOOGLE_API_KEY` is set to a real Gemini API key\n"
+        "- `GEMINI_TEMPERATURE` is between `0.0` and `2.0`\n"
+        "- `GEMINI_TIMEOUT_SECONDS` is `1` or greater\n"
+        "- `GEMINI_MAX_RETRIES` is `0` or greater\n"
+        "- `LOG_LEVEL` is one of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`\n\n"
+        "See **README section 2.3** for setup. The specific value is not shown here "
+        "for security; check the application logs for the field name."
+    )
+    st.stop()
+
 # Phase 12B: exception-type imports that previously fed `friendly_error`'s
 # isinstance ladder now live in `app.utils.errors` (the classifier). The UI only
 # needs the service classes + ProjectMetadata; every error path goes through
@@ -52,11 +78,17 @@ from app.document_generator.brd_generator import (
     generate_user_stories_docx,
 )
 from app.ui.project_registry import list_existing_projects, sanitize_project_id
-from app.utils.config import settings
 from app.utils.errors import classify, log_app_error
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Phase 13B: one sanitized startup line — the effective configuration a session
+# is running with (never the API key; `run_id` is "-" outside a pipeline run).
+logger.info(
+    "config: %s",
+    " ".join(f"{k}={v}" for k, v in settings.summary_for_log().items()),
+)
 
 st.set_page_config(page_title="BA Agent - SOW to BRD", layout="wide")
 

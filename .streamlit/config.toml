@@ -1,0 +1,11 @@
+# Phase 13B — minimal Streamlit hardening. Do not add unrelated settings here.
+# (Secrets belong in .streamlit/secrets.toml, which is git-ignored.)
+
+[client]
+# Never render raw Python tracebacks / exception details in the browser.
+showErrorDetails = false
+
+[server]
+# Run without auto-opening a browser; bound SOW upload size (MB).
+headless = true
+maxUploadSize = 25

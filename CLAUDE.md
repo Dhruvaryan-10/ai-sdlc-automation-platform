@@ -239,5 +239,23 @@ Memory phase.
 ## Environment variables (`.env`)
 
 `GOOGLE_API_KEY` (required) · `GEMINI_MODEL` (default `gemini-3.5-flash`) ·
-`GEMINI_TEMPERATURE` (default `0.3`) · `UPLOAD_DIR` / `OUTPUT_DIR` / `LOG_DIR` ·
-`LOG_LEVEL`. `outputs/`, `uploads/`, `logs/` are created on demand and are git-ignored.
+`GEMINI_TEMPERATURE` (default `0.3`) · `GEMINI_TIMEOUT_SECONDS` (default `900`) ·
+`GEMINI_MAX_RETRIES` (default `2`) · `UPLOAD_DIR` / `OUTPUT_DIR` / `LOG_DIR` ·
+`LOG_LEVEL` (default `INFO`). `outputs/`, `uploads/`, `logs/` are created on demand
+and are git-ignored.
+
+**Phase 13B — every field is validated once in `Settings()` (`app/utils/config.py`);
+an invalid `.env` raises `pydantic.ValidationError` at import, which the Streamlit
+startup guard turns into a clean `st.error` + `st.stop` (no traceback, key never
+shown).** `GOOGLE_API_KEY` — non-empty, not the `.env.example` placeholder,
+stored stripped. `GEMINI_TEMPERATURE` — `0.0`–`2.0` inclusive. `GEMINI_TIMEOUT_SECONDS`
+— integer `>= 1`. `GEMINI_MAX_RETRIES` — integer `>= 0`. `LOG_LEVEL` —
+`{DEBUG,INFO,WARNING,ERROR,CRITICAL}`, case-insensitive, stored upper-case.
+`GEMINI_MODEL` is **not** range-checked (no model allow-list). `resolved_*_dir()`
+return absolute `Path`s (relative values resolve against the launch directory — run
+from the repo root) and still `mkdir(exist_ok=True)`. `settings.summary_for_log()`
+returns a secret-free dict (model, temperature, timeout_seconds, max_retries,
+log_level, output/upload/log dirs — **never** the API key) for the one sanitized
+`config: …` INFO line emitted at Streamlit startup. `.streamlit/config.toml`
+(tracked) sets `client.showErrorDetails = false`, `server.headless = true`,
+`server.maxUploadSize = 25`.
