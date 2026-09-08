@@ -27,6 +27,7 @@ from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.business_analyst.prompt_manager import PromptManager
 from app.utils.llm import build_chat_llm
 from app.utils.logger import get_logger
+from app.utils.metrics import instrumented_invoke
 
 logger = get_logger(__name__)
 
@@ -39,6 +40,8 @@ class SolutionArchitectAgentError(Exception):
 
 class SolutionArchitectAgent:
     """Wraps Gemini (via LangChain) to generate and refine High-Level Designs."""
+
+    _TELEMETRY_STAGE = "hld"  # Phase 13A: SDLC stage tag for LLM telemetry
 
     def __init__(self, prompt_manager: PromptManager | None = None):
         self._prompt_manager = prompt_manager or PromptManager(prompts_dir=_PROMPTS_DIR)
@@ -82,7 +85,9 @@ class SolutionArchitectAgent:
 
     def _invoke(self, prompt: str) -> str:
         try:
-            response = self._ensure_llm().invoke(prompt)
+            response = instrumented_invoke(
+                self._ensure_llm(), prompt, stage=self._TELEMETRY_STAGE
+            )
         except Exception as exc:
             logger.error(f"Gemini API call failed: {exc}")
             raise SolutionArchitectAgentError(f"Gemini API call failed: {exc}") from exc

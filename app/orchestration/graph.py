@@ -67,6 +67,7 @@ construction, that a normal `run_step()` invocation can never trigger it.
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Any
 
 from langgraph.graph import END, START, StateGraph
@@ -80,6 +81,7 @@ from app.agents.test_case.service import TestCaseService
 from app.agents.user_story_refinement.service import UserStoryRefinementService
 from app.orchestration.state import SDLCState
 from app.utils.logger import get_logger
+from app.utils.run_context import new_run_id, run_context
 
 if TYPE_CHECKING:  # referenced only in type hints / caller code
     from app.agents.business_analyst.agent import ProjectMetadata
@@ -99,6 +101,28 @@ _REQUEST_ENSURE_BRD = "ensure_brd"
 # Phase 11B: the two independent branches off the finalized BRD. `gate_brd` on
 # `complete` fans out to BOTH concurrently; both fan back in at `gate_hld`.
 _HLD_US_FANOUT = ["ensure_hld", "ensure_user_stories"]
+
+# Phase 13A: best-effort mapping from a propagated agent-error type to the SDLC
+# stage that raised it, so a `run_step` failure line names the failing stage.
+# (The per-call `event=llm_call outcome=error` telemetry record already carries
+# the exact stage; this is a convenience for the run-level line.)
+_EXC_TYPE_TO_STAGE = {
+    "BusinessAnalystAgentError": "brd",
+    "SolutionArchitectAgentError": "hld",
+    "InitialUserStoryAgentError": "user_stories",
+    "LLDAgentError": "lld",
+    "UserStoryRefinementAgentError": "user_story_refinement",
+    "TestCaseAgentError": "test_cases",
+    "ClosureReportAgentError": "closure_report",
+}
+
+
+def _stage_from_exception(exc: BaseException) -> str:
+    for cls in type(exc).__mro__:
+        stage = _EXC_TYPE_TO_STAGE.get(cls.__name__)
+        if stage is not None:
+            return stage
+    return "-"
 
 
 # --- nodes (thin delegators to the existing services) ----------------------
@@ -530,12 +554,33 @@ def run_step(
         "metadata": metadata,
         "produced": {},
     }
-    logger.info("SDLC 8B-4: run_step project=%s request=%s", project_id, request)
-    final_state: SDLCState = compiled.invoke(initial)
+
+    # Phase 13A: one UUID4 per run_step invocation. `run_context` binds it (and
+    # the project id) for the whole graph run — LangGraph copies this context
+    # into its sync-node executor, so every stage (incl. the concurrent HLD ∥
+    # User-Story fan-out) and every LLM call inherits the same run_id. The
+    # context is restored on exit, so sequential/concurrent runs never share it.
+    run_id = new_run_id()
     logger.info(
-        "SDLC 8B-4: run_step project=%s status=%s awaiting=%s produced=%s",
-        project_id, final_state.get("status"), final_state.get("awaiting"),
-        final_state.get("produced"),
+        "run_step start run_id=%s project=%s request=%s", run_id, project_id, request
+    )
+    started_at = time.perf_counter()
+    with run_context(run_id=run_id, project_id=project_id):
+        try:
+            final_state: SDLCState = compiled.invoke(initial)
+        except BaseException as exc:
+            logger.error(
+                "run_step failed run_id=%s project=%s request=%s stage=%s "
+                "error_type=%s elapsed_ms=%s",
+                run_id, project_id, request, _stage_from_exception(exc),
+                type(exc).__name__, round((time.perf_counter() - started_at) * 1000),
+            )
+            raise  # original exception, unchanged
+    logger.info(
+        "run_step complete run_id=%s project=%s status=%s awaiting=%s produced=%s "
+        "elapsed_ms=%s",
+        run_id, project_id, final_state.get("status"), final_state.get("awaiting"),
+        final_state.get("produced"), round((time.perf_counter() - started_at) * 1000),
     )
     return final_state
 

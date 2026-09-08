@@ -33,6 +33,7 @@ from app.agents.business_analyst.prompt_manager import PromptManager
 from app.agents.closure_report.schema import ClosureNarrative
 from app.utils.llm import build_chat_llm
 from app.utils.logger import get_logger
+from app.utils.metrics import instrumented_invoke
 
 logger = get_logger(__name__)
 
@@ -106,6 +107,8 @@ class ClosureReportAgentError(Exception):
 class ClosureReportAgent:
     """Wraps Gemini (via LangChain) to produce a closure-report NARRATIVE (JSON string)."""
 
+    _TELEMETRY_STAGE = "closure_report"  # Phase 13A: SDLC stage tag for LLM telemetry
+
     def __init__(
         self,
         prompt_manager: PromptManager | None = None,
@@ -175,7 +178,9 @@ class ClosureReportAgent:
 
     def _invoke(self, prompt: str) -> str:
         try:
-            response = self._ensure_llm().invoke(prompt)
+            response = instrumented_invoke(
+                self._ensure_llm(), prompt, stage=self._TELEMETRY_STAGE
+            )
         except Exception as exc:
             logger.error(f"Gemini API call failed: {exc}")
             raise ClosureReportAgentError(f"Gemini API call failed: {exc}") from exc
@@ -202,7 +207,10 @@ class ClosureReportAgent:
         result = None
         for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
             try:
-                result = structured_llm.invoke(prompt)
+                result = instrumented_invoke(
+                    structured_llm, prompt,
+                    stage=self._TELEMETRY_STAGE, attempt=attempt,
+                )
                 break
             except Exception as exc:
                 if attempt < _RETRY_MAX_ATTEMPTS and _is_transient_llm_error(exc):
