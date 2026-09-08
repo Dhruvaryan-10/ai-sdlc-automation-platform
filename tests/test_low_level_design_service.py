@@ -21,6 +21,7 @@ from app.agents.low_level_design.service import (
     NoFinalHLDError,
 )
 from app.agents.solution_architect.service import SolutionArchitectService
+from app.services.version_service import VersionService
 from app.utils.config import settings
 
 
@@ -139,6 +140,186 @@ def test_lld_uses_available_user_story_context(
     _, _, user_stories_text, _ = stub_lld_agent.generate_calls[0]
     assert "US-001" in user_stories_text
     assert "user stories" in v1.note.lower()
+
+
+# --- Phase 11C: LLD generation context is the digest + index, not full text ---
+
+_REALISTIC_BRD = """# Support Portal — Business Requirement Document
+
+**Version:** 1
+**Client:** Acme Corp
+**Project Type:** Web Application
+
+## 1. Executive Summary
+A long-form executive summary paragraph that exists only to pad the BRD so the
+deterministic digest is meaningfully smaller than the full document. It repeats
+context a technical LLD does not need verbatim. """ + ("Filler sentence. " * 40) + """
+
+## 6. Functional Requirements
+FR-1. The system shall allow a customer to register with email and password and
+verify the email address before first login.
+FR-2. The system shall allow a customer to create a support ticket with a
+subject, description, category, priority and up to five attachments.
+FR-3. The system shall let an agent change a ticket's status through the
+lifecycle New -> Open -> Pending -> Resolved -> Closed.
+
+## 7. Non-Functional Requirements
+NFR-1. 95th-percentile page load under 2 seconds at expected concurrent load.
+NFR-2. All data encrypted in transit and at rest.
+
+## 8. Business Rules
+BR-1. A customer may only view and modify tickets they created.
+BR-2. A ticket cannot move to Closed unless it has first been Resolved.
+"""
+
+_REALISTIC_USER_STORIES = """# Support Portal — Draft User Stories
+
+**Version:** 1
+**Source:** Accepted BRD
+
+## US-001 — Customer Registration
+
+**User Story:**
+As a customer, I want to create an account so that I can raise support tickets.
+
+**Acceptance Criteria:**
+- Required registration information can be entered.
+- Invalid registration information is rejected.
+- """ + ("A padding acceptance-criterion line. " * 20) + """
+
+**Priority:** High
+**BRD Reference:** FR-1
+
+## US-002 — Raise a Ticket
+
+**User Story:**
+As a customer, I want to submit a support ticket with attachments.
+
+**Acceptance Criteria:**
+- """ + ("Another padding acceptance-criterion line. " * 20) + """
+
+**Priority:** High
+**BRD Reference:** FR-2, BR-1
+"""
+
+
+class _FixedBRDAgent:
+    def __init__(self, brd):
+        self._brd = brd
+        self.generate_calls = []
+
+    def generate_brd(self, clean_sow, metadata):
+        self.generate_calls.append((clean_sow, metadata))
+        return self._brd
+
+    def refine_brd(self, current_brd, user_feedback, current_version):  # pragma: no cover
+        return current_brd
+
+
+class _FixedUserStoryAgent:
+    def __init__(self, stories):
+        self._stories = stories
+        self.generate_calls = []
+
+    def generate_stories(self, brd_text, metadata):
+        self.generate_calls.append((brd_text, metadata))
+        return self._stories
+
+    def refine_stories(self, current_stories, user_feedback, current_version):  # pragma: no cover
+        return current_stories
+
+
+def _stack_with(brd_text, us_text, stub_sa_agent, sow_file, sample_metadata):
+    ba = BusinessAnalystService(project_id="proj", agent=_FixedBRDAgent(brd_text))
+    ba.generate_initial_brd(sow_file, sample_metadata)
+    ba.choose_final_brd(1)
+    sa = _sa_with_hld(ba, stub_sa_agent, finalize=True)
+    if us_text is not None:
+        InitialUserStoryService(
+            project_id="proj", ba_service=ba, agent=_FixedUserStoryAgent(us_text)
+        ).generate_initial_stories()
+    return ba, sa
+
+
+def test_lld_generation_receives_digest_and_index_not_full_brd_or_stories(
+    stub_sa_agent, stub_lld_agent, sow_file, sample_metadata
+):
+    from app.agents.low_level_design.context_reduction import (
+        build_brd_requirements_digest,
+        build_user_story_index,
+    )
+
+    ba, sa = _stack_with(
+        _REALISTIC_BRD, _REALISTIC_USER_STORIES, stub_sa_agent, sow_file, sample_metadata
+    )
+    lld = _lld(sa, ba, stub_lld_agent)
+    lld.generate_initial_lld()
+
+    hld_text, brd_text, user_stories_text, _ = stub_lld_agent.generate_calls[0]
+
+    # full HLD is passed unchanged
+    assert "High-Level Design" in hld_text
+    assert hld_text == sa.get_final_hld().content
+
+    # BRD block is the deterministic digest, not the full BRD document
+    assert brd_text == build_brd_requirements_digest(ba.get_final_brd().content)
+    assert "BRD REQUIREMENTS DIGEST" in brd_text
+    assert "## 1. Executive Summary" not in brd_text
+    assert "Filler sentence." not in brd_text
+    assert len(brd_text) < len(ba.get_final_brd().content)
+    for rid in ("FR-1", "FR-2", "FR-3", "NFR-1", "NFR-2", "BR-1", "BR-2"):
+        assert rid in brd_text
+
+    # User-story block is the deterministic index, not the full story document
+    assert user_stories_text == build_user_story_index(_REALISTIC_USER_STORIES)
+    assert "USER STORY INDEX" in user_stories_text
+    assert "**Acceptance Criteria:**" not in user_stories_text
+    assert "padding acceptance-criterion line" not in user_stories_text
+    assert "US-001" in user_stories_text and "US-002" in user_stories_text
+    assert "(BRD: FR-2, BR-1)" in user_stories_text
+
+
+def test_lld_generation_context_matches_the_deterministic_size_guard(
+    stub_ba_agent, stub_sa_agent, stub_us_agent, stub_lld_agent, sow_file, sample_metadata
+):
+    """Whatever the size guard decides (reduced digest+index, or full-text
+    fallback), the LLD service must hand the agent exactly that — and the ids
+    always survive. STUB_BRD / STUB_USER_STORIES are tiny, so this exercises the
+    small-input path end to end without asserting which branch wins."""
+    from app.agents.low_level_design.context_reduction import build_reduced_lld_context
+    from app.agents.low_level_design.service import (
+        _NO_BRD_SENTINEL,
+        _NO_USER_STORIES_SENTINEL,
+    )
+
+    ba = _final_brd(stub_ba_agent, sow_file, sample_metadata)
+    sa = _sa_with_hld(ba, stub_sa_agent, finalize=True)
+    InitialUserStoryService(
+        project_id="proj", ba_service=ba, agent=stub_us_agent
+    ).generate_initial_stories()
+
+    lld = _lld(sa, ba, stub_lld_agent)
+    lld.generate_initial_lld()
+    _, brd_text, user_stories_text, _ = stub_lld_agent.generate_calls[0]
+
+    us_content = (
+        VersionService(project_id="proj", subdir="user_stories")
+        .get_latest_version()
+        .content
+    )
+    ctx = build_reduced_lld_context(
+        ba.get_final_brd().content,
+        us_content,
+        no_brd_sentinel=_NO_BRD_SENTINEL,
+        no_user_stories_sentinel=_NO_USER_STORIES_SENTINEL,
+    )
+    assert brd_text == ctx.brd_block
+    assert user_stories_text == ctx.user_stories_block
+    if not ctx.reduced:                                   # fallback: untouched source
+        assert brd_text == ba.get_final_brd().content
+        assert user_stories_text == us_content
+    assert "FR-1" in brd_text
+    assert "US-001" in user_stories_text
 
 
 # --- TEST 6: LLD package does not import initial_user_story --------

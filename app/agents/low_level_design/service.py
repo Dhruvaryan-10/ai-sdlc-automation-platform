@@ -35,6 +35,7 @@ import re
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.business_analyst.service import BusinessAnalystService
 from app.agents.low_level_design.agent import LowLevelDesignAgent
+from app.agents.low_level_design.context_reduction import build_reduced_lld_context
 from app.agents.solution_architect.service import SolutionArchitectService
 from app.services.version_service import BRDVersion, VersionService
 from app.services.version_text import stamp_version_number
@@ -173,10 +174,34 @@ class LowLevelDesignService:
         user_stories_text = stories.content if stories else _NO_USER_STORIES_SENTINEL
         us_v = stories.version if stories else None
 
+        # Phase 11C: the LLD's supporting business context is a deterministic
+        # BRD Requirements Digest + User Story Index instead of the full BRD +
+        # full User Stories — proven safe for downstream Test Case quality by
+        # the Phase 11C confirmatory experiment, at ~1/4 the input tokens. The
+        # HLD (primary source of truth) is unchanged. A local, Gemini-free size
+        # guard falls back to the full BRD + full User Stories if the reduced
+        # form is not actually smaller; provenance/versioning are unaffected
+        # (source_ref still records the BRD/US versions the digest/index derive
+        # from).
+        reduced = build_reduced_lld_context(
+            brd_text,
+            user_stories_text,
+            no_brd_sentinel=_NO_BRD_SENTINEL,
+            no_user_stories_sentinel=_NO_USER_STORIES_SENTINEL,
+        )
+        logger.info(
+            "LLD context: %s (BRD %d->%d chars, User Stories %d->%d chars)",
+            reduced.reason,
+            len(brd_text),
+            len(reduced.brd_block),
+            len(user_stories_text),
+            len(reduced.user_stories_block),
+        )
+
         lld_text = self._agent.generate_lld(
             hld_text=final_hld.content,
-            brd_text=brd_text,
-            user_stories_text=user_stories_text,
+            brd_text=reduced.brd_block,
+            user_stories_text=reduced.user_stories_block,
             metadata=metadata,
         )
         n = self._next_version_number()

@@ -14,20 +14,21 @@ ACCEPTED HIGH-LEVEL DESIGN (PRIMARY TECHNICAL SOURCE OF TRUTH)
 {hld_text}
 ---
 
-SUPPORTING BUSINESS / REQUIREMENTS CONTEXT — BUSINESS REQUIREMENT DOCUMENT
+SUPPORTING BUSINESS / REQUIREMENTS CONTEXT — BRD REQUIREMENTS DIGEST
+(A deterministic, non-LLM extract of every functional requirement (FR), non-functional requirement (NFR) and business rule (BR) in the accepted BRD, each with its definition/intent line. It is authoritative for the requirements it lists. Occasionally — when the digest would not be smaller than the source — this block is instead the full Business Requirement Document; treat it the same way either form.)
 ---
 {brd_text}
 ---
 
-OPTIONAL FUNCTIONAL CONTEXT — DRAFT USER STORIES
-(This block may contain the literal text "(no draft user stories available)". If so, ignore it and derive functional mapping from the BRD instead. Draft user stories are context only — they are NOT a requirement and NOT authoritative.)
+OPTIONAL FUNCTIONAL CONTEXT — USER STORY INDEX
+(A deterministic, non-LLM extract: for every user story, its ID, the BRD requirement ID(s) it references, and a one-line goal. This block may instead contain the literal text "(no draft user stories available)". If so, ignore it and derive functional mapping from the BRD requirements digest instead. The user story index is context only — it is NOT a requirement and NOT authoritative.)
 ---
 {user_stories_text}
 ---
 
 INSTRUCTIONS
-1. The HLD is the primary technical source. Every component, service, interface, data store, and interaction in this LLD must trace back to something in the HLD. The BRD is supporting business context. The draft user stories, when present, are additional functional context for the requirement-to-implementation mapping only.
-2. Do NOT invent requirements, components, integrations, or constraints that are not present or reasonably implied by the HLD/BRD. Where the HLD leaves an implementation choice open, make a reasonable, clearly-labeled decision. Prefix any such choice with "**Design Decision:**" or "**Assumption:**". Never present an assumption as a confirmed requirement.
+1. The HLD is the primary technical source. Every component, service, interface, data store, and interaction in this LLD must trace back to something in the HLD. The BRD Requirements Digest is supporting business context. The user story index, when present, is additional functional context for the requirement-to-implementation mapping only.
+2. Do NOT invent requirements, components, integrations, or constraints that are not present or reasonably implied by the HLD or the BRD Requirements Digest. Where the HLD leaves an implementation choice open, make a reasonable, clearly-labeled decision. Prefix any such choice with "**Design Decision:**" or "**Assumption:**". Never present an assumption as a confirmed requirement.
 3. Produce genuine implementation-level detail: class and interface definitions with responsibilities, method signatures, service contracts, API endpoints with request/response structures, data models, database tables/columns and relationships where applicable, validation rules, error handling, processing logic, and sequence/interaction flows. Diagrams and sequences may be expressed as indented text or simple ASCII; do not attempt pixel-perfect art.
 4. Write in clear, precise, technical English aimed at the engineers who will implement the system.
 5. Use numbered sections exactly as below, in this order, using these exact section headings. Use numbered sub-points where it aids reference (e.g. class names, endpoint IDs).
@@ -43,7 +44,7 @@ REQUIRED OUTPUT STRUCTURE
 **Source:** Accepted HLD
 
 ## 1. Introduction and Source Traceability
-(what this LLD covers; which HLD components it details; how BRD/user-story context was used)
+(what this LLD covers; which HLD components it details; how the BRD requirements digest / user story index context was used)
 ## 2. Component / Module Detailed Design
 ## 3. Classes, Responsibilities and Interfaces
 ## 4. Services and API Specifications
@@ -61,7 +62,7 @@ REQUIRED OUTPUT STRUCTURE
 (internal modules, external libraries/services, and what each is used for)
 ## 12. Security Considerations
 ## 13. Requirement / User Story to Implementation Mapping
-(map the important functional requirements — from the draft user stories when provided, otherwise from the BRD functional requirements — to the specific components/classes/endpoints that implement them)
+(map the important functional requirements — from the user story index when provided, otherwise from the BRD requirements digest — to the specific components/classes/endpoints that implement them)
 
 Output format: {output_format}
 
