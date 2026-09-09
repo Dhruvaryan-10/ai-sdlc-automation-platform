@@ -95,14 +95,37 @@ streamlit run app/ui/streamlit_app.py
 # tests — deterministic, no API key or network needed (stub LLM agents)
 pytest                              # whole suite
 pytest tests/test_user_story_refinement_service.py::test_no_final_brd_blocks_refinement  # single test
+
+# checks CI runs (Phase 14) — Python 3.11 and 3.12, fully offline
+python -m compileall app
+python -m pyflakes app             # pyflakes is dev-only, NOT in requirements.txt
+pytest -q -ra
+
+# Docker (Phase 14) — image serves Streamlit on 0.0.0.0:8501 as a non-root user
+docker build -t sdlc-ba-agent .
+docker run --rm -p 8501:8501 -e GOOGLE_API_KEY=your_real_key \
+  -v "$(pwd)/outputs:/app/outputs" -v "$(pwd)/uploads:/app/uploads" -v "$(pwd)/logs:/app/logs" \
+  sdlc-ba-agent
 ```
 
-There is **no build step and no linter** configured. The `pytest` suite (added in Phase 2)
-uses stub agents injected via the `agent=` constructor param and monkeypatches
+There is **no build step** configured. `pyflakes` is the only static check (run by CI;
+not in `requirements.txt`, and `app/` must stay pyflakes-clean). The `pytest` suite (added
+in Phase 2) uses stub agents injected via the `agent=` constructor param and monkeypatches
 `settings.output_dir` to a tmp dir — it never calls Gemini. Real generation/refinement is
 verified manually through the Streamlit UI. A missing or invalid `GOOGLE_API_KEY` raises a
 pydantic `ValidationError` at startup (by design — see `app/utils/config.py`); `conftest.py`
 sets a dummy key before importing `app`.
+
+**CI / Docker (Phase 14):** `.github/workflows/ci.yml` runs the three checks above on push
+to `main` and on every PR (Python 3.11 + 3.12); it is offline and makes no Gemini calls
+(dummy `GOOGLE_API_KEY`). `Dockerfile` + `.dockerignore` build a `python:3.12-slim-bookworm`
+image (`WORKDIR /app`, non-root `appuser`, `HEALTHCHECK` on `/_stcore/health`); the base
+image digest is intentionally not hard-coded. `outputs/` `uploads/` `logs/` must be
+volume-mounted to persist — and the `VersionService` write lock is **in-process only**, so
+run a **single** server process per `outputs/` directory. See `README.md` §8. The repo has
+**no license** yet (pending an owner decision — `README.md` §9). The `GEMINI_MODEL`
+code/`.env.example` (`gemini-3.5-flash`) vs local `.env` (`gemini-3.6-flash`) discrepancy is
+unresolved and out of scope.
 
 ## Architecture — strict layering
 

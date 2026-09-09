@@ -1,0 +1,47 @@
+# Keep the build context minimal and never bake secrets or local state into
+# the image. Application code (app/), tests (tests/), requirements.txt and
+# .streamlit/ are intentionally NOT excluded.
+
+# --- Version control / CI ---
+.git
+.gitignore
+.github
+
+# --- Claude Code / agent worktree metadata ---
+.claude
+
+# --- Secrets & local environment (.env.example is kept on purpose) ---
+.env
+.env.local
+.env.*.local
+
+# --- Python virtual environments ---
+venv
+.venv
+env
+
+# --- Python bytecode & tool caches ---
+__pycache__
+**/__pycache__
+*.py[cod]
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# --- Runtime data: mount as volumes in production, never ship in the image ---
+outputs
+uploads
+logs
+
+# --- Editor / OS cruft ---
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# --- Container build files (not needed inside the image) ---
+Dockerfile
+.dockerignore

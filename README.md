@@ -418,3 +418,117 @@ authentication / multi-user support. Persistence is still plain JSON files; the
 database decision is deferred to the Project Memory phase. The known
 `_extract_text` / `_invoke` / metadata-helper / structured-retry duplication
 across the seven agent packages is a deliberately deferred cleanup.
+
+---
+
+## 8. Deployment & CI
+
+### 8.1 Local run (Streamlit)
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env          # then set a real GOOGLE_API_KEY
+streamlit run app/ui/streamlit_app.py
+```
+
+Run it **from the repository root** so `outputs/`, `uploads/`, and `logs/`
+resolve next to the code. The UI listens on **http://localhost:8501**.
+
+### 8.2 Docker
+
+A `Dockerfile` and `.dockerignore` are provided.
+
+```bash
+# build
+docker build -t sdlc-ba-agent .
+
+# run — publish port 8501 and pass the API key at runtime (never bake it in)
+docker run --rm -p 8501:8501 \
+  -e GOOGLE_API_KEY=your_real_key \
+  -v "$(pwd)/outputs:/app/outputs" \
+  -v "$(pwd)/uploads:/app/uploads" \
+  -v "$(pwd)/logs:/app/logs" \
+  sdlc-ba-agent
+```
+
+Details:
+
+- **Base image:** `python:3.12-slim-bookworm` (matches the project's Python and
+  every `requirements.txt` pin). A specific image **digest is not hard-coded** —
+  it must be verified against the registry in your own environment; the
+  `Dockerfile` header shows the two commands to pin one.
+- **Port:** the container serves Streamlit on `0.0.0.0:8501` and `EXPOSE`s
+  `8501`. Map it with `-p <host>:8501`.
+- **User:** runs as a non-root user (`appuser`, uid 10001).
+- **Healthcheck:** `HEALTHCHECK` polls Streamlit's `GET /_stcore/health`
+  (returns HTTP 200 when the server is ready).
+- **`.streamlit/config.toml`** (tracked) is included in the image: it sets
+  `server.headless=true`, `server.maxUploadSize=25`, and
+  `client.showErrorDetails=false`.
+
+### 8.3 Environment variables
+
+All are read once at startup and validated (`app/utils/config.py`); an invalid
+value stops the app with a plain message and never prints the value. See
+`.env.example` for the full list and allowed ranges.
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `GOOGLE_API_KEY` | **yes** | Real Gemini key. Rejected if empty or left as the `.env.example` placeholder. Pass it via `-e` / a secret store — **never commit `.env`, never bake it into the image** (`.dockerignore` excludes `.env`). |
+| `GEMINI_MODEL` | no | Default `gemini-3.5-flash`. |
+| `GEMINI_TEMPERATURE` | no | Default `0.3`; must be `0.0`–`2.0`. |
+| `GEMINI_TIMEOUT_SECONDS` | no | Default `900`; integer `>= 1`. |
+| `GEMINI_MAX_RETRIES` | no | Default `2`; integer `>= 0`. |
+| `UPLOAD_DIR` / `OUTPUT_DIR` / `LOG_DIR` | no | Defaults `uploads` / `outputs` / `logs`, resolved to absolute paths against the working directory. |
+| `LOG_LEVEL` | no | Default `INFO`; one of `DEBUG,INFO,WARNING,ERROR,CRITICAL` (any case). |
+
+### 8.4 Persistence
+
+- All project data is **plain JSON files on the local filesystem** — no
+  database. Each artifact stream lives at
+  `outputs/<project_id>/[<subdir>/]versions.json` (append-only history), written
+  atomically with a `versions.json.bak` last-known-good copy (Phase 12A).
+- `uploads/` holds uploaded SOW files; `logs/app.log` is the rotating log.
+- **Persist these three directories** across container restarts with volume
+  mounts (see the `docker run` example). Without a mount, data lives only in the
+  container's writable layer and is lost when it is removed.
+- **The write lock is in-process only.** Concurrent writers are serialized
+  within a single Python process (one Streamlit server). Running **multiple
+  server processes against the same `outputs/` directory is not safe** — atomic
+  replace prevents a torn file, but two processes can still lose an update.
+  Run a single instance per data directory.
+
+### 8.5 Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and every pull request,
+on Python **3.11** and **3.12**:
+
+```
+python -m compileall app
+python -m pyflakes app
+pytest -q -ra
+```
+
+The suite is **fully offline and deterministic** — every LLM agent is stubbed
+(`tests/conftest.py`), so CI makes **no Gemini calls** and needs **no real
+secret**. A dummy `GOOGLE_API_KEY` is set only so `import app...` passes startup
+validation.
+
+### 8.6 Current limitations
+
+- Single-process only (see 8.4); no horizontal scaling, no shared cache, no
+  auth / multi-user.
+- No real-Gemini contract test in normal CI (LLM I/O shape is covered by stubs
+  and manual UI testing).
+- The base image digest is not pinned by default (see 8.2).
+- No license is set yet (see below).
+
+---
+
+## 9. License
+
+**No license has been established for this repository.** There is no `LICENSE`
+file and no license declared in the project's docs or metadata. Until the
+project owner chooses one, default copyright applies and reuse/redistribution
+terms are undefined. Adding a `LICENSE` file is a pending owner decision and was
+intentionally **not** made as part of Phase 14.

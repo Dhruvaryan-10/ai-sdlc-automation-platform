@@ -720,7 +720,7 @@ class ClosureReportService:
         line(f"**Orphan references:** {qf['orphan_references']['total']}")
         line(f"**Uncovered requirements:** {len(qf['uncovered_requirements'])}")
         line(f"**Uncovered user stories:** {len(qf['uncovered_user_stories'])}")
-        line(f"**Missing / non-final required artifacts:** "
+        line("**Missing / non-final required artifacts:** "
              + (", ".join(qf["missing_final_artifacts"]) or "none"))
         line()
         line(narrative["findings_summary"])

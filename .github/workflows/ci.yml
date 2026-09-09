@@ -1,0 +1,59 @@
+name: CI
+
+# Deterministic, fully offline CI. The test suite injects stub LLM agents
+# (tests/conftest.py) and never calls Gemini or touches the network. No secrets
+# are used or required.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: py${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    env:
+      # The suite never calls Gemini. This dummy value only satisfies the
+      # Phase 13B startup validation in app/utils/config.py so that
+      # `import app...` succeeds during collection. It is NOT a secret and is
+      # deliberately hard-coded (never a real key).
+      GOOGLE_API_KEY: ci-not-a-real-key
+      # Keep any log file the app opens on import inside the runner workspace
+      # (tests/conftest.py would otherwise mkdtemp one); makes startup fully
+      # deterministic.
+      LOG_DIR: ${{ github.workspace }}/.ci-logs
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # pyflakes is a dev-only static checker and is intentionally not in
+          # requirements.txt; install it only if it isn't already present.
+          python -m pyflakes --version >/dev/null 2>&1 || pip install pyflakes
+
+      - name: Byte-compile application
+        run: python -m compileall app
+
+      - name: Static analysis (pyflakes)
+        run: python -m pyflakes app
+
+      - name: Run test suite
+        run: pytest -q -ra

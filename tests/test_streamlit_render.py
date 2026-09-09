@@ -9,7 +9,6 @@ persistence at a tmp dir), which is deterministic and offline.
 """
 
 import json
-from pathlib import Path
 
 from app.ui.streamlit_app import (
     _flatten_legacy_numbered_bullets,
@@ -278,15 +277,57 @@ def test_render_artifact_markdown_handles_none(monkeypatch):
 
 # --- persisted artifact is untouched ----------------------------------
 
-def test_persisted_test_case_artifact_is_not_modified_by_preview():
-    repo_root = Path(__file__).resolve().parents[1]
-    versions_file = repo_root / "outputs" / "d1801c21" / "test_cases" / "versions.json"
-    if not versions_file.exists():
-        import pytest
-        pytest.skip("no persisted d1801c21 project on this machine")
+# A realistic persisted test-case artifact. It carries the two shapes the
+# preview pipeline must handle: legacy "- N." numbered steps (flattened for
+# display) and a run of consecutive "**Key:** value" metadata lines (given
+# Markdown hard breaks for display). The literal "$" exercises the currency-
+# escape step. Mirrors what TestCaseService._render_markdown persists.
+_LEGACY_TEST_CASE_ARTIFACT = (
+    "# Demo Project — Test Cases\n"
+    "\n"
+    "**Version:** 1\n"
+    "**Source:** Generated from artifacts\n"
+    "**Built From:** BRD v2, HLD v1, LLD v1, User Stories v3\n"
+    "**Client:** Acme Corp\n"
+    "**Project Type:** Web Application\n"
+    "\n"
+    "## TC-001 — Configure a product price\n"
+    "\n"
+    "**Requirement / User Story Reference:** FR-1.3\n"
+    "**BRD Reference:** FR-1.3\n"
+    "**User Story Reference:** US-003\n"
+    "**HLD Reference:** Section 3.4\n"
+    "**LLD Reference:** Section 10.1\n"
+    "**Priority:** High\n"
+    "**Test Type:** Business Rule\n"
+    "\n"
+    "**Preconditions:**\n"
+    "- A base product exists in the catalog\n"
+    "\n"
+    "**Test Steps:**\n"
+    "- 1. Open the product and set the list price to $29.99\n"
+    "- 2. Set the B2B price to $19.99\n"
+    "- 3. Save the product\n"
+    "\n"
+    "**Expected Result:**\n"
+    "Both prices are stored and shown on the product page.\n"
+)
+
+
+def test_persisted_test_case_artifact_is_not_modified_by_preview(tmp_path):
+    # Hermetic: build the version stream in an isolated temp directory via the
+    # real VersionService, so this test never depends on a machine-local
+    # outputs/ project and always runs (no environment-conditional skip).
+    from app.services.version_service import VersionService
+
+    svc = VersionService("d1801c21", output_dir=tmp_path, subdir="test_cases")
+    svc.add_version(content=_LEGACY_TEST_CASE_ARTIFACT, source="initial")
+    versions_file = tmp_path / "d1801c21" / "test_cases" / "versions.json"
 
     before = versions_file.read_bytes()
     stored = json.loads(before.decode("utf-8"))[0]["content"]
+    # VersionService persisted the document content verbatim.
+    assert stored == _LEGACY_TEST_CASE_ARTIFACT
 
     # Full preview pipeline (order matches render_artifact_markdown).
     transformed = _flatten_legacy_numbered_bullets(stored)
