@@ -97,7 +97,7 @@ logger.info(
     " ".join(f"{k}={v}" for k, v in settings.summary_for_log().items()),
 )
 
-st.set_page_config(page_title="BA Agent - SOW to BRD", layout="wide")
+st.set_page_config(page_title="AI-SDLC Pipeline", layout="wide")
 
 
 # --- human-readable labels ------------------------------------------------------
@@ -1081,8 +1081,13 @@ with st.sidebar:
 
 # --- main area ------------------------------------------------------------------------
 
-st.title("Business Analyst Agent - SOW to BRD")
-st.caption("Phase 1: Statement of Work to Business Requirement Document")
+st.title("AI-SDLC Pipeline")
+st.caption("From SOW to Software Delivery — Powered by AI Agents")
+st.write(
+    "An end-to-end AI-powered Software Development Life Cycle pipeline that "
+    "transforms a Statement of Work (SOW) into complete SDLC artifacts using "
+    "specialized AI agents."
+)
 
 # --- SDLC Pipeline panel (Phase 8B-6) -----------------------------------------------
 #

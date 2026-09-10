@@ -1,6 +1,12 @@
-# SDLC Agent — BRD · HLD · User Stories · LLD · Story Refinement · Test Cases · Closure Report
+# AI-SDLC Pipeline
 
-The AI-powered SDLC platform, built one agent at a time:
+> From SOW to Software Delivery — Powered by AI Agents
+
+An end-to-end AI-powered Software Development Life Cycle pipeline that transforms
+a Statement of Work (SOW) into complete SDLC artifacts using specialized AI
+agents.
+
+Built one agent at a time:
 
 - **Phase 1 — Business Analyst Agent:** turns an uploaded Statement of Work
   (SOW) into a Business Requirement Document (BRD).
