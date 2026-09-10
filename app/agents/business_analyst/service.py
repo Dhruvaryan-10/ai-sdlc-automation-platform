@@ -20,6 +20,7 @@ from app.parsers.docx_parser import extract_text_from_docx
 from app.parsers.pdf_parser import extract_text_from_pdf
 from app.parsers.text_cleaner import clean_text
 from app.parsers.text_parser import extract_text_from_txt
+from app.quality.artifact_contract import check_brd, enforce
 from app.services.version_service import BRDVersion, VersionService
 from app.services.version_text import stamp_version_number
 from app.utils.logger import get_logger
@@ -96,6 +97,7 @@ class BusinessAnalystService:
         brd_text = self._agent.generate_brd(clean_sow, metadata)
         n = self._next_version_number()
         brd_text = stamp_version_number(brd_text, version_number=n)
+        self._enforce_brd_contract(brd_text)
         return self._version_service.add_version(
             content=brd_text, source="initial", note="Generated from SOW"
         )
@@ -132,11 +134,23 @@ class BusinessAnalystService:
             user_feedback=user_feedback,
             current_version=latest.version,
         )
+        refined_text = stamp_version_number(refined_text, self._next_version_number())
+        self._enforce_brd_contract(refined_text)
         return self._version_service.add_version(
-            content=stamp_version_number(refined_text, self._next_version_number()),
+            content=refined_text,
             source="ai_refine",
             note=user_feedback,
         )
+
+    @staticmethod
+    def _enforce_brd_contract(brd_text: str) -> None:
+        """Phase 17: reject a generated/refined BRD that no downstream consumer
+        could parse (zero requirement identifiers) before it becomes a version;
+        log any non-blocking contract warnings. Manual edits are exempt (a human
+        edit is a deliberate act, not silent model drift)."""
+        report = enforce(check_brd(brd_text))
+        for message in report.warning_messages():
+            logger.warning("BRD contract: %s", message)
 
     def _next_version_number(self) -> int:
         """Deterministic next version number: always max existing + 1."""

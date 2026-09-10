@@ -84,6 +84,7 @@ from app.agents.user_story_refinement.service import (
     NoInitialUserStoriesError as _NoInitialUserStoriesError,
     RefinementLockedError as _RefinementLockedError,
 )
+from app.quality.artifact_contract import ArtifactContractError as _ArtifactContractError
 from app.services.version_service import (
     VersionPersistenceError as _VersionPersistenceError,
 )
@@ -434,6 +435,16 @@ def _classify_impl(exc: BaseException) -> AppError:
     locked = first(_LOCK_TYPES)
     if locked is not None:
         return _app_error(ErrorCategory.STATE_LOCKED, message=_clean_message(locked))
+
+    # 4b. Phase 17 artifact structural-contract failure. `ArtifactContractError`
+    #     is a ValueError subclass, so this MUST precede steps 5/9. Its message is
+    #     assembled from app-authored, content-free strings — safe to surface and
+    #     to log verbatim (STATE_INVALID is a `_SAFE_DETAIL_CATEGORIES` member).
+    contract_err = first((_ArtifactContractError,))
+    if contract_err is not None:
+        return _app_error(
+            ErrorCategory.STATE_INVALID, message=_clean_message(contract_err)
+        )
 
     # 5. service-level structured-output validation (ValueError subclasses — so
     #    this MUST precede steps 7 and 9).

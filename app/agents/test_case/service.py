@@ -43,6 +43,7 @@ import re
 
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.test_case.agent import TestCaseAgent
+from app.quality.artifact_contract import check_test_cases, enforce
 from app.services.version_service import BRDVersion, VersionService
 from app.services.version_text import stamp_version_number
 from app.utils.logger import get_logger
@@ -448,6 +449,14 @@ class TestCaseService:
             source_label=source_label,
             built_from=self._built_from_line(brd.version, hld_v, lld_v, us_v),
         )
+
+        # Phase 17: the rendered document is validated with the same
+        # `traceability.extract_*` the downstream reports use, before it is
+        # persisted. `_parse_and_validate` already guarantees >=1 TC-NNN, so the
+        # blocking branch is defence-in-depth; the warnings are informative.
+        contract = enforce(check_test_cases(content))
+        for message in contract.warning_messages():
+            logger.warning("Test case contract: %s", message)
 
         note = f"{note_prefix} from BRD v{brd.version}"
         if hld_v:

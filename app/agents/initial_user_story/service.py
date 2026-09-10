@@ -25,6 +25,7 @@ import re
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.business_analyst.service import BusinessAnalystService
 from app.agents.initial_user_story.agent import InitialUserStoryAgent
+from app.quality.artifact_contract import check_user_stories, enforce
 from app.services.version_service import BRDVersion, VersionService
 from app.services.version_text import stamp_version_number
 from app.utils.logger import get_logger
@@ -141,6 +142,7 @@ class InitialUserStoryService:
         stories_text = self._agent.generate_stories(final_brd.content, metadata)
         n = self._next_version_number()
         stories_text = stamp_version_number(stories_text, version_number=n)
+        self._enforce_story_contract(stories_text, brd_text=final_brd.content)
 
         return self._version_service.add_version(
             content=stories_text,
@@ -148,6 +150,16 @@ class InitialUserStoryService:
             note=f"Generated from accepted BRD v{final_brd.version}",
             source_ref=f"brd_v{final_brd.version}",
         )
+
+    @staticmethod
+    def _enforce_story_contract(stories_text: str, *, brd_text: str | None = None) -> None:
+        """Phase 17: reject generated/refined user stories with zero parseable
+        '## US-...' headings before they become a version; log non-blocking
+        contract warnings (missing BRD-reference lines, dangling references).
+        Manual edits are exempt."""
+        report = enforce(check_user_stories(stories_text, brd_text=brd_text))
+        for message in report.warning_messages():
+            logger.warning("User story contract: %s", message)
 
     # --- step 2a: manual edit ------------------------------------------------------
 
@@ -189,8 +201,10 @@ class InitialUserStoryService:
             user_feedback=user_feedback,
             current_version=latest.version,
         )
+        refined_text = stamp_version_number(refined_text, self._next_version_number())
+        self._enforce_story_contract(refined_text)
         return self._version_service.add_version(
-            content=stamp_version_number(refined_text, self._next_version_number()),
+            content=refined_text,
             source="ai_refine",
             note=user_feedback,
             # A freeform refine reworks the SAME stories against the SAME BRD —
