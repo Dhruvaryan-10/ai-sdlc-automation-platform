@@ -67,6 +67,7 @@ construction, that a normal `run_step()` invocation can never trigger it.
 
 from __future__ import annotations
 
+import functools
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -79,9 +80,10 @@ from app.agents.low_level_design.service import LowLevelDesignService
 from app.agents.solution_architect.service import SolutionArchitectService
 from app.agents.test_case.service import TestCaseService
 from app.agents.user_story_refinement.service import UserStoryRefinementService
+from app.observability import pipeline_progress as _progress
 from app.orchestration.state import SDLCState
 from app.utils.logger import get_logger
-from app.utils.run_context import new_run_id, run_context
+from app.utils.run_context import current_run_id, new_run_id, run_context
 
 if TYPE_CHECKING:  # referenced only in type hints / caller code
     from app.agents.business_analyst.agent import ProjectMetadata
@@ -123,6 +125,60 @@ def _stage_from_exception(exc: BaseException) -> str:
         if stage is not None:
             return stage
     return "-"
+
+
+# --- Phase 15B: optional structured progress channel ----------------------
+#
+# `run_step(on_event=...)` / `build_sdlc_graph(on_event=...)` accept an OPTIONAL
+# callback. When it is None (the default) NOTHING below runs and the compiled
+# graph + `run_step` behave EXACTLY as before — no topology change, no state
+# change, no telemetry change, no retry change, no exception change, no
+# persistence change. When a callback is supplied it receives bounded
+# `pipeline_progress.PipelineEvent` objects (never a prompt, model output, API
+# key, or exception message).
+
+
+def _emit(on_event, **fields: Any) -> None:
+    """Best-effort structured progress event. No-op when `on_event` is None; a
+    callback that raises is swallowed (progress must never break a run — same
+    rule as `app.utils.metrics`)."""
+    if on_event is None:
+        return
+    try:
+        on_event(_progress.PipelineEvent(**fields))
+    except Exception:  # pragma: no cover - defensive; progress must not break a run
+        pass
+
+
+def _instrument(node_fn, *, stage: str, on_event):
+    """Wrap an `ensure_*` node so it emits stage start/complete/failed progress
+    events. Returns `node_fn` UNCHANGED when `on_event` is None, so the compiled
+    graph is byte-identical in the default path. When a callback is supplied the
+    wrapper is fully transparent: the node's return value is passed through
+    untouched and the ORIGINAL exception is re-raised unchanged (so
+    `_stage_from_exception` still classifies it and retries / persistence /
+    `event=llm_call` telemetry are unaffected)."""
+    if on_event is None:
+        return node_fn
+
+    @functools.wraps(node_fn)
+    def instrumented(state):
+        _emit(on_event, phase=_progress.PHASE_STAGE_STARTED, stage=stage,
+              run_id=current_run_id())
+        t0 = time.perf_counter()
+        try:
+            result = node_fn(state)
+        except BaseException:
+            _emit(on_event, phase=_progress.PHASE_STAGE_FAILED, stage=stage,
+                  run_id=current_run_id(), outcome=_progress.OUTCOME_ERROR,
+                  elapsed_ms=round((time.perf_counter() - t0) * 1000))
+            raise
+        _emit(on_event, phase=_progress.PHASE_STAGE_COMPLETED, stage=stage,
+              run_id=current_run_id(), outcome=_progress.OUTCOME_SUCCESS,
+              elapsed_ms=round((time.perf_counter() - t0) * 1000))
+        return result
+
+    return instrumented
 
 
 # --- nodes (thin delegators to the existing services) ----------------------
@@ -433,6 +489,7 @@ def build_sdlc_graph(
     lld_service: "LowLevelDesignService | None" = None,
     tc_service: "TestCaseService | None" = None,
     closure_service: "ClosureReportService | None" = None,
+    on_event: "_progress.OnEvent | None" = None,
 ):
     """Compile the full SDLC graph (8B-7: BRD -> HLD/US -> LLD -> Test Cases -> Closure Report).
 
@@ -444,6 +501,12 @@ def build_sdlc_graph(
     service as a constructor dependency (each reads the other streams via its own
     `VersionService` / `app.quality.*`), so `tc` / `closure` are constructed from
     `project_id` alone. Cheap to build; not cached.
+
+    Phase 15B: `on_event` is an OPTIONAL structured-progress callback. When None
+    (the default) the six `ensure_*` nodes are registered exactly as before and
+    the compiled graph is byte-identical; only the node CALLABLES are wrapped
+    (transparently) when a callback is supplied — the node set, every edge, and
+    every router are unchanged either way.
     """
     sa = sa_service or SolutionArchitectService(
         project_id=ba_service.project_id, ba_service=ba_service
@@ -462,16 +525,40 @@ def build_sdlc_graph(
         "resolve_state",
         _make_resolve_state_node(ba_service, sa, us, lld, tc, closure),
     )
-    graph.add_node("ensure_brd", _make_ensure_brd_node(ba_service))
+    graph.add_node(
+        "ensure_brd",
+        _instrument(_make_ensure_brd_node(ba_service),
+                    stage=_progress.STAGE_BRD, on_event=on_event),
+    )
     graph.add_node("gate_brd", _gate_brd_node)
-    graph.add_node("ensure_hld", _make_ensure_hld_node(sa))
-    graph.add_node("ensure_user_stories", _make_ensure_user_stories_node(us))
+    graph.add_node(
+        "ensure_hld",
+        _instrument(_make_ensure_hld_node(sa),
+                    stage=_progress.STAGE_HLD, on_event=on_event),
+    )
+    graph.add_node(
+        "ensure_user_stories",
+        _instrument(_make_ensure_user_stories_node(us),
+                    stage=_progress.STAGE_USER_STORIES, on_event=on_event),
+    )
     graph.add_node("gate_hld", _gate_hld_node)
-    graph.add_node("ensure_lld", _make_ensure_lld_node(lld))
+    graph.add_node(
+        "ensure_lld",
+        _instrument(_make_ensure_lld_node(lld),
+                    stage=_progress.STAGE_LLD, on_event=on_event),
+    )
     graph.add_node("gate_lld", _gate_lld_node)
-    graph.add_node("ensure_test_cases", _make_ensure_test_cases_node(tc))
+    graph.add_node(
+        "ensure_test_cases",
+        _instrument(_make_ensure_test_cases_node(tc),
+                    stage=_progress.STAGE_TEST_CASES, on_event=on_event),
+    )
     graph.add_node("gate_test_cases", _gate_test_cases_node)
-    graph.add_node("ensure_closure_report", _make_ensure_closure_report_node(closure))
+    graph.add_node(
+        "ensure_closure_report",
+        _instrument(_make_ensure_closure_report_node(closure),
+                    stage=_progress.STAGE_CLOSURE_REPORT, on_event=on_event),
+    )
     graph.add_node("gate_closure_report", _gate_closure_report_node)
 
     graph.add_edge(START, "resolve_state")
@@ -528,6 +615,7 @@ def run_step(
     lld_service: "LowLevelDesignService | None" = None,
     tc_service: "TestCaseService | None" = None,
     closure_service: "ClosureReportService | None" = None,
+    on_event: "_progress.OnEvent | None" = None,
 ) -> SDLCState:
     """Build the SDLC graph and run a single step. Returns the final SDLCState.
 
@@ -536,6 +624,16 @@ def run_step(
     of passing the service explicitly); when omitted, real services are
     constructed for `project_id`, sharing one `BusinessAnalystService` (and
     `SolutionArchitectService`) as their upstream source.
+
+    Phase 15B: `on_event` is an OPTIONAL structured-progress callback (see
+    `app.observability.pipeline_progress`). When None (the default) this function
+    behaves EXACTLY as before. When supplied it receives bounded `PipelineEvent`s
+    — `run_started` / `stage_started` / `stage_completed` / `stage_failed` /
+    `run_failed` / `run_completed` — carrying only `stage`, `run_id`,
+    `elapsed_ms`, `outcome`, and the run-summary fields; NEVER a prompt, model
+    output, secret, or exception message. A callback that raises is swallowed.
+    Telemetry, retries, exceptions, persistence, and graph topology are
+    unaffected.
     """
     service = ba_service or BusinessAnalystService(project_id=project_id)
     compiled = build_sdlc_graph(
@@ -545,6 +643,7 @@ def run_step(
         lld_service=lld_service,
         tc_service=tc_service,
         closure_service=closure_service,
+        on_event=on_event,
     )
 
     initial: SDLCState = {
@@ -564,6 +663,7 @@ def run_step(
     logger.info(
         "run_step start run_id=%s project=%s request=%s", run_id, project_id, request
     )
+    _emit(on_event, phase=_progress.PHASE_RUN_STARTED, run_id=run_id)
     started_at = time.perf_counter()
     with run_context(run_id=run_id, project_id=project_id):
         try:
@@ -575,12 +675,25 @@ def run_step(
                 run_id, project_id, request, _stage_from_exception(exc),
                 type(exc).__name__, round((time.perf_counter() - started_at) * 1000),
             )
+            _emit(
+                on_event, phase=_progress.PHASE_RUN_FAILED, run_id=run_id,
+                failure_stage=_stage_from_exception(exc),
+                outcome=_progress.OUTCOME_ERROR,
+                elapsed_ms=round((time.perf_counter() - started_at) * 1000),
+            )
             raise  # original exception, unchanged
     logger.info(
         "run_step complete run_id=%s project=%s status=%s awaiting=%s produced=%s "
         "elapsed_ms=%s",
         run_id, project_id, final_state.get("status"), final_state.get("awaiting"),
         final_state.get("produced"), round((time.perf_counter() - started_at) * 1000),
+    )
+    _emit(
+        on_event, phase=_progress.PHASE_RUN_COMPLETED, run_id=run_id,
+        pipeline_status=final_state.get("status"),
+        awaiting=final_state.get("awaiting"),
+        produced=dict(final_state.get("produced") or {}),
+        elapsed_ms=round((time.perf_counter() - started_at) * 1000),
     )
     return final_state
 

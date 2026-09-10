@@ -382,7 +382,10 @@ def test_pipeline_steps_derives_done_current_readonly_from_status():
     #        1       2       3       4       5       6(refine)   7       8(t&q)     9(closure)
     assert states == ["done", "done", "done", "done", "done", "readonly",
                       "done", "readonly", "current"]
-    assert steps[8]["status"] == "Current"        # step 9, current (approve)
+    # Phase 15C: WAITING_FOR_APPROVAL keeps the "current" rail state (back-compat)
+    # but is now labelled distinctly from a "generate next" PENDING step.
+    assert steps[8]["status"] == "Awaiting approval"   # step 9, awaiting approval
+    assert steps[0]["status"] == "Completed"
 
 
 def test_pipeline_steps_stale_closure_is_current_not_done():
@@ -446,7 +449,8 @@ def test_pipeline_panel_renders_the_step_rail_not_the_old_caption_columns():
     start = _SOURCE_TEXT.index("# --- SDLC Pipeline panel (Phase 8B-6)")
     end = _SOURCE_TEXT.index("st.divider()", start)
     panel_block = _SOURCE_TEXT[start:end]
-    assert "_render_step_rail(pipeline_status)" in panel_block
+    # Phase 15C: the rail render now also takes an optional run-overlay argument.
+    assert "_render_step_rail(pipeline_status" in panel_block
     assert "_STEP_RAIL_CSS" in panel_block
     assert "st.columns(5)" not in panel_block  # old truncating caption row is gone
 
@@ -592,3 +596,163 @@ def test_artifact_fingerprint_covers_all_six_streams():
     for key in ("versions", "hld_versions", "us_versions",
                 "lld_versions", "qa_versions", "closure_versions"):
         assert f'"{key}"' in src, f"fingerprint must include the {key} stream"
+
+
+# ============================================================
+# Phase 15C — pipeline progress UX (adapter over pipeline_stage_model)
+# ============================================================
+
+from app.observability.pipeline_progress import (  # noqa: E402
+    COMPLETED, FAILED, PHASE_RUN_COMPLETED, PHASE_RUN_FAILED,
+    PHASE_STAGE_COMPLETED, PHASE_STAGE_FAILED, PHASE_STAGE_STARTED, RUNNING,
+    PipelineEvent, PipelineProgress,
+)
+
+
+def test_pipeline_steps_contract_is_backward_compatible_without_run_records():
+    # exactly 9 rows, same ordering, same labels, only the 4 legacy states.
+    steps = _pipeline_steps(_empty_status(next_step="generate_brd"))
+    assert [s["n"] for s in steps] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert [s["name"] for s in steps] == [n for _, n in streamlit_app._RAIL_STEPS]
+    assert {s["state"] for s in steps} <= {"done", "current", "todo", "readonly"}
+
+
+def test_pipeline_steps_overlay_marks_running_completed_failed_blocked():
+    status = _empty_status(
+        brd_exists=True, brd_final_version=1,
+        hld_exists=True, hld_final_version=1,
+        us_exists=True, next_step="generate_lld",
+    )
+    run_records = {
+        "stages": {
+            "brd": {"state": COMPLETED, "elapsed_ms": 1200},
+            "hld": {"state": COMPLETED, "elapsed_ms": 8000},
+            "user_stories": {"state": COMPLETED, "elapsed_ms": 3000},
+            "lld": {"state": FAILED, "elapsed_ms": 500},
+        },
+        "failure_stage": "lld",
+    }
+    steps = {s["n"]: s for s in _pipeline_steps(status, run_records)}
+    assert steps[1]["state"] == "done" and "1.2s" in steps[1]["status"]
+    assert steps[3]["state"] == "done" and "8.0s" in steps[3]["status"]
+    assert steps[5]["state"] == "failed"
+    assert steps[7]["state"] == "blocked"
+    assert steps[9]["state"] == "blocked"
+    assert steps[6]["state"] == "readonly"          # readonly never blocked
+    assert steps[8]["state"] == "readonly"
+
+    run_records["stages"]["lld"] = {"state": RUNNING, "elapsed_ms": None}
+    run_records["failure_stage"] = None
+    steps = {s["n"]: s for s in _pipeline_steps(status, run_records)}
+    assert steps[5]["state"] == "running"
+    assert steps[7]["state"] == "todo"              # no failure -> not blocked
+
+
+def test_rail_state_and_text_distinguishes_waiting_from_pending_generate():
+    waiting = _empty_status(
+        brd_exists=True, brd_final_version=1, hld_exists=True,
+        awaiting_hld_approval=True, next_step="approve_hld",
+    )
+    pending = _empty_status(brd_exists=True, brd_final_version=1, next_step="generate_hld")
+    w = {s["n"]: s for s in _pipeline_steps(waiting)}[3]
+    p = {s["n"]: s for s in _pipeline_steps(pending)}[3]
+    assert w["state"] == p["state"] == "current"     # rail back-compat
+    assert w["status"] == "Awaiting approval"
+    assert p["status"] == "Current"
+
+
+def test_pipeline_helpers_that_must_stay_pure_have_no_streamlit_calls():
+    for fn in (streamlit_app._pipeline_steps, streamlit_app._render_step_rail,
+               streamlit_app._rail_state_and_text, streamlit_app._capture_pipeline_run,
+               streamlit_app._pipeline_run_headline):
+        assert "st." not in inspect.getsource(fn)
+
+
+def test_capture_pipeline_run_keeps_only_safe_bounded_fields():
+    p = PipelineProgress()
+    p.record(PipelineEvent(phase=PHASE_STAGE_STARTED, stage="brd", run_id="rid-xyz"))
+    p.record(PipelineEvent(phase=PHASE_STAGE_COMPLETED, stage="brd", run_id="rid-xyz",
+                           elapsed_ms=1234, outcome="success"))
+    p.record(PipelineEvent(phase=PHASE_RUN_COMPLETED, run_id="rid-xyz",
+                           pipeline_status="awaiting_approval", awaiting="brd_final",
+                           produced={"brd": 1}))
+    info = streamlit_app._capture_pipeline_run(
+        "proj-1", p, {"status": "awaiting_approval", "awaiting": "brd_final",
+                      "produced": {"brd": 1}},
+    )
+    assert set(info) == {
+        "project_id", "run_id", "run_records", "stages", "failure_stage",
+        "pipeline_status", "awaiting", "produced",
+    }
+    assert info["project_id"] == "proj-1"
+    assert info["run_id"] == "rid-xyz"
+    assert info["pipeline_status"] == "awaiting_approval"
+    assert info["produced"] == {"brd": 1}
+    assert info["failure_stage"] is None
+    assert info["stages"]["brd"]["elapsed_ms"] == 1234
+
+
+def test_capture_pipeline_run_on_failure_names_stage_but_not_exception_text():
+    _secret = "boom-provider-detail-503"
+    p = PipelineProgress()
+    p.record(PipelineEvent(phase=PHASE_STAGE_FAILED, stage="hld", run_id="rid-f",
+                           elapsed_ms=99, outcome="error"))
+    p.record(PipelineEvent(phase=PHASE_RUN_FAILED, run_id="rid-f",
+                           failure_stage="hld", outcome="error"))
+    info = streamlit_app._capture_pipeline_run("proj-2", p, None)
+    assert info["failure_stage"] == "hld"
+    assert info["pipeline_status"] is None
+    blob = repr(info)
+    assert _secret not in blob and "Traceback" not in blob
+
+
+def test_pipeline_run_headline_is_safe_for_each_outcome():
+    assert "failed at" in streamlit_app._pipeline_run_headline(
+        {"failure_stage": "lld"}
+    ).lower()
+    assert "complete" in streamlit_app._pipeline_run_headline(
+        {"failure_stage": None, "pipeline_status": "complete"}
+    ).lower()
+    assert "approval" in streamlit_app._pipeline_run_headline(
+        {"failure_stage": None, "pipeline_status": "awaiting_approval"}
+    ).lower()
+
+
+def test_pipeline_panel_uses_st_status_not_a_bare_pipeline_spinner():
+    start = _SOURCE_TEXT.index("# --- SDLC Pipeline panel (Phase 8B-6)")
+    end = _SOURCE_TEXT.index("st.divider()", start)
+    panel = _SOURCE_TEXT[start:end]
+    assert "st.status(" in panel
+    assert 'st.spinner("Running the SDLC orchestration pipeline' not in panel
+    assert "PipelineProgress()" in panel
+    assert "on_event=progress" in panel
+    assert 'st.session_state["pipeline_run"]' in panel
+    # friendly_error stays the ONLY user-facing exception text in the panel
+    assert "friendly_error(exc)" in panel
+    assert "str(exc)" not in panel and "traceback" not in panel.lower()
+
+
+def test_run_pipeline_step_forwards_on_event_to_run_step(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        streamlit_app, "run_step",
+        lambda project_id, **kwargs: captured.update(kwargs) or "sentinel",
+    )
+    sentinel_cb = object()
+    ba, sa, us, lld, tc = object(), object(), object(), object(), object()
+    out = run_pipeline_step("p", ba, sa, us, lld, tc, on_event=sentinel_cb)
+    assert out == "sentinel"
+    assert captured["on_event"] is sentinel_cb
+    assert captured["request"] == "ensure_brd"
+    # omitting it keeps the historical call shape (on_event=None)
+    captured.clear()
+    run_pipeline_step("p", ba, sa, us, lld, tc)
+    assert captured["on_event"] is None
+
+
+def test_run_step_still_called_exactly_once_and_only_in_run_pipeline_step():
+    calls = _find_calls(_TREE, "run_step")
+    assert len(calls) == 1
+    target = next(n for n in ast.walk(_TREE)
+                  if isinstance(n, ast.FunctionDef) and n.name == "run_pipeline_step")
+    assert target.lineno <= calls[0].lineno <= (target.end_lineno or calls[0].lineno)

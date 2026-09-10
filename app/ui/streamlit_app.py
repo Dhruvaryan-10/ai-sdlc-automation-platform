@@ -77,6 +77,13 @@ from app.document_generator.brd_generator import (
     generate_test_cases_docx,
     generate_user_stories_docx,
 )
+from app.observability import pipeline_progress as _pp
+from app.observability.pipeline_progress import (
+    PipelineProgress,
+    format_elapsed_ms,
+    pipeline_stage_model,
+    stage_label,
+)
 from app.ui.project_registry import list_existing_projects, sanitize_project_id
 from app.utils.errors import classify, log_app_error
 from app.utils.logger import get_logger
@@ -361,6 +368,17 @@ _STEP_RAIL_CSS = """
     border-color: rgba(250, 250, 250, 0.18);
 }
 .sdlc-steprail-wrap .sdlc-step--readonly .sdlc-step-status { color: rgba(250, 250, 250, 0.55); }
+.sdlc-steprail-wrap .sdlc-step--running .sdlc-step-num {
+    background: #2563eb; color: #ffffff; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.30);
+}
+.sdlc-steprail-wrap .sdlc-step--running .sdlc-step-status { color: #60a5fa; font-weight: 600; }
+.sdlc-steprail-wrap .sdlc-step--failed .sdlc-step-num { background: #b91c1c; color: #ffffff; }
+.sdlc-steprail-wrap .sdlc-step--failed .sdlc-step-status { color: #f87171; font-weight: 600; }
+.sdlc-steprail-wrap .sdlc-step--blocked .sdlc-step-num {
+    background: rgba(250, 250, 250, 0.05); color: rgba(250, 250, 250, 0.32);
+    border-color: rgba(250, 250, 250, 0.12);
+}
+.sdlc-steprail-wrap .sdlc-step--blocked .sdlc-step-status { color: rgba(250, 250, 250, 0.32); }
 </style>
 """
 
@@ -424,59 +442,62 @@ def _pipeline_summary(status: dict) -> list[str]:
     ]
 
 
-def _pipeline_steps(status: dict) -> list[dict]:
-    """Pure: `sdlc_status()` -> the 9 SDLC step-rail descriptors.
+def _rail_state_and_text(n: int, row: dict, status: dict) -> tuple[str, str]:
+    """Pure: translate ONE `pipeline_progress.pipeline_stage_model()` row into the
+    existing rail `(state, status-text)` pair.
 
-    Each entry is `{"n": int, "name": str, "state": str, "status": str}` where
-    `state` is one of "done" / "current" / "todo" / "readonly". No Streamlit
-    calls, no invented fields — every decision comes from `sdlc_status()`'s keys.
-
-      * done      — the step's artifact is finalized (or, for the no-gate
-                    User-Story step, generated). Step 9 (Closure Report) is
-                    "done" ONLY when it is final AND not stale.
-      * current   — the step the pipeline's `next_step` currently points at
-                    (a `generate_*` or `approve_*` action), OR Step 9 when a
-                    closure report exists but its evidence is stale (needs
-                    human review — never shown as an approval-complete state).
-      * readonly  — Step 6 (User Story Refinement, optional) and Step 8
-                    (Traceability & Quality, a live read-only view) have no
-                    generation/approval lifecycle.
-      * todo      — not started.
+    Backward-compatible rail vocabulary — "done" / "current" / "todo" / "readonly"
+    — plus the Phase 15C visual states "running" / "failed" / "blocked" which only
+    appear when a live-run overlay (`run_records`) is supplied. All stage/state
+    semantics come from `pipeline_stage_model()`; this only picks the display
+    words (`status` is read solely for the step-9 stale-evidence phrasing).
     """
-    current_n = _NEXT_STEP_TO_RAIL.get(status.get("next_step"), 0)
-    closure_stale = bool(status.get("closure_report_stale"))
-    done = {
-        1: status["brd_exists"],
-        2: status["brd_final_version"] is not None,
-        3: status["hld_final_version"] is not None,
-        4: status["us_exists"],
-        5: status["lld_final_version"] is not None,
-        6: False,  # optional reconciliation pass — no pipeline completion state
-        7: status["tc_final_version"] is not None,
-        8: False,  # live read-only report — no completion state
-        9: (status["closure_final_version"] is not None) and not closure_stale,
-    }
+    model_state = row.get("state")
+    elapsed_ms = row.get("elapsed_ms")
+    suffix = f" · {format_elapsed_ms(elapsed_ms)}" if elapsed_ms is not None else ""
+    if model_state == _pp.COMPLETED:
+        return "done", "Completed" + suffix
+    if model_state == _pp.RUNNING:
+        return "running", "Running…" + suffix
+    if model_state == _pp.FAILED:
+        return "failed", "Failed" + suffix
+    if model_state == _pp.BLOCKED:
+        return "blocked", "Blocked"
+    if model_state == _pp.WAITING_FOR_APPROVAL:
+        if n == 9 and status.get("closure_exists") and status.get("closure_report_stale"):
+            return "current", "Review — evidence may be stale"
+        return "current", "Awaiting approval"
+    if model_state == _pp.READONLY:
+        return "readonly", ("Optional" if n == 6 else "Read-only")
+    # PENDING
+    if row.get("is_next"):
+        return "current", "Current"
+    return "todo", "Not started"
+
+
+def _pipeline_steps(status: dict, run_records: dict | None = None) -> list[dict]:
+    """Pure: `sdlc_status()` (+ optional live-run `run_records`) -> the 9 SDLC
+    step-rail descriptors.
+
+    Each entry is `{"n": int, "name": str, "state": str, "status": str}`.
+    `state` is one of "done" / "current" / "todo" / "readonly" (backward
+    compatible) and, when `run_records` is supplied, additionally
+    "running" / "failed" / "blocked".
+
+    Phase 15C: the authoritative per-stage semantics come from
+    `app.observability.pipeline_progress.pipeline_stage_model()` — this function
+    only maps its rows onto the pre-existing rail representation. No Streamlit
+    calls; `_RAIL_STEPS` stays the source of the step numbers / labels / order.
+    """
+    model = {row["step"]: row for row in pipeline_stage_model(status, run_records)}
     steps: list[dict] = []
     for n, name in _RAIL_STEPS:
-        if done[n]:
-            state, text = "done", "Completed"
-        elif n == 9 and status.get("closure_exists") and closure_stale:
-            state, text = "current", "Review — evidence may be stale"
-        elif n == current_n:
-            state, text = "current", "Current"
-        elif n == 6:
-            state, text = (("readonly", "Optional") if status["us_exists"]
-                           else ("todo", "Not started"))
-        elif n == 8:
-            state, text = (("readonly", "Read-only") if status["brd_exists"]
-                           else ("todo", "Not started"))
-        else:
-            state, text = "todo", "Not started"
+        state, text = _rail_state_and_text(n, model.get(n, {}), status)
         steps.append({"n": n, "name": name, "state": state, "status": text})
     return steps
 
 
-def _render_step_rail(status: dict) -> str:
+def _render_step_rail(status: dict, run_records: dict | None = None) -> str:
     """Pure: build the scoped HTML for the horizontal 9-step SDLC rail.
 
     Content is built only from `_RAIL_STEPS` (static labels) + `_pipeline_steps`
@@ -489,7 +510,7 @@ def _render_step_rail(status: dict) -> str:
         f'<div class="sdlc-step-name">{s["name"]}</div>'
         f'<div class="sdlc-step-status">{s["status"]}</div>'
         f'</div>'
-        for s in _pipeline_steps(status)
+        for s in _pipeline_steps(status, run_records)
     )
     return (
         '<div class="sdlc-steprail-wrap">'
@@ -500,7 +521,7 @@ def _render_step_rail(status: dict) -> str:
 
 def run_pipeline_step(
     project_id: str, ba_service, sa_service, us_service, lld_service, tc_service,
-    closure_service=None,
+    closure_service=None, *, on_event=None,
 ):
     """Thin, testable wrapper around `run_step()` for the pipeline panel's button.
 
@@ -509,6 +530,9 @@ def run_pipeline_step(
     business logic of its own - `run_step` remains the single source of truth,
     unmodified. Never called except from the explicit "Run SDLC Pipeline" button
     handler below (never on import, page load, or a plain rerun).
+
+    Phase 15C: `on_event` is forwarded verbatim to `run_step(on_event=...)` (the
+    optional Phase 15B structured-progress callback). Omitted -> unchanged.
     """
     return run_step(
         project_id,
@@ -519,7 +543,83 @@ def run_pipeline_step(
         lld_service=lld_service,
         tc_service=tc_service,
         closure_service=closure_service,
+        on_event=on_event,
     )
+
+
+# --- Phase 15C: post-run pipeline progress (session-owned, never persisted) --------
+#
+# `run_step()` is synchronous, so the callback cannot repaint Streamlit while
+# Gemini is blocked. These helpers therefore build a POST-RUN timeline from the
+# `PipelineProgress` a run collected, plus the returned `SDLCState`. Only bounded
+# fields are kept — no `str(exc)`, no provider text, no prompts, no secrets.
+
+def _capture_pipeline_run(project_id: str, progress, final_state) -> dict:
+    """Safe in-memory summary for the session's "pipeline_run" state key.
+
+    `progress` is the run's `PipelineProgress`; `final_state` is the `SDLCState`
+    `run_step()` returned (or None on failure). Nothing here is written to disk.
+    Pure: only bounded fields, no Streamlit calls, no exception text.
+    """
+    records = progress.as_run_records()
+    used_state = final_state if isinstance(final_state, dict) else {}
+    return {
+        "project_id": project_id,
+        "run_id": records.get("run_id") or "-",
+        "run_records": records,                       # drives the rail overlay
+        "stages": records.get("stages") or {},
+        "failure_stage": records.get("failure_stage"),
+        "pipeline_status": used_state.get("status") or records.get("pipeline_status"),
+        "awaiting": used_state.get("awaiting") or records.get("awaiting"),
+        "produced": dict(used_state.get("produced") or records.get("produced") or {}),
+    }
+
+
+def _pipeline_run_headline(run_info: dict) -> str:
+    """Pure: a short, safe one-line summary of the most recent pipeline run."""
+    if run_info.get("failure_stage"):
+        return f"Pipeline stopped — failed at: {stage_label(run_info['failure_stage'])}"
+    if run_info.get("pipeline_status") == "complete":
+        return "Pipeline run complete — no orchestrated step remains"
+    return "Pipeline paused — a human approval is required to continue"
+
+
+def _render_pipeline_run_timeline(run_info: dict) -> None:
+    """Render the per-stage post-run timeline (uses `st.*`; not a pure helper)."""
+    stages = run_info.get("stages") or {}
+    _icons = {_pp.COMPLETED: "✅", _pp.RUNNING: "⏳", _pp.FAILED: "❌"}
+    for stage in _pp.GRAPH_STAGES:
+        rec = stages.get(stage)
+        if not rec:
+            continue
+        state = rec.get("state") or ""
+        line = f"{_icons.get(state, '•')} {stage_label(stage)} — {state.title()}"
+        if rec.get("elapsed_ms") is not None:
+            line += f" · {format_elapsed_ms(rec.get('elapsed_ms'))}"
+        if rec.get("attempts"):
+            line += f" (attempt {rec['attempts']})"
+        st.write(line)
+    if run_info.get("failure_stage"):
+        st.write(f"**Failed at: {stage_label(run_info['failure_stage'])}**")
+    produced = run_info.get("produced") or {}
+    if produced:
+        st.caption("Created this run: "
+                   + ", ".join(f"{stage_label(k)} v{v}" for k, v in produced.items()))
+    run_id = run_info.get("run_id")
+    if run_id and run_id != "-":
+        st.caption(f"Run reference: `{run_id}`")
+
+
+def _render_pipeline_run_summary(run_info: dict) -> None:
+    """Persistent (post-rerun) block for the last pipeline run (uses `st.*`)."""
+    headline = _pipeline_run_headline(run_info)
+    failed = bool(run_info.get("failure_stage"))
+    if failed:
+        st.warning(headline)
+    else:
+        st.caption(f"Last pipeline run: {headline}")
+    with st.expander("Pipeline run timeline", expanded=failed):
+        _render_pipeline_run_timeline(run_info)
 
 
 # --- session bootstrapping --------------------------------------------------------
@@ -1016,12 +1116,24 @@ with st.container():
         st.error(friendly_error(exc))
 
     if pipeline_status is not None:
-        # Horizontally-scrollable rail of all eight SDLC steps. Replaces the old
-        # 5-column caption row (which silently dropped the 6th line / Closure
-        # Report). Display only — state is derived from `sdlc_status()`; the
+        # Phase 15C: overlay the most recent pipeline run's per-stage records
+        # (COMPLETED / RUNNING / FAILED / BLOCKED + elapsed) onto the rail, but
+        # only for the project it belongs to. Never persisted.
+        _prev_run = st.session_state.get("pipeline_run")
+        _run_overlay = (
+            _prev_run.get("run_records")
+            if _prev_run and _prev_run.get("project_id") == st.session_state.project_id
+            else None
+        )
+
+        # Horizontally-scrollable rail of all nine SDLC steps. Display only —
+        # per-stage semantics come from
+        # `app.observability.pipeline_progress.pipeline_stage_model()`; the
         # `_pipeline_summary()` text helper is retained for API/test stability.
         st.markdown(_STEP_RAIL_CSS, unsafe_allow_html=True)
-        st.markdown(_render_step_rail(pipeline_status), unsafe_allow_html=True)
+        st.markdown(
+            _render_step_rail(pipeline_status, _run_overlay), unsafe_allow_html=True
+        )
 
         st.write(f"**{_next_step_label(pipeline_status)}**")
 
@@ -1041,6 +1153,10 @@ with st.container():
                 f"regenerated or re-approved automatically."
             )
 
+        # Phase 15C: persistent timeline of the last pipeline run for this project.
+        if _prev_run and _prev_run.get("project_id") == st.session_state.project_id:
+            _render_pipeline_run_summary(_prev_run)
+
         pipeline_ready = latest_version is not None
         if not pipeline_ready:
             st.info(
@@ -1053,12 +1169,22 @@ with st.container():
             "Run SDLC Pipeline", type="primary",
             disabled=not pipeline_ready, key="pipeline_run_btn",
         ):
-            with st.spinner("Running the SDLC orchestration pipeline..."):
+            # Phase 15C: `run_step()` is synchronous, so this st.status shows a
+            # single "running" state while Gemini is blocked; the per-stage
+            # timeline is filled in once the call returns (post-run).
+            progress = PipelineProgress()
+            with st.status(
+                "Running the SDLC orchestration pipeline…", expanded=True,
+            ) as pipeline_status_box:
                 try:
-                    run_pipeline_step(
+                    final_state = run_pipeline_step(
                         st.session_state.project_id,
                         service, sa_service, us_service, lld_service, qa_service,
                         closure_service,
+                        on_event=progress,
+                    )
+                    st.session_state["pipeline_run"] = _capture_pipeline_run(
+                        st.session_state.project_id, progress, final_state
                     )
                     refresh_versions()
                     refresh_hld_versions()
@@ -1066,12 +1192,21 @@ with st.container():
                     refresh_lld_versions()
                     refresh_qa_versions()
                     refresh_closure_versions()
-                    st.success(
-                        "SDLC orchestration completed. The pipeline stopped at "
-                        "the next required human action."
+                    _render_pipeline_run_timeline(st.session_state["pipeline_run"])
+                    pipeline_status_box.update(
+                        label=_pipeline_run_headline(st.session_state["pipeline_run"]),
+                        state="complete", expanded=False,
                     )
                     st.rerun()
                 except Exception as exc:
+                    st.session_state["pipeline_run"] = _capture_pipeline_run(
+                        st.session_state.project_id, progress, None
+                    )
+                    _render_pipeline_run_timeline(st.session_state["pipeline_run"])
+                    pipeline_status_box.update(
+                        label=_pipeline_run_headline(st.session_state["pipeline_run"]),
+                        state="error", expanded=True,
+                    )
                     st.error(friendly_error(exc))
 
 st.divider()
