@@ -94,6 +94,7 @@ def _validation_error(value="MODEL_OUTPUT_LEAK_MARKER_9F3A"):
 _ALL_CODES = {
     "persistence.corrupt", "persistence.io",
     "llm.quota", "llm.timeout", "llm.network", "llm.auth",
+    "llm.rate_limit", "llm.daily_quota", "llm.unavailable",
     "llm.empty_response", "llm.schema",
     "config.invalid",
     "state.missing_prerequisite", "state.locked", "state.invalid",
@@ -121,7 +122,10 @@ _REPRESENTATIVE = {
     "persistence.io": PermissionError("[Errno 13] Permission denied: outputs/p/versions.json"),
     "llm.quota": _wrap(TestCaseAgentError, "Gemini API call failed: 429 RESOURCE_EXHAUSTED — quota exceeded"),
     "llm.timeout": _wrap(SolutionArchitectAgentError, "Gemini API call failed: request timed out after 900s"),
-    "llm.network": _wrap(BusinessAnalystAgentError, "Gemini API call failed: 503 UNAVAILABLE — the model is overloaded"),
+    "llm.network": _wrap(BusinessAnalystAgentError, "Gemini API call failed: Connection reset by peer"),
+    "llm.unavailable": _wrap(BusinessAnalystAgentError, "Gemini API call failed: 503 UNAVAILABLE — the model is overloaded"),
+    "llm.rate_limit": _wrap(BusinessAnalystAgentError, "Gemini API call failed: 429 RESOURCE_EXHAUSTED. Quota exceeded for metric: generate_content_free_tier_requests. Please retry in 42.7s."),
+    "llm.daily_quota": _wrap(BusinessAnalystAgentError, "Gemini API call failed: 429 RESOURCE_EXHAUSTED quotaId GenerateRequestsPerDayPerProjectPerModel-FreeTier"),
     "llm.auth": _wrap(TestCaseAgentError, "Gemini API call failed: API key not valid. Pass a valid API key."),
     "llm.empty_response": TestCaseAgentError("Gemini returned an empty response"),
     "llm.schema": InvalidTestCaseJSONError("The QA agent did not return valid JSON: Expecting ','"),
@@ -145,13 +149,19 @@ def test_representative_exception_maps_to_its_code(code):
 
 # --- 3. retryable metadata + 4. log level metadata ----------------------
 
-_RETRYABLE_CODES = {"llm.timeout", "llm.network", "llm.empty_response", "llm.schema"}
+_RETRYABLE_CODES = {
+    "llm.timeout", "llm.network", "llm.empty_response", "llm.schema",
+    "llm.rate_limit", "llm.unavailable",
+}
 _LEVEL_BY_CODE = {
     "state.missing_prerequisite": logging.INFO,
     "state.locked": logging.INFO,
     "state.invalid": logging.INFO,
     "input.file": logging.INFO,
     "llm.quota": logging.WARNING,
+    "llm.rate_limit": logging.WARNING,
+    "llm.daily_quota": logging.WARNING,
+    "llm.unavailable": logging.WARNING,
     "llm.timeout": logging.WARNING,
     "llm.network": logging.WARNING,
     "llm.empty_response": logging.WARNING,
@@ -226,10 +236,20 @@ def test_version_persistence_error_wins_even_with_a_validation_error_cause():
 @pytest.mark.parametrize("msg", [
     "Gemini API call failed: 429 RESOURCE_EXHAUSTED",
     "Gemini API call failed: quota exceeded for generate_content_free_tier_requests",
-    "Gemini API call failed: rate limit reached, retry in 30s",
 ])
 def test_quota_variants(msg):
+    # No window information -> the generic (uncertain) quota message.
     assert classify(_wrap(TestCaseAgentError, msg)).category is ErrorCategory.LLM_QUOTA
+
+
+def test_quota_with_a_retry_window_is_a_rate_limit_with_the_wait_in_the_message():
+    # Free-tier stabilisation: a 429 carrying a retry delay is a short-window
+    # limit; the user is told how long to wait (rounded up).
+    res = classify(_wrap(TestCaseAgentError,
+                         "Gemini API call failed: rate limit reached, retry in 30s"))
+    assert res.category is ErrorCategory.LLM_RATE_LIMIT
+    assert res.retry_after_seconds == 30.0
+    assert "30 seconds" in res.user_message
 
 
 def test_quota_is_advisory_non_retryable():
@@ -252,6 +272,17 @@ def test_timeout_variants(msg):
 @pytest.mark.parametrize("msg", [
     "Gemini API call failed: 503 Service Unavailable",
     "Gemini API call failed: the model is overloaded, please try again later",
+    "Gemini API call failed: This model is currently experiencing high demand.",
+])
+def test_unavailable_variants(msg):
+    # Free-tier stabilisation: provider capacity errors are "temporarily
+    # unavailable", no longer the misleading "check your network" message.
+    res = classify(_wrap(BusinessAnalystAgentError, msg))
+    assert res.category is ErrorCategory.LLM_UNAVAILABLE
+    assert res.user_message == "Gemini is temporarily unavailable. Please try again later."
+
+
+@pytest.mark.parametrize("msg", [
     "Gemini API call failed: Server disconnected without sending a response",
     "Gemini API call failed: Connection reset by peer",
 ])

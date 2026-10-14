@@ -52,9 +52,11 @@ def test_timeout_and_retry_config_defaults_are_conservative():
     assert settings.gemini_timeout_seconds == 900
     assert settings.gemini_timeout_seconds >= 600
 
-    # small SDK retry budget so it does not multiply with the structured
-    # agents' own 3-attempt application loop (was up to 6 x 3 = 18).
-    assert settings.gemini_max_retries == 2
+    # SDK attempt budget. Free-tier stabilisation: `max_retries` is the SDK's
+    # TOTAL HTTP attempt count (verified: 2 meant two requests per agent
+    # attempt, i.e. up to 6 per call); default is now 1 so the application
+    # GeminiRetryPolicy is the single, server-aware retry layer.
+    assert settings.gemini_max_retries == 1
     assert 0 <= settings.gemini_max_retries <= 3
 
 

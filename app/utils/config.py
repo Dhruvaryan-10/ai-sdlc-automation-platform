@@ -38,7 +38,7 @@ def _abs_dir(raw: str) -> Path:
 class Settings(BaseSettings):
     # --- Gemini / LLM configuration ---
     google_api_key: str
-    gemini_model: str = "gemini-3.5-flash"
+    gemini_model: str = "gemini-3.6-flash"
     gemini_temperature: float = 0.3
 
     # Phase 11A — explicit, configurable timeout / retry policy for the Gemini
@@ -51,14 +51,31 @@ class Settings(BaseSettings):
     # worst observed case. Raise `GEMINI_TIMEOUT_SECONDS` for slow links or
     # unusually large documents.
     #
-    # `gemini_max_retries` is the SDK-level HTTP retry budget. The structured
-    # agents (test_case, closure_report) additionally run their own bounded
-    # 3-attempt application-level loop with jittered backoff; keeping the SDK
-    # budget small (default 2) stops the two from multiplying (was up to
-    # 6 x 3 = 18 attempts; now at most 2 x 3 = 6). Set `GEMINI_MAX_RETRIES=0`
-    # to make the application loop the sole retry mechanism.
+    # `gemini_max_retries` is passed to the SDK as `HttpRetryOptions(attempts=N)`
+    # — N is the TOTAL number of HTTP requests per agent attempt, not the number
+    # of retries (verified against langchain-google-genai 4.2.7 / google-genai
+    # 2.8.0: 0 and 1 both mean a single request). The SDK's own retry ignores
+    # Google's requested retry delay on 429 and retries after ~1 s, and it sits
+    # UNDER every agent's application-level loop, so the two multiplied (the old
+    # default 2 x 3 agent attempts = up to 6 requests per click — more than the
+    # whole free-tier per-minute quota). Free-tier stabilisation: the default is
+    # now 1 (SDK makes one request; the application policy in
+    # `app/utils/gemini_retry.py` is the single, server-aware retry layer).
     gemini_timeout_seconds: int = 900
-    gemini_max_retries: int = 2
+    gemini_max_retries: int = 1
+
+    # Free-tier stabilisation — the application-level retry budget, shared by
+    # all seven agents via `app.utils.gemini_retry.GeminiRetryPolicy`.
+    #
+    # `gemini_retry_max_attempts`: total attempts per Gemini call (1 = never
+    # retry). Kept small; 503s get exponential backoff with jitter.
+    # `gemini_retry_max_wait_seconds`: the most ONE call may sleep in total
+    # between attempts. A 429 is retried (once) only when Google's requested
+    # delay fits in this budget; otherwise the user immediately gets a clear
+    # "wait N seconds" message instead of a Streamlit request blocking for
+    # minutes. 0 disables all waiting (fail fast).
+    gemini_retry_max_attempts: int = 3
+    gemini_retry_max_wait_seconds: int = 60
 
     # --- Folder configuration ---
     upload_dir: str = "uploads"
@@ -115,6 +132,34 @@ class Settings(BaseSettings):
             raise ValueError("GEMINI_MAX_RETRIES must be an integer >= 0.")
         return value
 
+    @field_validator("gemini_model")
+    @classmethod
+    def _validate_gemini_model(cls, value: str) -> str:
+        stripped = (value or "").strip()
+        if not stripped:
+            raise ValueError(
+                "GEMINI_MODEL must not be empty (e.g. GEMINI_MODEL=gemini-3.6-flash)."
+            )
+        if any(ch.isspace() for ch in stripped):
+            raise ValueError("GEMINI_MODEL must not contain whitespace.")
+        return stripped  # store the trimmed value
+
+    @field_validator("gemini_retry_max_attempts")
+    @classmethod
+    def _validate_gemini_retry_max_attempts(cls, value: int) -> int:
+        if not (1 <= value <= 5):
+            raise ValueError("GEMINI_RETRY_MAX_ATTEMPTS must be an integer from 1 to 5.")
+        return value
+
+    @field_validator("gemini_retry_max_wait_seconds")
+    @classmethod
+    def _validate_gemini_retry_max_wait_seconds(cls, value: int) -> int:
+        if not (0 <= value <= 300):
+            raise ValueError(
+                "GEMINI_RETRY_MAX_WAIT_SECONDS must be an integer from 0 to 300."
+            )
+        return value
+
     @field_validator("log_level")
     @classmethod
     def _validate_log_level(cls, value: str) -> str:
@@ -156,6 +201,8 @@ class Settings(BaseSettings):
             "temperature": self.gemini_temperature,
             "timeout_seconds": self.gemini_timeout_seconds,
             "max_retries": self.gemini_max_retries,
+            "retry_max_attempts": self.gemini_retry_max_attempts,
+            "retry_max_wait_seconds": self.gemini_retry_max_wait_seconds,
             "log_level": self.log_level,
             "output_dir": str(_abs_dir(self.output_dir)),
             "upload_dir": str(_abs_dir(self.upload_dir)),

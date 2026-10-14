@@ -34,6 +34,8 @@ from enum import Enum
 
 from pydantic import ValidationError as _PydanticValidationError
 
+from app.utils.gemini_retry import GeminiFailureKind, classify_gemini_failure
+
 # --- recognised project exception types (symbols only — importing these modules
 #     does no new I/O beyond what importing `app.*` already does) ---------------
 from app.agents.business_analyst.agent import BusinessAnalystAgentError as _BAAgentError
@@ -114,7 +116,10 @@ class ErrorCategory(str, Enum):
 
     PERSISTENCE_CORRUPT = "persistence.corrupt"
     PERSISTENCE_IO = "persistence.io"
-    LLM_QUOTA = "llm.quota"
+    LLM_QUOTA = "llm.quota"              # 429 whose window could not be determined
+    LLM_RATE_LIMIT = "llm.rate_limit"    # short-window (per-minute) free-tier limit
+    LLM_DAILY_QUOTA = "llm.daily_quota"  # per-day quota exhausted
+    LLM_UNAVAILABLE = "llm.unavailable"  # 5xx / UNAVAILABLE / "high demand"
     LLM_TIMEOUT = "llm.timeout"
     LLM_NETWORK = "llm.network"
     LLM_AUTH = "llm.auth"
@@ -137,6 +142,9 @@ class AppError:
     user_message: str
     log_level: int
     retryable: bool
+    # Google's requested retry delay (seconds) when known — safe numeric
+    # metadata only (llm.rate_limit). Lets the UI enforce a per-session cooldown.
+    retry_after_seconds: float | None = None
 
 
 # category -> (log_level, retryable, default_user_message)
@@ -155,6 +163,21 @@ _SPEC: dict[ErrorCategory, tuple[int, bool, str]] = {
         logging.WARNING, False,
         "Gemini is currently rate-limited or its quota may be exhausted. Wait a "
         "bit and try again.",
+    ),
+    ErrorCategory.LLM_RATE_LIMIT: (
+        logging.WARNING, True,
+        "Gemini's free-tier request limit has been reached. Please wait for the "
+        "indicated retry window before trying again.",
+    ),
+    ErrorCategory.LLM_DAILY_QUOTA: (
+        logging.WARNING, False,
+        "The Gemini API daily quota appears to be exhausted. Please check your "
+        "usage dashboard and try again after the quota resets (daily quotas reset "
+        "at midnight Pacific time).",
+    ),
+    ErrorCategory.LLM_UNAVAILABLE: (
+        logging.WARNING, True,
+        "Gemini is temporarily unavailable. Please try again later.",
     ),
     ErrorCategory.LLM_TIMEOUT: (
         logging.WARNING, True,
@@ -217,8 +240,20 @@ _SAFE_DETAIL_CATEGORIES = frozenset({
 # Generic fallback message, exposed for callers that need it without a category.
 UNEXPECTED_MESSAGE = _SPEC[ErrorCategory.UNEXPECTED][2]
 
+# A Gemini model / API-configuration rejection (unknown or unsupported model
+# name). Reported under CONFIG_INVALID with Gemini-specific wording.
+GEMINI_CONFIG_MESSAGE = (
+    "Gemini configuration is invalid. Check the deployment configuration and "
+    "application logs."
+)
 
-def _app_error(category: ErrorCategory, *, message: str | None = None) -> AppError:
+
+def _app_error(
+    category: ErrorCategory,
+    *,
+    message: str | None = None,
+    retry_after_seconds: float | None = None,
+) -> AppError:
     log_level, retryable, default_msg = _SPEC[category]
     return AppError(
         category=category,
@@ -226,6 +261,21 @@ def _app_error(category: ErrorCategory, *, message: str | None = None) -> AppErr
         user_message=message if message else default_msg,
         log_level=log_level,
         retryable=retryable,
+        retry_after_seconds=retry_after_seconds,
+    )
+
+
+def _rate_limit_error(retry_after: float | None) -> AppError:
+    if retry_after is None:
+        return _app_error(ErrorCategory.LLM_RATE_LIMIT)
+    seconds = max(1, int(retry_after + 0.999))  # round up; never "0 seconds"
+    return _app_error(
+        ErrorCategory.LLM_RATE_LIMIT,
+        message=(
+            "Gemini's free-tier request limit has been reached. Please wait about "
+            f"{seconds} seconds before trying again."
+        ),
+        retry_after_seconds=float(seconds),
     )
 
 
@@ -250,12 +300,18 @@ _QUOTA_MARKERS = (
 _TIMEOUT_MARKERS = (
     "timeout", "timed out", "deadline exceeded", "read timed out",
 )
-_NETWORK_MARKERS = (
+# Provider capacity / server-side failures ("Gemini is temporarily unavailable").
+_UNAVAILABLE_MARKERS = (
     "503", "502", "504", "unavailable", "overloaded", "high demand",
-    "service unavailable", "bad gateway", "server disconnected",
+    "service unavailable", "bad gateway", "internal error",
+    "internal server error",
+)
+# Client-side transport / connectivity failures ("couldn't reach Gemini").
+_NETWORK_MARKERS = (
+    "server disconnected",
     "connection reset", "connection aborted", "connection refused",
     "remote protocol", "remoteprotocolerror", "incomplete read",
-    "temporarily", "internal error", "internal server error", "try again",
+    "temporarily", "try again",
 )
 _EMPTY_RESPONSE_MARKERS = (
     "returned an empty response", "returned no structured result",
@@ -370,15 +426,29 @@ def _classify_llm(chain: list[BaseException]) -> AppError:
             or "PERMISSION_DENIED" in codes or "UNAUTHENTICATED" in codes
             or marker(_AUTH_MARKERS)):
         return _app_error(ErrorCategory.LLM_AUTH)
-    if 429 in codes or "RESOURCE_EXHAUSTED" in codes or marker(_QUOTA_MARKERS):
-        return _app_error(ErrorCategory.LLM_QUOTA)
+    # Free-tier stabilisation: Google's 429 / 5xx / model errors are
+    # sub-classified by `app.utils.gemini_retry` (structured RetryInfo /
+    # QuotaFailure details first, message markers as a fallback).
+    gemini = classify_gemini_failure(chain[0])
+    if (gemini.is_quota or 429 in codes or "RESOURCE_EXHAUSTED" in codes
+            or marker(_QUOTA_MARKERS)):
+        if gemini.kind is GeminiFailureKind.DAILY_QUOTA:
+            return _app_error(ErrorCategory.LLM_DAILY_QUOTA)
+        if gemini.kind is GeminiFailureKind.RATE_LIMIT:
+            return _rate_limit_error(gemini.retry_after_seconds)
+        return _app_error(ErrorCategory.LLM_QUOTA)  # window unknown: generic
+    if gemini.kind is GeminiFailureKind.MODEL_CONFIG:
+        return _app_error(ErrorCategory.CONFIG_INVALID, message=GEMINI_CONFIG_MESSAGE)
     if (names & _HTTPX_TIMEOUT_NAMES
             or any(isinstance(e, TimeoutError) for e in chain)
             or "DEADLINE_EXCEEDED" in codes or marker(_TIMEOUT_MARKERS)):
         return _app_error(ErrorCategory.LLM_TIMEOUT)
-    if (names & _HTTPX_NETWORK_NAMES
+    if (gemini.kind is GeminiFailureKind.UNAVAILABLE
             or any(c in (500, 502, 503, 504) for c in codes)
-            or "UNAVAILABLE" in codes or "INTERNAL" in codes or "ABORTED" in codes
+            or "UNAVAILABLE" in codes or "INTERNAL" in codes
+            or marker(_UNAVAILABLE_MARKERS)):
+        return _app_error(ErrorCategory.LLM_UNAVAILABLE)
+    if (names & _HTTPX_NETWORK_NAMES or "ABORTED" in codes
             or marker(_NETWORK_MARKERS)):
         return _app_error(ErrorCategory.LLM_NETWORK)
     if marker(_EMPTY_RESPONSE_MARKERS):
@@ -502,6 +572,8 @@ def log_app_error(logger_: logging.Logger, classified: AppError, exc: BaseExcept
             f"{classified.category.name} [{classified.code}] "
             f"type={type(exc).__name__} cause={cause_name}"
         )
+        if classified.retry_after_seconds is not None:
+            head += f" retry_after={classified.retry_after_seconds:.0f}s"
 
         if classified.category in _SAFE_DETAIL_CATEGORIES:
             logger_.log(
