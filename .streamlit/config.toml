@@ -9,3 +9,9 @@ showErrorDetails = false
 # Run without auto-opening a browser; bound SOW upload size (MB).
 headless = true
 maxUploadSize = 25
+
+[theme]
+# Native base theme = the app's first-session default (Dark). The in-app
+# Light/Dark switch (app/ui/theme.py) layers a scoped stylesheet on top of it;
+# Streamlit 1.38 has no supported per-session runtime theme API.
+base = "dark"

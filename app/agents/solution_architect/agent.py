@@ -30,6 +30,8 @@ from pydantic import ValidationError
 
 from app.agents.business_analyst.agent import ProjectMetadata
 from app.agents.business_analyst.prompt_manager import PromptManager
+from app.utils.config import settings
+from app.utils.gemini_retry import GeminiRetryPolicy, describe
 from app.utils.llm import build_chat_llm
 from app.utils.logger import get_logger
 from app.utils.metrics import instrumented_invoke
@@ -46,7 +48,12 @@ _PROMPTS_DIR = Path(__file__).parent / "prompts"
 # seconds of backoff at most, stdlib only (no new dependency). Duplicated per
 # agent on purpose -- CLAUDE.md forbids a shared retry helper / base class until
 # a dedicated cleanup phase.
-_RETRY_MAX_ATTEMPTS = 3
+# Free-tier stabilisation: total attempts per call now come from
+# GEMINI_RETRY_MAX_ATTEMPTS (default 3, range 1-5). WHETHER and HOW LONG to
+# wait between attempts is decided by app.utils.gemini_retry.GeminiRetryPolicy
+# (server-aware: honours Google's retry delay on 429, never retries an
+# exhausted daily quota, bounds total sleep by GEMINI_RETRY_MAX_WAIT_SECONDS).
+_RETRY_MAX_ATTEMPTS = settings.gemini_retry_max_attempts
 _RETRY_BASE_DELAY_S = 1.0
 _RETRY_MAX_DELAY_S = 8.0
 
@@ -96,6 +103,16 @@ def _retry_backoff_seconds(attempt: int) -> float:
     d = min(max_delay, base * 2**(attempt-1))."""
     ceiling = min(_RETRY_MAX_DELAY_S, _RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
     return ceiling / 2 + random.uniform(0, ceiling / 2)
+
+
+def _new_retry_policy() -> GeminiRetryPolicy:
+    """One bounded retry policy per logical Gemini call (see module notes).
+    Resolves `_is_transient_llm_error` / `_retry_backoff_seconds` at call time."""
+    return GeminiRetryPolicy(
+        max_attempts=_RETRY_MAX_ATTEMPTS,
+        is_transient=lambda exc: _is_transient_llm_error(exc),
+        backoff=lambda attempt: _retry_backoff_seconds(attempt),
+    )
 
 
 class SolutionArchitectAgentError(Exception):
@@ -158,6 +175,7 @@ class SolutionArchitectAgent:
         number is forwarded to ``instrumented_invoke`` so telemetry stays correct.
         """
         response = None
+        retry_policy = _new_retry_policy()
         for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
             try:
                 response = instrumented_invoke(
@@ -166,15 +184,21 @@ class SolutionArchitectAgent:
                 )
                 break
             except Exception as exc:
-                if attempt < _RETRY_MAX_ATTEMPTS and _is_transient_llm_error(exc):
-                    delay = _retry_backoff_seconds(attempt)
+                delay = retry_policy.next_delay(exc, attempt)
+                if delay is not None:
                     logger.warning(
                         "Gemini call failed (attempt %d/%d), retrying in %.1fs: %s",
-                        attempt, _RETRY_MAX_ATTEMPTS, delay, exc,
+                        attempt, _RETRY_MAX_ATTEMPTS, delay,
+                        describe(exc, retry_policy.last_failure),
                     )
                     time.sleep(delay)
                     continue
-                logger.error(f"Gemini API call failed: {exc}")
+                # Sanitized: classification metadata only, never provider text.
+                logger.error(
+                    "Gemini API call failed (attempt %d/%d): %s",
+                    attempt, _RETRY_MAX_ATTEMPTS,
+                    describe(exc, retry_policy.last_failure),
+                )
                 raise SolutionArchitectAgentError(f"Gemini API call failed: {exc}") from exc
 
         raw_content = getattr(response, "content", None)
@@ -222,7 +246,11 @@ class SolutionArchitectAgent:
             current_version=str(current_version),
         )
 
-        logger.info(f"Refining HLD from v{current_version} with feedback: '{user_feedback[:80]}...'")
+        # Free-tier stabilisation / log hygiene: never log user-supplied text.
+        logger.info(
+            f"Refining HLD from v{current_version} "
+            f"(feedback: {len(user_feedback)} chars)"
+        )
         refined_text = self._invoke(prompt)
         logger.info(f"HLD refined ({len(refined_text)} chars)")
         return refined_text

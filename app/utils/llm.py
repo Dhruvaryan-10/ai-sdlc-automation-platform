@@ -33,6 +33,11 @@ def build_chat_llm(*, max_retries: int | None = None) -> ChatGoogleGenerativeAI:
     Reads `settings` at CALL time (never import time), so a test that
     monkeypatches `settings.gemini_*` before the first real call still wins.
 
+    * `max_retries` is the SDK's TOTAL HTTP attempt count per call
+      (`HttpRetryOptions(attempts=N)`; 0 and 1 both mean one request). The
+      default is 1: the SDK's own retry ignores Google's 429 retry delay, so
+      the application-level `app.utils.gemini_retry.GeminiRetryPolicy` is the
+      single, server-aware retry layer (free-tier stabilisation).
     * `timeout` / `max_retries` are passed EXPLICITLY (previously left to the
       SDK defaults: `timeout=None` — no client deadline at all — and
       `max_retries=6`). `settings.gemini_timeout_seconds` bounds a hung

@@ -140,7 +140,10 @@ missing or out of range the app stops immediately with a plain-English message
 | `GOOGLE_API_KEY` | Required; a real key (not empty, not the placeholder). |
 | `GEMINI_TEMPERATURE` | Number from `0.0` to `2.0` inclusive. |
 | `GEMINI_TIMEOUT_SECONDS` | Integer `1` or greater. |
-| `GEMINI_MAX_RETRIES` | Integer `0` or greater. |
+| `GEMINI_MODEL` | Non-empty model ID with no spaces. Default `gemini-3.6-flash`. |
+| `GEMINI_MAX_RETRIES` | Integer `0` or greater. SDK attempts per call (default `1`; see 8.7). |
+| `GEMINI_RETRY_MAX_ATTEMPTS` | Integer `1`–`5`. Application attempts per Gemini call (default `3`). |
+| `GEMINI_RETRY_MAX_WAIT_SECONDS` | Integer `0`–`300`. Most one call may wait between attempts (default `60`). |
 | `LOG_LEVEL` | One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (any case). |
 | `UPLOAD_DIR` / `OUTPUT_DIR` / `LOG_DIR` | Any path; relative paths resolve against the directory you launch from, so run the app from the repository root. The folders are created automatically. |
 
@@ -400,9 +403,18 @@ pytest
   value itself is not shown. See the valid-values table in Step 2.3.
 - **`streamlit: command not found`** — your virtual environment isn't
   activated. Re-run the activation command from Step 2.1.
-- **Gemini errors about quota/rate limit** — the free tier has request
-  limits; wait a minute and try again, or check your usage at
-  https://aistudio.google.com.
+- **"Gemini's free-tier request limit has been reached"** — the per-minute
+  free-tier limit was hit. The message says how many seconds Google asked you
+  to wait; the app will not send another request from your session before then.
+  See 8.7.
+- **"The Gemini API daily quota appears to be exhausted"** — the per-day quota
+  is used up; it resets at midnight Pacific time. Check usage at
+  https://aistudio.google.com. The app never auto-retries this.
+- **"Gemini is temporarily unavailable"** — Google returned 503 / high demand.
+  The app already retried a few times with backoff; try again later.
+- **"Gemini configuration is invalid"** — usually an unknown or retired
+  `GEMINI_MODEL`. Check the value in `.env` (local) or in your deployment
+  secrets, and the log line `kind=model_config`.
 - **Uploaded PDF produces empty/garbled text** — if the PDF is a scanned
   image (not real text), PyMuPDF can't extract it; this Phase 1 build
   doesn't include OCR. Use a text-based PDF, DOCX, or TXT instead.
@@ -481,10 +493,12 @@ value stops the app with a plain message and never prints the value. See
 | Variable | Required | Notes |
 | --- | --- | --- |
 | `GOOGLE_API_KEY` | **yes** | Real Gemini key. Rejected if empty or left as the `.env.example` placeholder. Pass it via `-e` / a secret store — **never commit `.env`, never bake it into the image** (`.dockerignore` excludes `.env`). |
-| `GEMINI_MODEL` | no | Default `gemini-3.5-flash`. |
+| `GEMINI_MODEL` | no | Default `gemini-3.6-flash` (the single source for every agent — see 8.7). |
 | `GEMINI_TEMPERATURE` | no | Default `0.3`; must be `0.0`–`2.0`. |
 | `GEMINI_TIMEOUT_SECONDS` | no | Default `900`; integer `>= 1`. |
-| `GEMINI_MAX_RETRIES` | no | Default `2`; integer `>= 0`. |
+| `GEMINI_MAX_RETRIES` | no | Default `1`; integer `>= 0`. **Total** SDK HTTP attempts per agent attempt (`0` and `1` both = one request). Keep it at `1`. |
+| `GEMINI_RETRY_MAX_ATTEMPTS` | no | Default `3`; `1`–`5`. Application-level attempts per Gemini call. |
+| `GEMINI_RETRY_MAX_WAIT_SECONDS` | no | Default `60`; `0`–`300`. Total wait budget per call; `0` = fail fast. |
 | `UPLOAD_DIR` / `OUTPUT_DIR` / `LOG_DIR` | no | Defaults `uploads` / `outputs` / `logs`, resolved to absolute paths against the working directory. |
 | `LOG_LEVEL` | no | Default `INFO`; one of `DEBUG,INFO,WARNING,ERROR,CRITICAL` (any case). |
 
@@ -528,6 +542,86 @@ validation.
   and manual UI testing).
 - The base image digest is not pinned by default (see 8.2).
 - No license is set yet (see below).
+- Rate-limit protection is **per browser session** (see 8.7): several users
+  or tabs sharing one API key are not coordinated with each other.
+
+### 8.7 Gemini model, free-tier quotas and Streamlit Cloud
+
+**Which setting controls the model.** Every agent builds its client through
+`app/utils/llm.py::build_chat_llm()`, which reads `settings.gemini_model`
+(`app/utils/config.py`). There are no per-agent model names. Precedence:
+real environment variables → `.env` → the code default (`gemini-3.6-flash`,
+listed in Google's Gemini API model docs).
+
+**Configuring it.**
+- *Local:* set `GEMINI_MODEL=gemini-3.6-flash` and `GOOGLE_API_KEY=...` in `.env`
+  (never commit it).
+- *Docker:* `-e GEMINI_MODEL=... -e GOOGLE_API_KEY=...`.
+- *Streamlit Community Cloud:* app → **Settings → Secrets**, as top-level keys:
+  ```toml
+  GOOGLE_API_KEY = "your-key"
+  GEMINI_MODEL = "gemini-3.6-flash"
+  GEMINI_MAX_RETRIES = "1"
+  ```
+  Streamlit exports top-level secrets as environment variables at server start,
+  which is what `Settings` reads. **Editing your local `.env` does not change
+  Streamlit Cloud** — the `.env` file is git-ignored and never deployed. After
+  editing Cloud secrets, **reboot the app** (settings are read once per process).
+  The startup log line `config: model=...` shows the effective model.
+
+**How free-tier quotas affect generation.** Limits apply per Google Cloud
+project and model, not per API key: a requests-per-minute limit (the error
+previously seen: 5/minute) and a requests-per-day limit (resets at midnight
+Pacific time). One SDLC pipeline run makes several Gemini calls (BRD, HLD and
+user stories at the same time, LLD, refinement, test cases, closure), so fast
+repeated runs can hit the per-minute limit.
+
+**How errors are handled** (`app/utils/gemini_retry.py`, used by all agents):
+
+| Gemini response | What the app does |
+| --- | --- |
+| 429, per-minute limit, with a retry delay | Reads Google's `RetryInfo` / `Retry-After` / "retry in Ns". Waits **once** if the delay fits in `GEMINI_RETRY_MAX_WAIT_SECONDS`; otherwise stops immediately and tells you how long to wait. Your session then refuses new generations until that window has passed. |
+| 429, daily quota | Never retried. Clear daily-quota message. |
+| 429, window unknown | Not retried. Generic quota message. |
+| 503 / UNAVAILABLE / high demand | Exponential backoff with jitter, raised to any server delay; at most `GEMINI_RETRY_MAX_ATTEMPTS` attempts and `GEMINI_RETRY_MAX_WAIT_SECONDS` of waiting. |
+| Unknown / unsupported model | Not retried. "Gemini configuration is invalid" message. |
+
+The SDK's own retry is off by default (`GEMINI_MAX_RETRIES=1`). It ignores
+Google's 429 retry delay and used to multiply with the app's retries: the old
+default meant up to 6 requests in a few seconds for one click. Logs contain
+only classification metadata (`kind=rate_limit status=429 retry_after=42.0s`),
+never provider text, prompts, SOW content or keys.
+
+**Double-click protection.** Each generation button (and *Run SDLC Pipeline*)
+goes through a per-session guard (`app/ui/generation_guard.py`). A click queued
+while a generation was running is ignored, and the in-progress flag is always
+cleared on success, failure or interruption. Project IDs and saved artifacts are
+untouched; a failed later stage never removes earlier artifacts.
+
+**Multi-user limitation.** The guard and cooldown live in Streamlit session
+state, so they protect one browser session. They are **not** a global rate
+limiter: several users or tabs share the project's quota and can still exceed
+it together. A shared limiter would need shared state (e.g. Redis), which this
+deployment does not have.
+
+### 8.8 Light / Dark theme
+
+A **Theme: Light | Dark** switch sits at the top-right of the main page.
+- Dark is the default for a new session (`.streamlit/config.toml` sets
+  `[theme] base = "dark"`).
+- Your choice is kept in session state and mirrored to the URL (`?theme=light`),
+  so it survives reruns, tab changes, project switches and a browser refresh.
+  It is per viewer, never global.
+- Streamlit 1.38 has **no supported API to change the theme per session at
+  runtime** (`st._config` is private and server-wide). The switch therefore
+  applies a scoped stylesheet (`app/ui/theme.py`) built from design tokens and
+  Streamlit's stable `data-testid` / `data-baseweb` hooks. Text tokens meet
+  WCAG AA contrast, keyboard focus is always visible, and reduced-motion,
+  high-contrast and forced-colours preferences are respected.
+- Known limits: `st.dataframe` grids are drawn on a canvas in the native
+  (dark) theme. In Light mode they are colour-inverted, which looks close but
+  not pixel-exact. If a viewer picks a different theme in Streamlit's own
+  ⋮ → Settings menu, those native-only parts follow that choice instead.
 
 ---
 

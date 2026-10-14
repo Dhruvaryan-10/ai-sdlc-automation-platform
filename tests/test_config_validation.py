@@ -33,7 +33,12 @@ def test_valid_defaults_load():
     s = _mk()
     assert s.gemini_temperature == 0.3
     assert s.gemini_timeout_seconds == 900
-    assert s.gemini_max_retries == 2
+    # Free-tier stabilisation: SDK attempts default 1 (no SDK-level retry; the
+    # application GeminiRetryPolicy is the single server-aware retry layer).
+    assert s.gemini_max_retries == 1
+    assert s.gemini_retry_max_attempts == 3
+    assert s.gemini_retry_max_wait_seconds == 60
+    assert s.gemini_model == "gemini-3.6-flash"
     assert s.log_level == "INFO"
     # defaults / field names / singleton architecture unchanged
     assert isinstance(settings, Settings)
@@ -182,6 +187,7 @@ def test_summary_for_log_contains_safe_fields():
     keys = set(_mk().summary_for_log())
     assert keys == {
         "model", "temperature", "timeout_seconds", "max_retries",
+        "retry_max_attempts", "retry_max_wait_seconds",
         "log_level", "output_dir", "upload_dir", "log_dir",
     }
 
@@ -258,6 +264,6 @@ def test_bad_env_raises_the_exception_type_the_guard_catches(monkeypatch):
 def test_llm_client_config_defaults_still_pinned():
     # mirrors tests/test_llm_client_config.py's expectations — must not regress
     assert settings.gemini_timeout_seconds == 900
-    assert settings.gemini_max_retries == 2
+    assert settings.gemini_max_retries == 1  # free-tier stabilisation (was 2)
     assert 0 <= settings.gemini_max_retries <= 3
     assert settings.gemini_timeout_seconds >= 600

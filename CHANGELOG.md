@@ -7,6 +7,52 @@ rather than by semantic version.
 
 ## [Unreleased]
 
+### Free-tier stabilisation, rate-limit handling & Light/Dark theme
+
+- **Root cause of free-tier 429s:** the SDK retry (`GEMINI_MAX_RETRIES=2` is
+  *two HTTP attempts*, verified against langchain-google-genai 4.2.7 /
+  google-genai 2.8.0) ran under every agent's 3-attempt loop. One 429 click
+  sent up to 6 requests in about 5 s, and neither layer honoured Google's
+  requested retry delay.
+- **`app/utils/gemini_retry.py` (new):** classifies Gemini failures into
+  per-minute rate limit, daily quota, unknown-window quota, 503/unavailable or
+  model-config. It reads Google's retry delay (structured `RetryInfo`, then the
+  `Retry-After` header, then the "retry in Ns" text) and provides a bounded
+  per-call `GeminiRetryPolicy`. All seven agents' existing loops consult it:
+  - a per-minute 429 is retried at most once, only after Google's delay and
+    only if that fits the wait budget;
+  - daily or unknown quota and bad model names are never retried;
+  - 503s use the existing jittered exponential backoff, raised to any server
+    delay.
+- **Config:** `GEMINI_MAX_RETRIES` default `2 → 1` (single SDK attempt). New
+  `GEMINI_RETRY_MAX_ATTEMPTS` (default 3, 1–5) and
+  `GEMINI_RETRY_MAX_WAIT_SECONDS` (default 60, 0–300). `GEMINI_MODEL` is
+  validated (non-empty, no spaces). A startup warning is logged if
+  `GEMINI_MAX_RETRIES > 1`. The `.env.example`, README and code default all now
+  use `gemini-3.6-flash`, which resolves the open `GEMINI_MODEL` discrepancy item.
+- **Error taxonomy:** new `llm.rate_limit` (message includes the wait in
+  seconds), `llm.daily_quota` and `llm.unavailable`. 503 no longer shows
+  "check your network". Unknown models map to "Gemini configuration is invalid".
+  Agent logs carry only sanitized classification metadata. Refinement feedback
+  text is no longer logged.
+- **Duplicate-generation guard (`app/ui/generation_guard.py`, new):** all 14
+  Gemini-triggering buttons and *Run SDLC Pipeline* go through a per-session
+  guard. Queued double-clicks are ignored, the in-progress flag is always reset,
+  and a Google retry window is honoured for the session. Session state only;
+  not a cross-user limiter.
+- **Light/Dark switch (`app/ui/theme.py`, new):** a `Theme: Light | Dark` radio
+  at the top of the page, defaulting to Dark (`.streamlit/config.toml`
+  `[theme] base = "dark"`). The choice persists via session state + `?theme=`
+  and survives project switches. Token-based scoped CSS uses stable
+  `data-testid`/`data-baseweb` selectors and meets WCAG AA text contrast, with
+  visible focus. The pipeline step rail now uses theme variables. Filled
+  primary buttons use `#d93636` (white text 4.6:1) instead of `#ff4b4b` (3.4:1).
+- **Tests:** `tests/test_gemini_rate_limit.py` (real SDK error objects plus a
+  real client driven over an in-process HTTP transport; no quota used) and
+  `tests/test_generation_guard_and_theme.py`. Pinned-default tests were updated
+  for the intentional changes above.
+
+
 ### Phase 14 — CI & Deployment Readiness
 
 - **GitHub Actions CI** (`.github/workflows/ci.yml`): on every push to `main`
@@ -41,7 +87,7 @@ rather than by semantic version.
 - The repository has **no license file**. None is established anywhere in the
   repo history or metadata; choosing one is a project-owner decision (see
   `README.md` → License).
-- `GEMINI_MODEL` discrepancy is unchanged: code / `.env.example` default
+- *(Resolved in "Free-tier stabilisation" above.)* `GEMINI_MODEL` discrepancy: code / `.env.example` default
   `gemini-3.5-flash` vs the local `.env` `gemini-3.6-flash`. Deliberately out of
   scope — awaits a product decision.
 

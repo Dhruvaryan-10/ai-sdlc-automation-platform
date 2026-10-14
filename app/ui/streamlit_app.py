@@ -48,6 +48,9 @@ except _ConfigValidationError:
         "- `GEMINI_TEMPERATURE` is between `0.0` and `2.0`\n"
         "- `GEMINI_TIMEOUT_SECONDS` is `1` or greater\n"
         "- `GEMINI_MAX_RETRIES` is `0` or greater\n"
+        "- `GEMINI_MODEL` is set and has no spaces\n"
+        "- `GEMINI_RETRY_MAX_ATTEMPTS` is `1`–`5`; "
+        "`GEMINI_RETRY_MAX_WAIT_SECONDS` is `0`–`300`\n"
         "- `LOG_LEVEL` is one of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`\n\n"
         "See **README section 2.3** for setup. The specific value is not shown here "
         "for security; check the application logs for the field name."
@@ -84,6 +87,8 @@ from app.observability.pipeline_progress import (
     pipeline_stage_model,
     stage_label,
 )
+from app.ui import generation_guard as _gen_guard
+from app.ui import theme as _theme
 from app.ui.project_registry import list_existing_projects, sanitize_project_id
 from app.utils.errors import classify, log_app_error
 from app.utils.logger import get_logger
@@ -96,8 +101,36 @@ logger.info(
     "config: %s",
     " ".join(f"{k}={v}" for k, v in settings.summary_for_log().items()),
 )
+if settings.gemini_max_retries > 1:
+    # Free-tier stabilisation: SDK retries ignore Google's 429 retry delay and
+    # multiply with the application GeminiRetryPolicy. Warn (no secrets).
+    logger.warning(
+        "config: GEMINI_MAX_RETRIES=%d makes the SDK resend each request up to %d "
+        "times without honouring Google's retry delay; set GEMINI_MAX_RETRIES=1 "
+        "(also in deployment secrets) so the application retry policy is the "
+        "only retry layer.",
+        settings.gemini_max_retries, settings.gemini_max_retries,
+    )
 
 st.set_page_config(page_title="AI-SDLC Pipeline", layout="wide")
+
+# --- Light / Dark appearance (see app/ui/theme.py for how and why) ---------------
+# Resolve the session's theme BEFORE anything else renders and emit its scoped
+# stylesheet first, so a rerun never paints the wrong theme. Dark is the
+# first-session default; the choice is kept in st.session_state (the switch's
+# widget key) and mirrored to ?theme= so it survives project switches/refresh.
+_active_theme = _theme.ensure_theme(st.session_state, st.query_params)
+st.markdown(_theme.theme_css(_active_theme), unsafe_allow_html=True)
+
+
+def _on_theme_change() -> None:
+    """Mirror the explicit choice to the URL (per viewer; never global)."""
+    try:
+        st.query_params[_theme.QUERY_PARAM] = _theme.query_value(
+            st.session_state.get(_theme.THEME_KEY)
+        )
+    except Exception:  # pragma: no cover - cosmetic persistence only
+        pass
 
 
 # --- human-readable labels ------------------------------------------------------
@@ -117,8 +150,21 @@ def switch_project(pid: str) -> None:
     (so a browser refresh reopens the same project) and reruns so every service
     and cached version list is rebuilt against `pid`.
     """
+    # Per-viewer preferences / safety state are NOT project data: keep the
+    # Light/Dark choice and the duplicate-generation guard (incl. any Gemini
+    # retry-window cooldown, which is per API key, not per project).
+    preserved = {
+        k: st.session_state[k]
+        for k in (_theme.THEME_KEY, _gen_guard.STATE_KEY)
+        if k in st.session_state
+    }
     for key in list(st.session_state.keys()):
         del st.session_state[key]
+    for key, value in preserved.items():
+        try:
+            st.session_state[key] = value
+        except Exception:  # pragma: no cover - ?theme= in the URL restores it anyway
+            pass
     st.session_state.project_id = pid
     st.query_params["project"] = pid
     st.rerun()
@@ -238,7 +284,40 @@ def friendly_error(exc: Exception) -> str:
     `st.error(friendly_error(exc))` — is unchanged (Phase 12B)."""
     classified = classify(exc)
     log_app_error(logger, classified, exc)
+    if classified.retry_after_seconds:
+        # Free-tier stabilisation: remember Google's retry window for THIS
+        # session so the next click does not re-send before it has passed.
+        try:
+            _gen_guard.note_retry_after(st.session_state, classified.retry_after_seconds)
+        except Exception:  # pragma: no cover - never break error reporting
+            pass
     return classified.user_message
+
+
+# --- free-tier stabilisation: per-session duplicate-generation guard ---------------
+#
+# Every button that triggers a Gemini call is written as
+#     if st.button(...) and _begin_generation("<op>"):
+#         with _generation_slot("<op>"), st.spinner(...):
+# `_begin_generation` refuses a click queued while the previous generation was
+# running (and any request inside Google's retry window); `_generation_slot`
+# always clears the in-progress flag — success, failure, or a Streamlit
+# interruption. State lives in st.session_state only (per session; never shared
+# between users). See app/ui/generation_guard.py for the rules and limitations.
+
+def _begin_generation(op: str) -> bool:
+    decision = _gen_guard.try_begin(st.session_state, op)
+    if not decision.allowed:
+        logger.info("generation request not started: op=%s reason=%s", op, decision.reason)
+        if decision.reason == "cooldown":
+            st.warning(decision.message)
+        else:
+            st.info(decision.message)
+    return decision.allowed
+
+
+def _generation_slot(op: str):
+    return _gen_guard.slot(st.session_state, op)
 
 
 # --- Phase 8B-6: pure SDLC Pipeline panel formatting helpers -----------------------
@@ -318,22 +397,22 @@ _STEP_RAIL_CSS = """
     display: flex; flex-direction: row; flex-wrap: nowrap;
     gap: 0.55rem; align-items: flex-start;
     padding: 0.85rem 0.9rem 0.7rem 0.9rem;
-    border: 1px solid rgba(250, 250, 250, 0.14);
+    border: 1px solid rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.14);
     border-radius: 12px;
-    background: rgba(250, 250, 250, 0.02);
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.02);
     overflow-x: auto; overflow-y: hidden;
     scrollbar-width: thin;
-    scrollbar-color: rgba(250, 250, 250, 0.32) rgba(250, 250, 250, 0.06);
+    scrollbar-color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.32) rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.06);
 }
 .sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar { height: 8px; }
 .sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar-track {
-    background: rgba(250, 250, 250, 0.06); border-radius: 8px;
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.06); border-radius: 8px;
 }
 .sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar-thumb {
-    background: rgba(250, 250, 250, 0.28); border-radius: 8px;
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.28); border-radius: 8px;
 }
 .sdlc-steprail-wrap .sdlc-steprail::-webkit-scrollbar-thumb:hover {
-    background: rgba(250, 250, 250, 0.42);
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.42);
 }
 .sdlc-steprail-wrap .sdlc-step {
     flex: 0 0 auto; min-width: 128px; max-width: 168px;
@@ -348,37 +427,43 @@ _STEP_RAIL_CSS = """
 }
 .sdlc-steprail-wrap .sdlc-step-name {
     font-size: 0.78rem; font-weight: 600; line-height: 1.2;
-    color: rgba(250, 250, 250, 0.90);
+    color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.90);
 }
 .sdlc-steprail-wrap .sdlc-step-status { font-size: 0.7rem; line-height: 1.15; }
 .sdlc-steprail-wrap .sdlc-step--done .sdlc-step-num { background: #15803d; color: #ffffff; }
-.sdlc-steprail-wrap .sdlc-step--done .sdlc-step-status { color: #4ade80; }
+.sdlc-steprail-wrap .sdlc-step--done .sdlc-step-status { color: var(--sdlc-rail-done, #4ade80); }
 .sdlc-steprail-wrap .sdlc-step--done .sdlc-step-status::before { content: "\\2713\\00a0"; }
 .sdlc-steprail-wrap .sdlc-step--current .sdlc-step-num {
     background: #2563eb; color: #ffffff; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.30);
 }
-.sdlc-steprail-wrap .sdlc-step--current .sdlc-step-status { color: #60a5fa; font-weight: 600; }
+.sdlc-steprail-wrap .sdlc-step--current .sdlc-step-status { color: var(--sdlc-rail-current, #60a5fa); font-weight: 600; }
 .sdlc-steprail-wrap .sdlc-step--todo .sdlc-step-num {
-    background: rgba(250, 250, 250, 0.08); color: rgba(250, 250, 250, 0.60);
-    border-color: rgba(250, 250, 250, 0.18);
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.08); color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.60);
+    border-color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.18);
 }
-.sdlc-steprail-wrap .sdlc-step--todo .sdlc-step-status { color: rgba(250, 250, 250, 0.45); }
+.sdlc-steprail-wrap .sdlc-step--todo .sdlc-step-status {
+    color: var(--sdlc-rail-todo-text, rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.45));
+}
 .sdlc-steprail-wrap .sdlc-step--readonly .sdlc-step-num {
-    background: rgba(250, 250, 250, 0.08); color: rgba(250, 250, 250, 0.72);
-    border-color: rgba(250, 250, 250, 0.18);
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.08); color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.72);
+    border-color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.18);
 }
-.sdlc-steprail-wrap .sdlc-step--readonly .sdlc-step-status { color: rgba(250, 250, 250, 0.55); }
+.sdlc-steprail-wrap .sdlc-step--readonly .sdlc-step-status {
+    color: var(--sdlc-rail-readonly-text, rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.55));
+}
 .sdlc-steprail-wrap .sdlc-step--running .sdlc-step-num {
     background: #2563eb; color: #ffffff; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.30);
 }
-.sdlc-steprail-wrap .sdlc-step--running .sdlc-step-status { color: #60a5fa; font-weight: 600; }
+.sdlc-steprail-wrap .sdlc-step--running .sdlc-step-status { color: var(--sdlc-rail-current, #60a5fa); font-weight: 600; }
 .sdlc-steprail-wrap .sdlc-step--failed .sdlc-step-num { background: #b91c1c; color: #ffffff; }
-.sdlc-steprail-wrap .sdlc-step--failed .sdlc-step-status { color: #f87171; font-weight: 600; }
+.sdlc-steprail-wrap .sdlc-step--failed .sdlc-step-status { color: var(--sdlc-rail-failed, #f87171); font-weight: 600; }
 .sdlc-steprail-wrap .sdlc-step--blocked .sdlc-step-num {
-    background: rgba(250, 250, 250, 0.05); color: rgba(250, 250, 250, 0.32);
-    border-color: rgba(250, 250, 250, 0.12);
+    background: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.05); color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.32);
+    border-color: rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.12);
 }
-.sdlc-steprail-wrap .sdlc-step--blocked .sdlc-step-status { color: rgba(250, 250, 250, 0.32); }
+.sdlc-steprail-wrap .sdlc-step--blocked .sdlc-step-status {
+    color: var(--sdlc-rail-blocked-text, rgba(var(--sdlc-rail-rgb, 250, 250, 250), 0.32));
+}
 </style>
 """
 
@@ -1081,7 +1166,18 @@ with st.sidebar:
 
 # --- main area ------------------------------------------------------------------------
 
-st.title("AI-SDLC Pipeline")
+_title_col, _theme_col = st.columns([4, 1], vertical_alignment="bottom")
+with _title_col:
+    st.title("AI-SDLC Pipeline")
+with _theme_col:
+    st.radio(
+        "Theme",
+        _theme.OPTIONS,
+        key=_theme.THEME_KEY,
+        horizontal=True,
+        on_change=_on_theme_change,
+        help="Switch between Light and Dark appearance. Kept for this browser session.",
+    )
 st.caption("From SOW to Software Delivery — Powered by AI Agents")
 st.write(
     "An end-to-end AI-powered Software Development Life Cycle pipeline that "
@@ -1174,45 +1270,46 @@ with st.container():
             "Run SDLC Pipeline", type="primary",
             disabled=not pipeline_ready, key="pipeline_run_btn",
         ):
-            # Phase 15C: `run_step()` is synchronous, so this st.status shows a
-            # single "running" state while Gemini is blocked; the per-stage
-            # timeline is filled in once the call returns (post-run).
-            progress = PipelineProgress()
-            with st.status(
-                "Running the SDLC orchestration pipeline…", expanded=True,
-            ) as pipeline_status_box:
-                try:
-                    final_state = run_pipeline_step(
-                        st.session_state.project_id,
-                        service, sa_service, us_service, lld_service, qa_service,
-                        closure_service,
-                        on_event=progress,
-                    )
-                    st.session_state["pipeline_run"] = _capture_pipeline_run(
-                        st.session_state.project_id, progress, final_state
-                    )
-                    refresh_versions()
-                    refresh_hld_versions()
-                    refresh_us_versions()
-                    refresh_lld_versions()
-                    refresh_qa_versions()
-                    refresh_closure_versions()
-                    _render_pipeline_run_timeline(st.session_state["pipeline_run"])
-                    pipeline_status_box.update(
-                        label=_pipeline_run_headline(st.session_state["pipeline_run"]),
-                        state="complete", expanded=False,
-                    )
-                    st.rerun()
-                except Exception as exc:
-                    st.session_state["pipeline_run"] = _capture_pipeline_run(
-                        st.session_state.project_id, progress, None
-                    )
-                    _render_pipeline_run_timeline(st.session_state["pipeline_run"])
-                    pipeline_status_box.update(
-                        label=_pipeline_run_headline(st.session_state["pipeline_run"]),
-                        state="error", expanded=True,
-                    )
-                    st.error(friendly_error(exc))
+            if _begin_generation("pipeline_run"):
+                # Phase 15C: `run_step()` is synchronous, so this st.status shows a
+                # single "running" state while Gemini is blocked; the per-stage
+                # timeline is filled in once the call returns (post-run).
+                progress = PipelineProgress()
+                with _generation_slot("pipeline_run"), st.status(
+                    "Running the SDLC orchestration pipeline…", expanded=True,
+                ) as pipeline_status_box:
+                    try:
+                        final_state = run_pipeline_step(
+                            st.session_state.project_id,
+                            service, sa_service, us_service, lld_service, qa_service,
+                            closure_service,
+                            on_event=progress,
+                        )
+                        st.session_state["pipeline_run"] = _capture_pipeline_run(
+                            st.session_state.project_id, progress, final_state
+                        )
+                        refresh_versions()
+                        refresh_hld_versions()
+                        refresh_us_versions()
+                        refresh_lld_versions()
+                        refresh_qa_versions()
+                        refresh_closure_versions()
+                        _render_pipeline_run_timeline(st.session_state["pipeline_run"])
+                        pipeline_status_box.update(
+                            label=_pipeline_run_headline(st.session_state["pipeline_run"]),
+                            state="complete", expanded=False,
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.session_state["pipeline_run"] = _capture_pipeline_run(
+                            st.session_state.project_id, progress, None
+                        )
+                        _render_pipeline_run_timeline(st.session_state["pipeline_run"])
+                        pipeline_status_box.update(
+                            label=_pipeline_run_headline(st.session_state["pipeline_run"]),
+                            state="error", expanded=True,
+                        )
+                        st.error(friendly_error(exc))
 
 st.divider()
 
@@ -1250,8 +1347,8 @@ with tab_generate:
 
         ready = bool(uploaded_file and project_name and client_name and industry)
 
-        if st.button("Generate BRD", disabled=not ready, type="primary"):
-            with st.spinner("Extracting document, cleaning text, and generating your BRD..."):
+        if st.button("Generate BRD", disabled=not ready, type="primary") and _begin_generation("brd_generate"):
+            with _generation_slot("brd_generate"), st.spinner("Extracting document, cleaning text, and generating your BRD..."):
                 try:
                     upload_path = (settings.resolved_upload_dir()
                                    / f"{st.session_state.project_id}_{uploaded_file.name}")
@@ -1377,8 +1474,8 @@ with tab_workspace:
                     key="feedback_input",
                     height=120,
                 )
-                if st.button("Refine with AI", type="primary", disabled=not feedback.strip()):
-                    with st.spinner("Sending the current BRD and your feedback to Gemini..."):
+                if st.button("Refine with AI", type="primary", disabled=not feedback.strip()) and _begin_generation("brd_refine"):
+                    with _generation_slot("brd_refine"), st.spinner("Sending the current BRD and your feedback to Gemini..."):
                         try:
                             start = time.time()
                             new_version = service.refine_with_ai(feedback)
@@ -1501,8 +1598,8 @@ with tab_hld:
         st.subheader("Generate the High-Level Design")
         st.caption(f"The HLD will be generated from the Accepted BRD (v{final_version.version}). "
                    "This creates HLD Version 1.")
-        if st.button("Generate HLD", type="primary"):
-            with st.spinner("Sending the accepted BRD to Gemini and drafting the HLD..."):
+        if st.button("Generate HLD", type="primary") and _begin_generation("hld_generate"):
+            with _generation_slot("hld_generate"), st.spinner("Sending the accepted BRD to Gemini and drafting the HLD..."):
                 try:
                     start = time.time()
                     hld_version = sa_service.generate_initial_hld()
@@ -1618,8 +1715,8 @@ with tab_hld:
                     height=120,
                 )
                 if st.button("Refine with AI", type="primary",
-                             disabled=not hld_feedback.strip(), key="hld_refine_btn"):
-                    with st.spinner("Sending the current HLD and your feedback to Gemini..."):
+                             disabled=not hld_feedback.strip(), key="hld_refine_btn") and _begin_generation("hld_refine"):
+                    with _generation_slot("hld_refine"), st.spinner("Sending the current HLD and your feedback to Gemini..."):
                         try:
                             start = time.time()
                             new_hld = sa_service.refine_with_ai(hld_feedback)
@@ -1743,8 +1840,8 @@ with tab_stories:
         st.subheader("Generate the Draft User Stories")
         st.caption(f"The user stories will be generated from the Accepted BRD "
                    f"(v{final_version.version}). This creates User Stories Version 1.")
-        if st.button("Generate Draft User Stories", type="primary"):
-            with st.spinner("Sending the accepted BRD to Gemini and drafting user stories..."):
+        if st.button("Generate Draft User Stories", type="primary") and _begin_generation("us_generate"):
+            with _generation_slot("us_generate"), st.spinner("Sending the accepted BRD to Gemini and drafting user stories..."):
                 try:
                     start = time.time()
                     us_version = us_service.generate_initial_stories()
@@ -1867,8 +1964,8 @@ with tab_stories:
                     height=120,
                 )
                 if st.button("Refine with AI", type="primary",
-                             disabled=not us_feedback.strip(), key="us_refine_btn"):
-                    with st.spinner("Sending the current user stories and your feedback to Gemini..."):
+                             disabled=not us_feedback.strip(), key="us_refine_btn") and _begin_generation("us_refine"):
+                    with _generation_slot("us_refine"), st.spinner("Sending the current user stories and your feedback to Gemini..."):
                         try:
                             start = time.time()
                             new_us = us_service.refine_with_ai(us_feedback)
@@ -1974,8 +2071,8 @@ with tab_lld:
                         "HLD and BRD only.")
         st.caption(f"The LLD will be generated from the Accepted HLD (v{hld_final.version})."
                    + us_note + " This creates LLD Version 1.")
-        if st.button("Generate LLD", type="primary"):
-            with st.spinner("Sending the accepted HLD and context to Gemini and drafting the LLD..."):
+        if st.button("Generate LLD", type="primary") and _begin_generation("lld_generate"):
+            with _generation_slot("lld_generate"), st.spinner("Sending the accepted HLD and context to Gemini and drafting the LLD..."):
                 try:
                     start = time.time()
                     lld_version = lld_service.generate_initial_lld()
@@ -2091,8 +2188,8 @@ with tab_lld:
                     height=120,
                 )
                 if st.button("Refine with AI", type="primary",
-                             disabled=not lld_feedback.strip(), key="lld_refine_btn"):
-                    with st.spinner("Sending the current LLD and your feedback to Gemini..."):
+                             disabled=not lld_feedback.strip(), key="lld_refine_btn") and _begin_generation("lld_refine"):
+                    with _generation_slot("lld_refine"), st.spinner("Sending the current LLD and your feedback to Gemini..."):
                         try:
                             start = time.time()
                             new_lld = lld_service.refine_with_ai(lld_feedback)
@@ -2286,8 +2383,8 @@ with tab_usr:
                    "preserved; only evidence-based changes are made.")
         refine_label = "Refine Again" if usr_is_refined else "Refine Stories from Artifacts"
         if st.button(refine_label, type="primary", disabled=us_is_locked,
-                     key="usr_refine_btn"):
-            with st.spinner("Reconciling the user stories against BRD / HLD / LLD..."):
+                     key="usr_refine_btn") and _begin_generation("usr_refine"):
+            with _generation_slot("usr_refine"), st.spinner("Reconciling the user stories against BRD / HLD / LLD..."):
                 try:
                     start = time.time()
                     new_us = usr_service.refine()
@@ -2400,8 +2497,8 @@ with tab_qa:
             st.caption(f"Test cases will be generated from the Accepted BRD "
                        f"(v{final_version.version}) and whatever optional context is "
                        "available. This creates Test Cases Version 1.")
-            if st.button("Generate Test Cases", type="primary", key="qa_generate_btn"):
-                with st.spinner("Sending the artifacts to Gemini and drafting test cases..."):
+            if st.button("Generate Test Cases", type="primary", key="qa_generate_btn") and _begin_generation("qa_generate"):
+                with _generation_slot("qa_generate"), st.spinner("Sending the artifacts to Gemini and drafting test cases..."):
                     try:
                         start = time.time()
                         qa_v = qa_service.generate()
@@ -2519,8 +2616,8 @@ with tab_qa:
                         height=120,
                     )
                     if st.button("Refine with AI", type="primary",
-                                 disabled=not qa_feedback.strip(), key="qa_refine_btn"):
-                        with st.spinner("Sending the current test cases and your feedback "
+                                 disabled=not qa_feedback.strip(), key="qa_refine_btn") and _begin_generation("qa_refine"):
+                        with _generation_slot("qa_refine"), st.spinner("Sending the current test cases and your feedback "
                                         "to Gemini..."):
                             try:
                                 start = time.time()
@@ -2564,8 +2661,8 @@ with tab_qa:
             st.caption("Rebuild the test cases from scratch against the CURRENT artifacts "
                        "(ignores the current test-case content). Creates a new version.")
             if st.button("Regenerate from Artifacts", disabled=qa_is_locked,
-                         key="qa_regen_btn"):
-                with st.spinner("Rebuilding test cases from the current artifacts..."):
+                         key="qa_regen_btn") and _begin_generation("qa_regenerate"):
+                with _generation_slot("qa_regenerate"), st.spinner("Rebuilding test cases from the current artifacts..."):
                     try:
                         start = time.time()
                         new_qa = qa_service.regenerate()
@@ -2869,8 +2966,8 @@ with tab_closure:
                        "(BRD, HLD, User Stories, LLD, Test Cases, Traceability, "
                        "Project Quality Report). Creates Closure Report Version 1.")
             if st.button("Generate Closure Report", type="primary",
-                         key="closure_generate_btn"):
-                with st.spinner("Assembling project evidence and drafting the closure "
+                         key="closure_generate_btn") and _begin_generation("closure_generate"):
+                with _generation_slot("closure_generate"), st.spinner("Assembling project evidence and drafting the closure "
                                 "report..."):
                     try:
                         start = time.time()
@@ -2965,8 +3062,8 @@ with tab_closure:
             st.caption("Rebuild the closure report from the CURRENT project evidence. "
                        "Creates a new version; the previous one stays in History.")
             if st.button("Regenerate from Project Evidence", disabled=closure_is_locked,
-                         key="closure_regen_btn"):
-                with st.spinner("Rebuilding the closure report from current evidence..."):
+                         key="closure_regen_btn") and _begin_generation("closure_regenerate"):
+                with _generation_slot("closure_regenerate"), st.spinner("Rebuilding the closure report from current evidence..."):
                     try:
                         start = time.time()
                         new_cr = closure_service.regenerate()
